@@ -1,5 +1,8 @@
 [workspace]
 
+# connect all the files here on the root crate
+
+
 members = [
     "cli",
     "indexer",

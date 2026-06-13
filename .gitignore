@@ -1,0 +1,17 @@
+# Added by Cargo
+# ----------------------------------------------------------------------------
+/target/
+
+# Remove this macro if you want to check in your development secrets
+# ----------------------------------------------------------------------------
+**/*.rs.bk
+
+# IDE and Editor Specific Files
+# ----------------------------------------------------------------------------
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
