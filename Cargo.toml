@@ -1,0 +1,13 @@
+[
+workspace
+]
+
+members = [
+    "cli",
+    "indexer",
+    "parser",
+    "graph",
+    "storage",
+    "query"
+]
+resolver = "2"
