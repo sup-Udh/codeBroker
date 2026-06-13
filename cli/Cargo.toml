@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+
+indexer = { path = "../indexer" }
+query = { path = "../query" }
+storage = { path = "../storage" }
