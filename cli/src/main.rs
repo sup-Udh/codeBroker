@@ -1,3 +1,86 @@
+use clap::{Parser, Subcommand};
+use std::fs;
+
+// 1. Define the CLI arguments
+#[derive(Parser)]
+#[command(name = "codebroker")]
+#[command(about = "A blazing fast local code graph", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initializes the database and indexes the codebase
+    Init,
+    /// Queries the graph for a specific symbol
+    Query {
+        text: String,
+    },
+}
+
+
 fn main() {
-    println!("Hello, world!");
+    let cli = Cli::parse();
+    match &cli.command {
+        Commands::Init => {
+            println!("Initializing CodeBroker...");
+            // 1. Boot up the database
+            let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
+            db.init_schema().expect("Failed to initialize schema");
+            // 2. Walk the file system
+            let files = indexer::walker::collect_files(".");
+            println!("Found {} files to index.", files.len());
+            // 3. The Main Indexing Loop
+            for file_path in files {
+                // Read file from disk
+                if let Ok(source_code) = fs::read_to_string(&file_path) {
+                    
+                    // Insert the file into SQLite and get its ID
+                    let file_id = db.insert_file(&file_path).unwrap();
+                    // Parse the AST
+                    if let Some(tree) = parser::treesitter::parse_rust_code(&source_code) {
+                        
+                        // Extract and save symbols (Functions, Structs)
+                        let symbols = parser::extractor::extract_symbols(&tree, &source_code);
+                        for symbol in symbols {
+                            db.insert_symbol(file_id, &symbol).unwrap();
+                        }
+                        // Extract and save imports
+                        let imports = parser::extractor::extract_imports(&tree, &source_code);
+                        for import in imports {
+                            db.insert_import(file_id, &import).unwrap();
+                        }
+                    }
+                }
+            }
+            println!("Indexing complete! Run a query to test it.");
+        }
+        Commands::Query { text } => {
+            // Connect to the existing DB
+            let db = storage::Database::new("codebroker.db").expect("DB not found. Run init first.");
+            
+            println!("Searching for: '{}'", text);
+            
+            // For Phase 0, we just do a raw SQL search across our symbols
+            let mut stmt = db.conn.prepare(
+                "SELECT files.path, symbols.kind, symbols.name, symbols.line_number 
+                 FROM symbols 
+                 JOIN files ON symbols.file_id = files.id 
+                 WHERE symbols.name LIKE ?1"
+            ).unwrap();
+            // We use % so it does a wildcard search (e.g. searching "main" finds "main")
+            let search_term = format!("%{}%", text);
+            let mut rows = stmt.query([search_term]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let path: String = row.get(0).unwrap();
+                let kind: String = row.get(1).unwrap();
+                let name: String = row.get(2).unwrap();
+                let line: i64 = row.get(3).unwrap();
+                println!("Found {} '{}' in {} on line {}", kind, name, path, line);
+            }
+        }
+    }
 }
