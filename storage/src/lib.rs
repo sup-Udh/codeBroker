@@ -1,14 +1,7 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// public api of the storage crate
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod schema;
+pub mod db;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+// reimporting everything so that it could use it as `storage::Database` by the other crates
+pub use db::Database;

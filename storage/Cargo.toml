@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 
 graph = {path="../graph"}
+rusqlite = { version = "0.40.1", features = ["bundled"] }
