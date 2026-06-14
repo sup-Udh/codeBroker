@@ -51,7 +51,7 @@ fn main() {
                         // Extract and save imports
                         let imports = parser::extractor::extract_imports(&tree, &source_code);
                         for import in imports {
-                            db.insert_import(file_id, &import).unwrap();
+                            db.insert_raw_import(file_id, &import).unwrap();
                         }
                     }
                 }
