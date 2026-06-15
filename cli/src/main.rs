@@ -38,10 +38,12 @@ fn main() {
             use parser::frontend::{LanguageFrontend, RustFrontend};
             use parser::typescript_frontend::TypeScriptFrontend;
             use parser::python_frontend::PythonFrontend;
+            use parser::javascript_frontend::JavaScriptFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
                 Box::new(TypeScriptFrontend),
                 Box::new(PythonFrontend),
+                Box::new(JavaScriptFrontend),
             ];
 
             // 2. Walk the file system

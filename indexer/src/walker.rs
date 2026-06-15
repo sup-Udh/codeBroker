@@ -25,7 +25,7 @@ pub fn collect_files(root_dir:&str) -> Vec<String> {
 fn is_supported_file(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
-            return ext_str == "rs" || ext_str == "ts" || ext_str == "tsx" || ext_str == "py";
+            return ext_str == "rs" || ext_str == "ts" || ext_str == "tsx" || ext_str == "py" || ext_str == "js" || ext_str == "jsx";
 
         }
 
