@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use parser::frontend;
 use std::fs;
 
 // 1. Define the CLI arguments
@@ -34,28 +35,52 @@ fn main() {
             // 1. Boot up the database
             let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");
+            use parser::frontend::{LanguageFrontend, RustFrontend};
+             let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
+                Box::new(RustFrontend),
+                // When you add TypeScript, you literally just add:
+                // Box::new(TypeScriptFrontend),
+            ];
+
             // 2. Walk the file system
             let files = indexer::walker::collect_files(".");
             println!("Found {} files to index.", files.len());
-            // 3. The Main Indexing Loop
+
+            
+                 // 3. The Main Indexing Loop
             for file_path in files {
-                // Read file from disk
                 if let Ok(source_code) = fs::read_to_string(&file_path) {
                     
-                    // Insert the file into SQLite and get its ID
-                    let file_id = db.insert_file(&file_path).unwrap();
-                    // Parse the AST
-                    if let Some(tree) = parser::treesitter::parse_rust_code(&source_code) {
-                        
-                        // Extract and save symbols (Functions, Structs)
-                        let symbols = parser::extractor::extract_symbols(&tree, &source_code);
-                        for symbol in symbols {
-                            db.insert_symbol(file_id, &symbol).unwrap();
+                    // A. Extract the file extension
+                    let extension = std::path::Path::new(&file_path)
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("");
+
+                    // B. Find the correct language parser from our registry
+                    let mut matched_frontend = None;
+                    for frontend in &frontends {
+                        if frontend.can_handle(extension) {
+                            matched_frontend = Some(frontend);
+                            break;
                         }
-                        // Extract and save imports
-                        let imports = parser::extractor::extract_imports(&tree, &source_code);
-                        for import in imports {
-                            db.insert_raw_import(file_id, &import).unwrap();
+                    }
+
+                    // C. If we have a parser for this language, process it!
+                    if let Some(frontend) = matched_frontend {
+                        
+                        let file_id = db.insert_file(&file_path).unwrap();
+
+                        // D. The Universal Extraction (Zero language-specific code here!)
+                        if let Some((symbols, imports)) = frontend.parse_and_extract(&source_code) {
+                            
+                            for symbol in symbols {
+                                db.insert_symbol(file_id, &symbol).unwrap();
+                            }
+                            
+                            for import in imports {
+                                db.insert_raw_import(file_id, &import).unwrap();
+                            }
                         }
                     }
                 }
