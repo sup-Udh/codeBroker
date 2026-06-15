@@ -69,11 +69,18 @@ fn main() {
 
             // 2. Loop through every single staged import
             for (_raw_id, source_file_id, import_name) in raw_imports {
-                // 3. Ask the database if a real Symbol exists with this exact name
-                if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(&import_name) {
-                    // 4. We found a match! Draw the physical Edge in the graph.
-                    db.insert_edge(source_file_id, target_symbol_id, "imports").unwrap();
-                    edges_created += 1;
+                // Split the import path (like `storage::Database` or `graph::{SymbolNode}`) into individual words
+                let words: Vec<&str> = import_name.split(|c: char| !c.is_alphanumeric()).collect();
+                
+                for word in words {
+                    if word.is_empty() { continue; }
+                    
+                    // 3. Ask the database if a real Symbol exists with this exact word
+                    if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
+                        // 4. We found a match! Draw the physical Edge in the graph.
+                        let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
+                        edges_created += 1;
+                    }
                 }
             }
 
