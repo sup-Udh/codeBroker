@@ -36,10 +36,10 @@ fn main() {
             let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");
             use parser::frontend::{LanguageFrontend, RustFrontend};
+            use parser::typescript_frontend::TypeScriptFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
-                // When you add TypeScript, you literally just add:
-                // Box::new(TypeScriptFrontend),
+                Box::new(TypeScriptFrontend),
             ];
 
             // 2. Walk the file system

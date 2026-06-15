@@ -1,6 +1,6 @@
 // gap between the tree sitter synatx and grpah models
 
-use tree_sitter::{Query, QueryCursor, Tree};
+use tree_sitter::{Query, QueryCursor, Tree, StreamingIterator};
 use graph::SymbolNode;
 use graph::ImportNode;
 
@@ -17,19 +17,19 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
         (struct_item name: (type_identifier) @struct)
     ";
 
-    let language = tree_sitter_rust::language();
+    let language = tree_sitter_rust::LANGUAGE.into();
     
     // Compile the query
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
 
     // 2. Execute the query against the root node of our parsed tree
-    let matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
     // 3. Iterate through the matches and build our domain models
 
 
-    for m in matches {
+    while let Some(m) = matches.next() {
         for capture in m.captures {
             // The node in the AST that matched  capture (e.g., the actual word "main")
             let node = capture.node;
@@ -62,11 +62,11 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
         (use_declaration argument: (_) @import)
     ";
 
-    let language = tree_sitter_rust::language();
+    let language = tree_sitter_rust::LANGUAGE.into();
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
-    for m in matches {
+    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    while let Some(m) = matches.next() {
         for capture in m.captures {
             let node = capture.node;
             
