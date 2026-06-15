@@ -26,6 +26,10 @@ fn main() {
     match &cli.command {
         Commands::Init => {
             println!("Initializing CodeBroker...");
+
+            let _ = fs::remove_file("codebroker.db");
+
+            
             // 1. Boot up the database
             let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");

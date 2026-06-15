@@ -57,7 +57,9 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
     let mut imports = Vec::new();
     // The query: Find a `use_declaration`, and capture whatever is inside 
     // its `argument` block and tag it as `@import`.
-    let query_str = "(use_declaration argument: (_) @import)";
+    let query_str = "(use_declaration argument: identifier @import)";
+
+
     let language = tree_sitter_rust::language();
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
