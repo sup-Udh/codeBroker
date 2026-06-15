@@ -9,6 +9,7 @@ members = [
     "parser",
     "graph",
     "storage",
-    "query"
-, "semantic"]
+    "query",
+ "semantic"
+]
 resolver = "2"
