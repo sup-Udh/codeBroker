@@ -5,8 +5,8 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree, StreamingIterator};
 pub struct JavaScriptFrontend;
 
 impl LanguageFrontend for JavaScriptFrontend {
-    fn can_handle(&self, extension: &str) -> bool {
-        extension == "js" || extension == "jsx"
+    fn can_handle(&self, path: &str) -> bool {
+        path.ends_with(".js") || path.ends_with(".jsx")
     }
 
     fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {
@@ -54,7 +54,7 @@ fn extract_js_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
 fn extract_js_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
     let mut imports = Vec::new();
     let query_str = "
-        (import_statement (identifier) @import)
+        (import_statement) @import
     ";
     
     let language = tree_sitter_javascript::LANGUAGE.into();

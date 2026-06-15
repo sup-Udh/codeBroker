@@ -5,8 +5,8 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree, StreamingIterator};
 pub struct TypeScriptFrontend;
 
 impl LanguageFrontend for TypeScriptFrontend {
-    fn can_handle(&self, extension: &str) -> bool {
-        extension == "ts" || extension == "tsx" || extension == "js"
+    fn can_handle(&self, path: &str) -> bool {
+        path.ends_with(".ts") || path.ends_with(".tsx")
     }
 
     fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {

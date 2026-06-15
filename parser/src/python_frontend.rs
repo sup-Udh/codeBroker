@@ -5,8 +5,8 @@ use tree_sitter::{Parser, Query, QueryCursor, Tree, StreamingIterator};
 pub struct PythonFrontend;
 
 impl LanguageFrontend for PythonFrontend {
-    fn can_handle(&self, extension: &str) -> bool {
-        extension == "py"
+    fn can_handle(&self, path: &str) -> bool {
+        path.ends_with(".py")
     }
 
     fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {

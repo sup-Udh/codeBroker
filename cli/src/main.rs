@@ -39,11 +39,13 @@ fn main() {
             use parser::typescript_frontend::TypeScriptFrontend;
             use parser::python_frontend::PythonFrontend;
             use parser::javascript_frontend::JavaScriptFrontend;
+            use parser::config_frontend::ConfigFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
                 Box::new(TypeScriptFrontend),
                 Box::new(PythonFrontend),
                 Box::new(JavaScriptFrontend),
+                Box::new(ConfigFrontend),
             ];
 
             // 2. Walk the file system
@@ -64,7 +66,7 @@ fn main() {
                     // B. Find the correct language parser from our registry
                     let mut matched_frontend = None;
                     for frontend in &frontends {
-                        if frontend.can_handle(extension) {
+                        if frontend.can_handle(&file_path) {
                             matched_frontend = Some(frontend);
                             break;
                         }

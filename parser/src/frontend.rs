@@ -1,7 +1,7 @@
 use graph::{SymbolNode, ImportNode};
 
 pub trait LanguageFrontend {
-    fn can_handle(&self, extension: &str) -> bool;
+    fn can_handle(&self, path: &str) -> bool;
 
     // parse and extract to unified domains
     fn parse_and_extract(&self, soruce_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)>;
@@ -10,8 +10,8 @@ pub trait LanguageFrontend {
 pub struct RustFrontend;
 
 impl LanguageFrontend for RustFrontend {
-    fn can_handle(&self, extension: &str) -> bool {
-        extension == "rs"
+    fn can_handle(&self, path: &str) -> bool {
+        path.ends_with(".rs")
     }
 
     fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {

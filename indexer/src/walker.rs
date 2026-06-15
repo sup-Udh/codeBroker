@@ -25,12 +25,14 @@ pub fn collect_files(root_dir:&str) -> Vec<String> {
 fn is_supported_file(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
-            return ext_str == "rs" || ext_str == "ts" || ext_str == "tsx" || ext_str == "py" || ext_str == "js" || ext_str == "jsx";
-
+            return ext_str == "rs" || ext_str == "ts" || ext_str == "tsx" || ext_str == "py" || ext_str == "js" || ext_str == "jsx" || ext_str == "json" || ext_str == "toml" || ext_str == "txt" || ext_str == "yml" || ext_str == "yaml";
         }
-
-
+    }
+    
+    // Also allow files without extensions or specific names
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if file_name == "Dockerfile" {
+        return true;
     }
     false
-
 }
