@@ -14,7 +14,7 @@ pub struct ContextObject {
 
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
 
-    
+    pub forward_dependencies: Vec<String>, // what this file imports
 
 
 }
@@ -65,13 +65,28 @@ impl ContextObject {
             siblings.push(row.get(0)?);
         }
 
-        // 4. Package it all up into our pristine, JSON-ready Context Object
+        // 4. Fetch Forward Dependencies (What does this file import?)
+        let mut fwd_stmt = db.conn.prepare(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id
+             WHERE edges.source_file_id = ?1 AND edges.kind = 'imports'"
+        )?;
+        
+        let mut fwd_rows = fwd_stmt.query(rusqlite::params![file_id])?;
+        let mut forward_dependencies = Vec::new();
+        while let Some(row) = fwd_rows.next()? {
+            forward_dependencies.push(row.get(0)?);
+        }
+
+        // 5. Package it all up into our pristine, JSON-ready Context Object
         Ok(Some(ContextObject {
             target_name: name,
             target_kind: kind,
             defining_file: path,
             line_number: line_number as usize,
             reverse_dependencies: rev_deps,
+            forward_dependencies,
             siblings,
         }))
     }
