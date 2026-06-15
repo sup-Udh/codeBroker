@@ -18,6 +18,7 @@ enum Commands {
     /// Queries the graph for a specific symbol
     Query {text: String},
     Dependents {symbol: String},
+    Context { symbol: String },
 }
 
 
@@ -130,6 +131,25 @@ fn main() {
                 }
                 Err(e) => println!("Error querying graph: {}", e),
             }
+
+        }
+
+        Commands::Context { symbol } => {
+            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            
+            println!("Assembling context object for '{}'...\n", symbol);
+            // Call our new assembly engine!
+            match query::context::ContextObject::assemble(&db, symbol) {
+                Ok(Some(context_obj)) => {
+                    // This is the magic: We convert our rich graph structs into clean JSON
+                    let json_payload = serde_json::to_string_pretty(&context_obj).unwrap();
+                    println!("{}", json_payload);
+                }
+                Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
+                Err(e) => println!("Error assembling context: {}", e),
+            }
+        }
+
 
         }
     }
