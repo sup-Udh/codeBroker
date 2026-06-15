@@ -147,6 +147,8 @@ dependencies = [
  "indexer",
  "parser",
  "query",
+ "serde",
+ "serde_json",
  "storage",
 ]
 

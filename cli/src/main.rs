@@ -137,7 +137,7 @@ fn main() {
         Commands::Context { symbol } => {
             let db = storage::Database::new("codebroker.db").expect("DB not found.");
             
-            println!("Assembling context object for '{}'...\n", symbol);
+            println!("Assembling context bject for '{}'...\n", symbol);
             // Call our new assembly engine!
             match query::context::ContextObject::assemble(&db, symbol) {
                 Ok(Some(context_obj)) => {
@@ -153,5 +153,3 @@ fn main() {
 
         }
     }
-
-}
