@@ -40,7 +40,10 @@ impl LlmProvider for HuggingFaceProvider {
             .send_json(payload)
             .map_err(|e| format!("HTTP request failed: {}", e))?;
         // Parse the response
-        let json_resp: serde_json::Value = response.into_json()
+        let mut response = response;
+        let text = response.body_mut().read_to_string()
+            .map_err(|e| format!("Failed to read body: {}", e))?;
+        let json_resp: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| format!("Failed to parse JSON: {}", e))?;
         // Extract the generated text from the Hugging Face response array
         if let Some(arr) = json_resp.as_array() {
