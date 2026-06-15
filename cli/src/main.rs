@@ -37,9 +37,11 @@ fn main() {
             db.init_schema().expect("Failed to initialize schema");
             use parser::frontend::{LanguageFrontend, RustFrontend};
             use parser::typescript_frontend::TypeScriptFrontend;
+            use parser::python_frontend::PythonFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
                 Box::new(TypeScriptFrontend),
+                Box::new(PythonFrontend),
             ];
 
             // 2. Walk the file system
