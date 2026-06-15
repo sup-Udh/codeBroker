@@ -14,7 +14,6 @@ pub struct ContextObject {
 
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
 
-    pub siblings: Vec<String>,
     
 
 
