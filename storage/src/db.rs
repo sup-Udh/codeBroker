@@ -88,10 +88,10 @@ impl Database {
 
 
     /// Creates a directional relationship between two symbols
-    pub fn insert_edge(&self, source_symbol_id: i64, target_symbol_id: i64, kind: &str) -> Result<()> {
+    pub fn insert_edge(&self, source_file_id: i64, target_symbol_id: i64, kind: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO edges (source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3)",
-            params![source_symbol_id, target_symbol_id, kind],
+            "INSERT INTO edges (source_file_id, target_symbol_id, kind) VALUES (?1, ?2, ?3)",
+            params![source_file_id, target_symbol_id, kind],
         )?;
         Ok(())
     }

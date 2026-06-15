@@ -7,4 +7,5 @@ edition = "2024"
 
 
 graph = { path = "../graph" }
+rusqlite = "0.40.1"
 storage = { path = "../storage" }

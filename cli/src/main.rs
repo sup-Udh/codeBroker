@@ -16,9 +16,8 @@ enum Commands {
     /// Initializes the database and indexes the codebase
     Init,
     /// Queries the graph for a specific symbol
-    Query {
-        text: String,
-    },
+    Query {text: String},
+    Dependents {symbol: String},
 }
 
 
@@ -56,6 +55,25 @@ fn main() {
                     }
                 }
             }
+
+            // --- PASS 2: THE LINKER ---
+            println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
+
+            // 1. Get all the "Missing Friends" from our staging table
+            let raw_imports = db.get_all_raw_imports().expect("Failed to fetch raw imports");
+            let mut edges_created = 0;
+
+            // 2. Loop through every single staged import
+            for (_raw_id, source_file_id, import_name) in raw_imports {
+                // 3. Ask the database if a real Symbol exists with this exact name
+                if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(&import_name) {
+                    // 4. We found a match! Draw the physical Edge in the graph.
+                    db.insert_edge(source_file_id, target_symbol_id, "imports").unwrap();
+                    edges_created += 1;
+                }
+            }
+
+            println!("Linking complete. Created {} true graph edges.", edges_created);
             println!("Indexing complete! Run a query to test it.");
         }
         Commands::Query { text } => {
@@ -82,5 +100,27 @@ fn main() {
                 println!("Found {} '{}' in {} on line {}", kind, name, path, line);
             }
         }
+        Commands::Dependents { symbol } => {
+
+                        let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            
+            println!("Traversing graph to find dependents of '{}'...", symbol);
+            
+            match query::engine::find_dependents(&db, symbol) {
+                Ok(files) => {
+                    if files.is_empty() {
+                        println!("No files depend on '{}'. It is safe to delete!", symbol);
+                    } else {
+                        println!("WARNING: Modifying '{}' will impact the following {} files:", symbol, files.len());
+                        for file in files {
+                            println!("  -> {}", file);
+                        }
+                    }
+                }
+                Err(e) => println!("Error querying graph: {}", e),
+            }
+
+        }
     }
+
 }
