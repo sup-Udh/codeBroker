@@ -95,4 +95,50 @@ impl Database {
         )?;
         Ok(())
     }
+
+
+        /// Layer 3: Save an AI-generated summary to the Knowledge Store
+    pub fn save_semantic_summary(
+        &self, 
+        symbol_id: i64, 
+        summary: &str, 
+        source_hash: &str, 
+        context_hash: &str,
+        model_name: &str
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO semantic_summaries (symbol_id, summary, source_hash, context_hash, model_name) 
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![symbol_id, summary, source_hash, context_hash, model_name],
+        )?;
+        Ok(())
+    }
+
+    /// Layer 3: Retrieve a cached summary ONLY if the source, context, and model haven't changed
+    pub fn get_cached_summary(
+        &self, 
+        symbol_id: i64, 
+        source_hash: &str, 
+        context_hash: &str,
+        model_name: &str
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT summary FROM semantic_summaries 
+             WHERE symbol_id = ?1 AND source_hash = ?2 AND context_hash = ?3 AND model_name = ?4 
+             ORDER BY created_at DESC LIMIT 1"
+        )?;
+        
+        let result = stmt.query_row(params![symbol_id, source_hash, context_hash, model_name], |row| {
+            row.get::<_, String>(0)
+        });
+
+        match result {
+            Ok(summary) => Ok(Some(summary)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+
+
 }

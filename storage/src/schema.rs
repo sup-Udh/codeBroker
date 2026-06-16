@@ -31,4 +31,18 @@ pub const INIT_SQL: &str = "
         line_number INTEGER NOT NULL,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
+
+
+        CREATE TABLE IF NOT EXISTS semantic_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol_id INTEGER NOT NULL,
+        summary TEXT NOT NULL,
+        source_hash TEXT NOT NULL,
+        context_hash TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
+    
 ";

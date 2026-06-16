@@ -1,0 +1,80 @@
+use crate::provider::LlmProvider;
+use crate::prompt::build_prompt;
+use storage::Database;
+use query::context::ContextObject;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
+
+pub struct SummaryGenerator<'a> {
+    db: &'a Database,
+    provider: Box<dyn LlmProvider>,
+}
+
+impl<'a> SummaryGenerator<'a> {
+    pub fn new(db: &'a Database, provider: Box<dyn LlmProvider>) -> Self {
+        Self { db, provider }
+    }
+
+    pub fn generate(&self, symbol_name: &str) -> Result<String, String> {
+        // 1. Get the symbol from the database
+        let mut stmt = self.db.conn.prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")
+            .map_err(|e| e.to_string())?;
+        
+        let (symbol_id, file_id) = stmt.query_row([symbol_name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        }).map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?;
+
+        // 2. Get the file path and read the source code
+        let file_path: String = self.db.conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            [file_id],
+            |row| row.get(0)
+        ).map_err(|e| e.to_string())?;
+        
+        let source_code = fs::read_to_string(&file_path).unwrap_or_default();
+
+        // 3. Assemble the ContextObject
+        let context = ContextObject::assemble(self.db, symbol_name)
+            .map_err(|e| e.to_string())?
+            .ok_or("Failed to assemble context")?;
+
+        // 3.5. Fetch config files
+        let mut config_text = String::new();
+        if let Ok(mut cfg_stmt) = self.db.conn.prepare("SELECT path FROM files WHERE path LIKE '%package.json' OR path LIKE '%Dockerfile' OR path LIKE '%Cargo.toml' OR path LIKE '%tsconfig.json' OR path LIKE '%pyproject.toml' OR path LIKE '%requirements.txt' OR path LIKE '%docker-compose.yml'") {
+            if let Ok(cfg_iter) = cfg_stmt.query_map([], |row| row.get::<_, String>(0)) {
+                for cfg_path in cfg_iter.flatten() {
+                    if let Ok(content) = fs::read_to_string(&cfg_path) {
+                        config_text.push_str(&format!("--- {} ---\n{}\n\n", cfg_path, content));
+                    }
+                }
+            }
+        }
+
+        // 4. Calculate Hashes
+        let source_hash = calculate_hash(&source_code);
+        let context_json = serde_json::to_string(&context).unwrap_or_default();
+        let context_hash = calculate_hash(&context_json);
+        let model_name = self.provider.model_name();
+
+        // 5. Check Cache
+        if let Ok(Some(cached_summary)) = self.db.get_cached_summary(symbol_id, &source_hash, &context_hash, model_name) {
+            return Ok(format!("(Cached)\n{}", cached_summary));
+        }
+
+        // 6. Build Prompt & Call AI
+        let prompt = build_prompt(symbol_name, &source_code, &context, &config_text);
+        let summary = self.provider.generate_summary(&prompt)?;
+
+        // 7. Save to Cache
+        let _ = self.db.save_semantic_summary(symbol_id, &summary, &source_hash, &context_hash, model_name);
+
+        Ok(summary)
+    }
+}
+
+fn calculate_hash(data: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}

@@ -20,6 +20,7 @@ enum Commands {
     Query {text: String},
     Dependents {symbol: String},
     Context { symbol: String },
+    Explain { symbol: String },
 }
 
 
@@ -178,6 +179,29 @@ fn main() {
                 }
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
                 Err(e) => println!("Error assembling context: {}", e),
+            }
+        }
+        Commands::Explain { symbol } => {
+            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+            if hf_token.is_empty() {
+                println!("Error: HF_API_TOKEN environment variable is not set.");
+                println!("Please run: export HF_API_TOKEN=\"hf_your_token\"");
+                return;
+            }
+            
+            println!("Generating semantic summary for '{}'...", symbol);
+            
+            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+            let generator = semantic::generator::SummaryGenerator::new(&db, provider);
+            
+            match generator.generate(&symbol) {
+                Ok(summary) => {
+                    println!("\n=== SEMANTIC SUMMARY ===");
+                    println!("{}", summary);
+                    println!("========================\n");
+                }
+                Err(e) => println!("Error generating summary: {}", e),
             }
         }
 
