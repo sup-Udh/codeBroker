@@ -89,6 +89,20 @@ fn main() {
                                             },
                                             "required": ["symbol"]
                                         }
+                                    },
+                                    {
+                                        "name": "impact_analysis",
+                                        "description": "Returns a deep, AI-generated semantic architectural summary of a code symbol, utilizing Qwen2.5-Coder to explain the blast radius and context.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": {
+                                                    "type": "string",
+                                                    "description": "The exact name of the struct, function, or trait to analyze."
+                                                }
+                                            },
+                                            "required": ["symbol"]
+                                        }
                                     }
                                 ]
                             }),
@@ -125,6 +139,27 @@ fn main() {
                                         }
                                     }
                                     Err(_) => "Error connecting to codebroker.db".to_string(),
+                                }
+                            }
+                            "impact_analysis" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                
+                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                if hf_token.is_empty() {
+                                    "Error: HF_API_TOKEN environment variable is not set on the MCP server.".to_string()
+                                } else {
+                                    match storage::Database::new("codebroker.db") {
+                                        Ok(db) => {
+                                            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                            let generator = semantic::generator::SummaryGenerator::new(&db, provider);
+                                            
+                                            match generator.generate(symbol) {
+                                                Ok(summary) => summary,
+                                                Err(e) => format!("Error generating impact analysis: {}", e),
+                                            }
+                                        }
+                                        Err(_) => "Error connecting to codebroker.db".to_string(),
+                                    }
                                 }
                             }
                             _ => {
