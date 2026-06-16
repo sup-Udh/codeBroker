@@ -48,6 +48,35 @@ pub const INIT_SQL: &str = "
     );
 
 
+        -- Layer 4.5: Analytics Events
+    CREATE TABLE IF NOT EXISTS analytics_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        agent_name TEXT,
+        session_id TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Layer 4.5: Token and Cost Accounting
+    CREATE TABLE IF NOT EXISTS token_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol_name TEXT NOT NULL,
+        raw_tokens_avoided INTEGER NOT NULL,
+        context_tokens_used INTEGER NOT NULL,
+        cost_saved_cents REAL NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Layer 4.5: Cache Observability
+    CREATE TABLE IF NOT EXISTS cache_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol_name TEXT NOT NULL,
+        status TEXT NOT NULL, -- 'hit' or 'miss'
+        latency_ms INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+
 
 
     

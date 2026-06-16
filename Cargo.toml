@@ -12,5 +12,5 @@ members = [
     "query",
  "semantic"
 , "mcp",
-, "analytics"]
+ "analytics"]
 resolver = "2"
