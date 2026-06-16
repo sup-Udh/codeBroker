@@ -16,4 +16,6 @@
 *.sln
 *.sw?
 
-# add storages additional files. like in the gitignore 
+# add storages additional files. like in the gitignore
+.env
+ 

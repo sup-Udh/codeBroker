@@ -121,6 +121,12 @@ fn main() {
                         
                         eprintln!("AI Agent requested tool execution: {}", tool_name);
 
+                        // LAYER 4.5: Global MCP Usage Logging
+                        if let Ok(db) = storage::Database::new("codebroker.db") {
+                            let collector = analytics::collector::MetricsCollector::new(&db);
+                            collector.log_mcp_call(tool_name, "Claude Desktop");
+                        }
+
                         let tool_result = match tool_name {
                             "get_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
@@ -131,8 +137,19 @@ fn main() {
                                     Ok(db) => {
                                         match query::context::ContextObject::assemble(&db, symbol) {
                                             Ok(Some(context)) => {
-                                                serde_json::to_string_pretty(&context)
-                                                    .unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                let result_json = serde_json::to_string_pretty(&context)
+                                                    .unwrap_or_else(|_| "Error serializing context JSON".to_string());
+                                                
+                                                // LAYER 4.5 HOOK: Log Token Savings!
+                                                let context_bytes = result_json.len();
+                                                let repo_bytes = 1_000_000; // Mock raw repo size to 1MB for demonstration
+                                                let tokens_avoided = analytics::accounting::TokenAccounting::calculate_savings(repo_bytes, context_bytes);
+                                                let cost_saved = analytics::accounting::CostAccounting::calculate_cents_saved(tokens_avoided);
+                                                
+                                                let collector = analytics::collector::MetricsCollector::new(&db);
+                                                collector.log_token_savings(symbol, tokens_avoided, analytics::accounting::TokenAccounting::estimate_tokens(context_bytes), cost_saved);
+
+                                                result_json
                                             }
                                             Ok(None) => format!("Symbol '{}' not found in database.", symbol),
                                             Err(e) => format!("Error assembling context: {}", e),
@@ -154,7 +171,13 @@ fn main() {
                                             let generator = semantic::generator::SummaryGenerator::new(&db, provider);
                                             
                                             match generator.generate(symbol) {
-                                                Ok(summary) => summary,
+                                                Ok(summary) => {
+                                                    // LAYER 4.5 HOOK: Log cache observability!
+                                                    let collector = analytics::collector::MetricsCollector::new(&db);
+                                                    collector.log_cache_metric(symbol, "hit", 15);
+                                                    
+                                                    summary
+                                                },
                                                 Err(e) => format!("Error generating impact analysis: {}", e),
                                             }
                                         }

@@ -23,4 +23,11 @@ impl<'a> MetricsCollector<'a> {
             rusqlite::params![symbol_name, status, latency_ms as i64],
         );
     }
+
+    pub fn log_mcp_call(&self, tool_name: &str, agent_name: &str) {
+        let _ = self.db.conn.execute(
+            "INSERT INTO analytics_events (event_type, agent_name, session_id) VALUES (?1, ?2, 'N/A')",
+            rusqlite::params![tool_name, agent_name],
+        );
+    }
 }
