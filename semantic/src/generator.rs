@@ -5,7 +5,7 @@ use query::context::ContextObject;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
-
+use std::time::Instant;
 pub struct SummaryGenerator<'a> {
     db: &'a Database,
     provider: Box<dyn LlmProvider>,
@@ -62,12 +62,23 @@ impl<'a> SummaryGenerator<'a> {
             return Ok(format!("(Cached)\n{}", cached_summary));
         }
 
-        // 6. Build Prompt & Call AI
+        // 6. Build Prompt & Call AI (with latency tracking!)
         let prompt = build_prompt(symbol_name, &source_code, &context, &config_text);
-        let summary = self.provider.generate_summary(&prompt)?;
+        
+        let start_time = std::time::Instant::now();
+        let (summary, token_count) = self.provider.generate_summary(&prompt)?;
+        let elapsed_ms = start_time.elapsed().as_millis();
 
-        // 7. Save to Cache
-        let _ = self.db.save_semantic_summary(symbol_id, &summary, &source_hash, &context_hash, model_name);
+        // 7. Save to Cache with all our rich metadata
+        let _ = self.db.save_semantic_summary(
+            symbol_id, 
+            &summary, 
+            &source_hash, 
+            &context_hash, 
+            model_name, 
+            token_count, 
+            elapsed_ms
+        );
 
         Ok(summary)
     }

@@ -8,6 +8,13 @@ pub struct Database {
     pub conn: Connection,
 }
 
+pub struct CodeBrokerStats {
+    pub files_indexed: i64,
+    pub summaries_generated: i64,
+    pub total_cache_hits: i64,
+    pub extensions: Vec<String>,
+}
+
 impl Database {
     /// Opens a connection to the SQLite database at the given path
     pub fn new(db_path: &str) -> Result<Self> {
@@ -98,23 +105,25 @@ impl Database {
 
 
         /// Layer 3: Save an AI-generated summary to the Knowledge Store
+     /// Layer 3: Save an AI-generated summary to the Knowledge Store with metadata
     pub fn save_semantic_summary(
         &self, 
         symbol_id: i64, 
         summary: &str, 
         source_hash: &str, 
         context_hash: &str,
-        model_name: &str
+        model_name: &str,
+        token_count: usize,
+        generation_time_ms: u128
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO semantic_summaries (symbol_id, summary, source_hash, context_hash, model_name) 
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![symbol_id, summary, source_hash, context_hash, model_name],
-        )?;
+            "INSERT INTO semantic_summaries (symbol_id, summary, source_hash, context_hash, model_name, token_count, generation_time_ms, hit_count) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+            params![symbol_id, summary, source_hash, context_hash, model_name, (token_count as i64), (generation_time_ms as i64)],        )?;
         Ok(())
     }
 
-    /// Layer 3: Retrieve a cached summary ONLY if the source, context, and model haven't changed
+    /// Layer 3: Retrieve a cached summary and increment its hit_count
     pub fn get_cached_summary(
         &self, 
         symbol_id: i64, 
@@ -122,22 +131,59 @@ impl Database {
         context_hash: &str,
         model_name: &str
     ) -> Result<Option<String>> {
+        // 1. Fetch the summary and its primary ID
         let mut stmt = self.conn.prepare(
-            "SELECT summary FROM semantic_summaries 
+            "SELECT id, summary FROM semantic_summaries 
              WHERE symbol_id = ?1 AND source_hash = ?2 AND context_hash = ?3 AND model_name = ?4 
              ORDER BY created_at DESC LIMIT 1"
         )?;
         
         let result = stmt.query_row(params![symbol_id, source_hash, context_hash, model_name], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         });
 
         match result {
-            Ok(summary) => Ok(Some(summary)),
+            Ok((id, summary)) => {
+                // 2. Increment the hit_count!
+                let _ = self.conn.execute("UPDATE semantic_summaries SET hit_count = hit_count + 1 WHERE id = ?1", params![id]);
+                Ok(Some(summary))
+            },
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
     }
+
+
+
+        /// Phase 2: Aggregates metrics for the Knowledge Dashboard
+    pub fn get_codebroker_stats(&self) -> Result<CodeBrokerStats> {
+        let files_indexed: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
+        let summaries_generated: i64 = self.conn.query_row("SELECT COUNT(*) FROM semantic_summaries", [], |row| row.get(0)).unwrap_or(0);
+        
+        // Sum up all the hits
+        let total_cache_hits: i64 = self.conn.query_row("SELECT SUM(hit_count) FROM semantic_summaries", [], |row| row.get(0)).unwrap_or(0);
+        
+        // Grab all file paths so we can calculate languages
+        let mut extensions = Vec::new();
+        if let Ok(mut stmt) = self.conn.prepare("SELECT path FROM files") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                for path in rows.flatten() {
+                    if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
+                        extensions.push(ext.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(CodeBrokerStats {
+            files_indexed,
+            summaries_generated,
+            total_cache_hits,
+            extensions
+        })
+    }
+
+    
 
 
 

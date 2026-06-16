@@ -40,9 +40,15 @@ pub const INIT_SQL: &str = "
         source_hash TEXT NOT NULL,
         context_hash TEXT NOT NULL,
         model_name TEXT NOT NULL,
+        token_count INTEGER NOT NULL DEFAULT 0,
+        generation_time_ms INTEGER NOT NULL DEFAULT 0,
+        hit_count INTEGER NOT NULL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
+
+
+
 
     
 ";

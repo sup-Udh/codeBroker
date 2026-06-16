@@ -21,6 +21,8 @@ enum Commands {
     Dependents {symbol: String},
     Context { symbol: String },
     Explain { symbol: String },
+    Knowledge,
+    Refresh,
 }
 
 
@@ -180,6 +182,65 @@ fn main() {
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
                 Err(e) => println!("Error assembling context: {}", e),
             }
+        }
+        Commands::Knowledge => {
+            let db = storage::Database::new("codebroker.db").expect("DB not found. Run init first.");
+            if let Ok(stats) = db.get_codebroker_stats() {
+                println!("\n=== CODEBROKER KNOWLEDGE DASHBOARD ===");
+                println!("Files Indexed: {}", stats.files_indexed);
+                println!("Summaries Generated: {}", stats.summaries_generated);
+                
+                // Calculate Hit Rate (Total Queries = Generated + Hits)
+                let total_queries = stats.summaries_generated + stats.total_cache_hits;
+                let hit_rate = if total_queries > 0 {
+                    (stats.total_cache_hits as f64 / total_queries as f64) * 100.0
+                } else {
+                    0.0
+                };
+                println!("Cache Hit Rate: {:.1}% ({} cache hits)", hit_rate, stats.total_cache_hits);
+
+                // Calculate Languages
+                let mut languages = Vec::new();
+                for ext in stats.extensions {
+                    match ext.as_str() {
+                        "rs" => if !languages.contains(&"Rust") { languages.push("Rust"); },
+                        "ts" | "tsx" => if !languages.contains(&"TypeScript") { languages.push("TypeScript"); },
+                        "js" | "jsx" => if !languages.contains(&"JavaScript") { languages.push("JavaScript"); },
+                        "py" => if !languages.contains(&"Python") { languages.push("Python"); },
+                        _ => {}
+                    }
+                }
+                
+                if !languages.is_empty() {
+                    println!("\nLanguages Detected:");
+                    for lang in languages {
+                        println!(" - {}", lang);
+                    }
+                }
+                println!("======================================\n");
+            }
+        }
+        Commands::Refresh => {
+            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+            if hf_token.is_empty() {
+                println!("Error: HF_API_TOKEN environment variable is not set.");
+                return;
+            }
+            
+            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+            let generator = semantic::generator::SummaryGenerator::new(&db, provider);
+            
+            println!("Regenerating stale summaries in the background...");
+            
+            if let Ok(mut stmt) = db.conn.prepare("SELECT name FROM symbols") {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                    for symbol in rows.flatten() {
+                        let _ = generator.generate(&symbol);
+                    }
+                }
+            }
+            println!("Refresh complete!");
         }
         Commands::Explain { symbol } => {
             let db = storage::Database::new("codebroker.db").expect("DB not found.");

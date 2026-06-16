@@ -1,15 +1,12 @@
 pub trait LlmProvider {
-
-    // returning the fully assemblemd prompt using this function
-    fn generate_summary(&self, prompt: &str) -> Result<String , String>;
-
+    /// Returns the unique ID of the model (e.g. 'Qwen/Qwen2.5-Coder-32B-Instruct')
     fn model_name(&self) -> &str;
-
     
-
-
+    /// Generates a semantic summary of the code and returns (Summary, TokenCount)
+    fn generate_summary(&self, prompt: &str) -> Result<(String, usize), String>;
 }
 
+// Don't forget to update the MockProvider so it compiles!
 pub struct MockProvider;
 
 impl LlmProvider for MockProvider {
@@ -17,7 +14,9 @@ impl LlmProvider for MockProvider {
         "offline/mock-model"
     }
 
-    fn generate_summary(&self, prompt: &str) -> Result<String, String> {
-        Ok(format!("(Simulated AI Response)\n\nI have analyzed the prompt. The target symbol is critical to the architecture. Here is the prompt I received:\n\n---\n{}...", &prompt[..150]))
+    fn generate_summary(&self, prompt: &str) -> Result<(String, usize), String> {
+        let fake_summary = format!("(Simulated AI Response)\n\nI have analyzed the prompt. The target symbol is critical to the architecture. Here is the prompt I received:\n\n---\n{}...", &prompt[..150]);
+        // Simulate a response that used 142 tokens
+        Ok((fake_summary, 142)) 
     }
 }
