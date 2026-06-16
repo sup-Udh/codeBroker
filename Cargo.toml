@@ -11,5 +11,7 @@ members = [
     "storage",
     "query",
  "semantic"
-, "mcp"]
+, "mcp"
+
+]
 resolver = "2"
