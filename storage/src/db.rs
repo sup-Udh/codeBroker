@@ -183,8 +183,49 @@ impl Database {
         })
     }
 
-    
+    pub fn get_repository_topology_hash(&self) -> Result<String> {
+        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
+        let symbols: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0)).unwrap_or(0);
+        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap_or(0);
+        
+        let mut stmt = self.conn.prepare("SELECT path FROM files")?;
+        let mut rows = stmt.query([])?;
+        let mut dirs = std::collections::HashSet::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                dirs.insert(parent.to_string_lossy().to_string());
+            }
+        }
+        let mut dirs_vec: Vec<_> = dirs.into_iter().collect();
+        dirs_vec.sort();
+        let top_modules = dirs_vec.join(",");
+        
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        format!("{}-{}-{}-{}", files, symbols, edges, top_modules).hash(&mut hasher);
+        Ok(format!("{:x}", hasher.finish()))
+    }
 
+    pub fn save_repository_overview(&self, repository_hash: &str, model_name: &str, overview_text: &str) -> Result<()> {
+        let max_version: i64 = self.conn.query_row("SELECT MAX(topology_version) FROM repository_overviews", [], |row| row.get(0)).unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO repository_overviews (repository_hash, topology_version, model_name, overview_text) VALUES (?1, ?2, ?3, ?4)",
+            params![repository_hash, max_version + 1, model_name, overview_text]
+        )?;
+        Ok(())
+    }
 
-
+    pub fn get_cached_repository_overview(&self, repository_hash: &str, model_name: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT overview_text FROM repository_overviews WHERE repository_hash = ?1 AND model_name = ?2 ORDER BY created_at DESC LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![repository_hash, model_name], |row| row.get::<_, String>(0));
+        match result {
+            Ok(summary) => Ok(Some(summary)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }

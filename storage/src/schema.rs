@@ -48,7 +48,16 @@ pub const INIT_SQL: &str = "
     );
 
 
-        -- Layer 4.5: Analytics Events
+        CREATE TABLE IF NOT EXISTS repository_overviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repository_hash TEXT NOT NULL,
+        topology_version INTEGER NOT NULL DEFAULT 1,
+        model_name TEXT NOT NULL,
+        overview_text TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Layer 4.5: Analytics Events
     CREATE TABLE IF NOT EXISTS analytics_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,

@@ -89,3 +89,38 @@ fn calculate_hash(data: &str) -> String {
     data.hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
+
+pub struct ProjectOverviewGenerator<'a> {
+    db: &'a Database,
+    provider: Box<dyn LlmProvider>,
+}
+
+impl<'a> ProjectOverviewGenerator<'a> {
+    pub fn new(db: &'a Database, provider: Box<dyn LlmProvider>) -> Self {
+        Self { db, provider }
+    }
+
+    pub fn generate(&self) -> Result<String, String> {
+        let repo_hash = self.db.get_repository_topology_hash().map_err(|e| e.to_string())?;
+        let model_name = self.provider.model_name();
+
+        if let Ok(Some(cached_overview)) = self.db.get_cached_repository_overview(&repo_hash, model_name) {
+            return Ok(format!("(Cached Overview)\n{}", cached_overview));
+        }
+
+        let raw_overview = query::engine::build_project_overview(self.db).map_err(|e| e.to_string())?;
+        
+        let overview_json = serde_json::to_string_pretty(&raw_overview).unwrap_or_default();
+        
+        let prompt = format!(
+            "You are a Principal Systems Architect. Analyze the following raw topological metrics and subsystem distribution for this repository, and generate a highly professional architectural overview mapping out what this project likely does and what its major subsystems are responsible for. Do not list file paths explicitly, summarize their conceptual role.\n\nRaw Data:\n{}",
+            overview_json
+        );
+
+        let (summary, _token_count) = self.provider.generate_summary(&prompt)?;
+
+        let _ = self.db.save_repository_overview(&repo_hash, model_name, &summary);
+
+        Ok(summary)
+    }
+}

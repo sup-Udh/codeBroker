@@ -103,6 +103,61 @@ fn main() {
                                             },
                                             "required": ["symbol"]
                                         }
+                                    },
+                                    {
+                                        "name": "search_codebase",
+                                        "description": "Discovery tool to find where a keyword or concept is mentioned in symbol names.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "keyword": {
+                                                    "type": "string",
+                                                    "description": "The concept or name to search for (e.g. 'AuthService')."
+                                                }
+                                            },
+                                            "required": ["keyword"]
+                                        }
+                                    },
+                                    {
+                                        "name": "find_symbol",
+                                        "description": "Exact lookup tool to find the definition file, line number, and kind of a specific symbol.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": {
+                                                    "type": "string",
+                                                    "description": "The exact name of the symbol."
+                                                }
+                                            },
+                                            "required": ["symbol"]
+                                        }
+                                    },
+                                    {
+                                        "name": "project_overview",
+                                        "description": "Returns a raw topological map of the repository, including file counts, symbol counts, and subsystem directories.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "required": []
+                                        }
+                                    },
+                                    {
+                                        "name": "project_overview_ai",
+                                        "description": "Returns a deeply cached, AI-generated architectural summary of the entire repository.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "required": []
+                                        }
+                                    },
+                                    {
+                                        "name": "repository_stats",
+                                        "description": "Returns raw JSON counts of files, symbols, edges, and languages in the repository.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {},
+                                            "required": []
+                                        }
                                     }
                                 ]
                             }),
@@ -182,6 +237,88 @@ fn main() {
                                             }
                                         }
                                         Err(_) => "Error connecting to codebroker.db".to_string(),
+                                    }
+                                }
+                            }
+                            "search_codebase" => {
+                                let keyword = arguments.get("keyword").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::engine::search_symbols(&db, keyword) {
+                                            Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
+                                            Err(e) => format!("Error searching: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "find_symbol" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::engine::find_symbol_exact(&db, symbol) {
+                                            Ok(results) => {
+                                                if results.is_empty() {
+                                                    format!("Symbol '{}' not found.", symbol)
+                                                } else {
+                                                    let mut s = format!("Exact matches for '{}':\n", symbol);
+                                                    for (path, kind, line) in results {
+                                                        s.push_str(&format!("- [{}] at {}:{}\n", kind, path, line));
+                                                    }
+                                                    s
+                                                }
+                                            }
+                                            Err(e) => format!("Error finding symbol: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "project_overview" => {
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::engine::build_project_overview(&db) {
+                                            Ok(overview) => serde_json::to_string_pretty(&overview).unwrap_or_default(),
+                                            Err(e) => format!("Error building overview: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "repository_stats" => {
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::engine::build_project_overview(&db) {
+                                            Ok(overview) => {
+                                                let stats = serde_json::json!({
+                                                    "files": overview.files,
+                                                    "symbols": overview.symbols,
+                                                    "edges": overview.edges,
+                                                    "languages": overview.languages
+                                                });
+                                                serde_json::to_string_pretty(&stats).unwrap_or_default()
+                                            }
+                                            Err(e) => format!("Error fetching stats: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "project_overview_ai" => {
+                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                if hf_token.is_empty() {
+                                    "Error: HF_API_TOKEN environment variable is not set.".to_string()
+                                } else {
+                                    match storage::Database::new("codebroker.db") {
+                                        Ok(db) => {
+                                            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                            let generator = semantic::generator::ProjectOverviewGenerator::new(&db, provider);
+                                            match generator.generate() {
+                                                Ok(summary) => summary,
+                                                Err(e) => format!("Error generating overview: {}", e),
+                                            }
+                                        }
+                                        Err(_) => "Error connecting to db".to_string(),
                                     }
                                 }
                             }
