@@ -1,173 +1,11 @@
-use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead, Write};
+import re
 
-#[derive(Serialize, Deserialize, Debug)]
+with open("mcp/src/main.rs", "r") as f:
+    code = f.read()
 
+# I will replace the inside of "tools/call" => { ... }
 
-// json rpc structures
-struct JsonRpcRequest {
-    jsonrpc: String,
-    id: Option<serde_json::Value>,
-    method: String,
-    params: Option<serde_json::Value>,
-}
-
-
-
-#[derive(Serialize, Deserialize, Debug)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: serde_json::Value,
-    result: serde_json::Value,
-}
-
-
-
-fn main() {
-    // it will corrupt the protocol and crash the AI agent!
-    eprintln!("CodeBroker MCP Server starting up...");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    // The Infinite Transport Loop
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // Exit if stdin is closed (IDE shut down)
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Parse the incoming JSON-RPC request from the agent
-        if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line) {
-            eprintln!("Received method: {}", request.method);
-            // The Router
-            match request.method.as_str() {
-                "initialize" => {
-                    // The agent is saying hello. We must respond with our capabilities.
-                    if let Some(id) = request.id {
-                        let response = JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id,
-                            result: serde_json::json!({
-                                "protocolVersion": "2024-11-05",
-                                "capabilities": {
-                                    "tools": {} // We will add tools in Phase 3
-                                },
-                                "serverInfo": {
-                                    "name": "codebroker-mcp",
-                                    "version": "0.1.0"
-                                }
-                            }),
-                        };
-                        
-                        let response_str = serde_json::to_string(&response).unwrap();
-                        println!("{}", response_str); // Write JSON to stdout!
-                        stdout.flush().unwrap();
-                    }
-                }
-                "initialized" => {
-                    eprintln!("Agent initialization handshake complete.");
-                }
-                "tools/list" => {
-                    // Tell the AI agent exactly what tools we have
-                    if let Some(id) = request.id {
-                        let response = JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id,
-                            result: serde_json::json!({
-                                "tools": [
-                                    {
-                                        "name": "get_context",
-                                        "description": "Returns the exact architectural graph dependencies and blast radius dependents for a given code symbol.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the struct, function, or trait."
-                                                }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "impact_analysis",
-                                        "description": "Returns a deep, AI-generated semantic architectural summary of a code symbol, utilizing Qwen2.5-Coder to explain the blast radius and context.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the struct, function, or trait to analyze."
-                                                }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "search_codebase",
-                                        "description": "Discovery tool to find where a keyword or concept is mentioned in symbol names.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "keyword": {
-                                                    "type": "string",
-                                                    "description": "The concept or name to search for (e.g. 'AuthService')."
-                                                }
-                                            },
-                                            "required": ["keyword"]
-                                        }
-                                    },
-                                    {
-                                        "name": "find_symbol",
-                                        "description": "Exact lookup tool to find the definition file, line number, and kind of a specific symbol.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the symbol."
-                                                }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "project_overview",
-                                        "description": "Returns a raw topological map of the repository, including file counts, symbol counts, and subsystem directories.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {},
-                                            "required": []
-                                        }
-                                    },
-                                    {
-                                        "name": "project_overview_ai",
-                                        "description": "Returns a deeply cached, AI-generated architectural summary of the entire repository.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {},
-                                            "required": []
-                                        }
-                                    },
-                                    {
-                                        "name": "repository_stats",
-                                        "description": "Returns raw JSON counts of files, symbols, edges, and languages in the repository.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {},
-                                            "required": []
-                                        }
-                                    }
-                                ]
-                            }),
-                        };
-                        println!("{}", serde_json::to_string(&response).unwrap());
-                        stdout.flush().unwrap();
-                    }
-                }
-                "tools/call" => {
-                    // Intercept the AI agent trying to execute a tool
+replacement = """                "tools/call" => {
                     if let Some(id) = request.id {
                         let params = request.params.unwrap_or_default();
                         let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -331,7 +169,6 @@ fn main() {
                             );
                         }
 
-                        // Send the result back to the AI agent
                         let response = JsonRpcResponse {
                             jsonrpc: "2.0".to_string(),
                             id,
@@ -347,11 +184,12 @@ fn main() {
                         println!("{}", serde_json::to_string(&response).unwrap());
                         stdout.flush().unwrap();
                     }
-                }
-                _ => {
-                    eprintln!("Unknown method received: {}", request.method);
-                }
-            }
-        }
-    }
-}
+                }"""
+
+# regex replace everything from "tools/call" => { to the end of the block before _ =>
+pattern = r'"tools/call"\s*=>\s*\{.*?(?=\s*_ => \{)'
+new_code = re.sub(pattern, replacement, code, flags=re.DOTALL)
+
+with open("mcp/src/main.rs", "w") as f:
+    f.write(new_code)
+

@@ -46,14 +46,7 @@
 
         <div class="card" style="flex: 1;">
             <h2 style="margin-top: 0;">MCP Agent Usage</h2>
-            <div style="margin-top: 20px;">
-                <h3 style="color: #58a6ff; margin-bottom: 5px;">get_context</h3>
-                <p style="font-size: 1.5em; margin: 0; color: white;" id="getContextCalls">0 calls</p>
-            </div>
-            <div style="margin-top: 30px;">
-                <h3 style="color: #58a6ff; margin-bottom: 5px;">impact_analysis</h3>
-                <p style="font-size: 1.5em; margin: 0; color: white;" id="impactAnalysisCalls">0 calls</p>
-            </div>
+            <div id="mcpUsageContainer"></div>
         </div>
     </div>
 
@@ -76,10 +69,18 @@
                     document.getElementById('optimizationRatio').innerText = reduction.toFixed(2) + "%";
                 }
 
-                // Update MCP Usage Stats
+                // Update MCP Usage Stats dynamically
                 if (data.mcp_usage) {
-                    document.getElementById('getContextCalls').innerText = data.mcp_usage.get_context.toLocaleString() + " calls";
-                    document.getElementById('impactAnalysisCalls').innerText = data.mcp_usage.impact_analysis.toLocaleString() + " calls";
+                    const container = document.getElementById('mcpUsageContainer');
+                    container.innerHTML = '';
+                    for (const [tool, count] of Object.entries(data.mcp_usage)) {
+                        container.innerHTML += `
+                            <div style="margin-top: 15px;">
+                                <h3 style="color: #58a6ff; margin-bottom: 5px; font-size: 1em;">${tool}</h3>
+                                <p style="font-size: 1.2em; margin: 0; color: white;">${count.toLocaleString()} calls</p>
+                            </div>
+                        `;
+                    }
                 }
 
                 // Render Chart.js

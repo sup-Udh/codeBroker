@@ -1,3 +1,5 @@
+use storage::Database;
+
 pub struct TokenAccounting;
 
 impl TokenAccounting {
@@ -6,26 +8,48 @@ impl TokenAccounting {
         bytes / 4
     }
 
-    /// Calculates exactly how many tokens we saved the LLM from having to read.
-    pub fn calculate_savings(repo_bytes: usize, context_bytes: usize) -> usize {
-        let repo_tokens = Self::estimate_tokens(repo_bytes);
-        let context_tokens = Self::estimate_tokens(context_bytes);
-        
-        if repo_tokens > context_tokens {
-            repo_tokens - context_tokens
-        } else {
-            0
+    pub fn estimate_search_context(db: &Database) -> usize {
+        let total_symbols: i64 = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        Self::estimate_tokens((total_symbols as usize) * 50)
+    }
+
+    pub fn estimate_find_symbol_context(db: &Database, symbol: &str) -> usize {
+        let file_path: Result<String, _> = db.conn.query_row(
+            "SELECT files.path FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 LIMIT 1",
+            rusqlite::params![symbol],
+            |r| r.get(0)
+        );
+        match file_path {
+            Ok(path) => {
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    Self::estimate_tokens(metadata.len() as usize)
+                } else {
+                    1000 
+                }
+            }
+            Err(_) => 0
         }
+    }
+
+    pub fn estimate_graph_context(db: &Database) -> usize {
+        let total_symbols: i64 = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+        Self::estimate_tokens((total_symbols as usize * 50) + (total_edges as usize * 100))
     }
 }
 
 pub struct CostAccounting;
 
 impl CostAccounting {
-    /// Converts token savings into estimated US Cents. 
-    /// Assumes a blended average cost of $3.00 per 1 Million input tokens.
-    pub fn calculate_cents_saved(tokens_saved: usize) -> f64 {
-        let cost_per_million_cents = 300.0;
+    /// Converts token savings into estimated US Cents.
+    pub fn calculate_cents_saved(tokens_saved: usize, model: &str) -> f64 {
+        let cost_per_million_cents = match model.to_lowercase().as_str() {
+            m if m.contains("claude") => 300.0,
+            m if m.contains("gpt") => 250.0,
+            m if m.contains("gemini") => 150.0,
+            m if m.contains("qwen") => 50.0,
+            _ => 300.0,
+        };
         (tokens_saved as f64 / 1_000_000.0) * cost_per_million_cents
     }
 }

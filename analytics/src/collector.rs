@@ -9,25 +9,34 @@ impl<'a> MetricsCollector<'a> {
         Self { db }
     }
 
-    pub fn log_token_savings(&self, symbol_name: &str, raw_tokens_avoided: usize, context_tokens_used: usize, cost_saved_cents: f64) {
-        let _ = self.db.conn.execute(
-            "INSERT INTO token_metrics (symbol_name, raw_tokens_avoided, context_tokens_used, cost_saved_cents) 
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![symbol_name, raw_tokens_avoided as i64, context_tokens_used as i64, cost_saved_cents],
-        );
-    }
+    pub fn log_comprehensive_event(
+        &self,
+        tool_name: &str,
+        execution_time_ms: usize,
+        delivered_token_count: usize,
+        estimated_raw_context_tokens: usize,
+        cache_hit: bool,
+        model_used: &str,
+    ) {
+        let token_reduction = if estimated_raw_context_tokens > delivered_token_count {
+            estimated_raw_context_tokens - delivered_token_count
+        } else {
+            0
+        };
 
-    pub fn log_cache_metric(&self, symbol_name: &str, status: &str, latency_ms: usize) {
         let _ = self.db.conn.execute(
-            "INSERT INTO cache_metrics (symbol_name, status, latency_ms) VALUES (?1, ?2, ?3)",
-            rusqlite::params![symbol_name, status, latency_ms as i64],
-        );
-    }
-
-    pub fn log_mcp_call(&self, tool_name: &str, agent_name: &str) {
-        let _ = self.db.conn.execute(
-            "INSERT INTO analytics_events (event_type, agent_name, session_id) VALUES (?1, ?2, 'N/A')",
-            rusqlite::params![tool_name, agent_name],
+            "INSERT INTO mcp_analytics_events 
+             (tool_name, execution_time_ms, delivered_token_count, estimated_raw_context_tokens, token_reduction, cache_hit, model_used) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                tool_name,
+                execution_time_ms as i64,
+                delivered_token_count as i64,
+                estimated_raw_context_tokens as i64,
+                token_reduction as i64,
+                cache_hit,
+                model_used
+            ],
         );
     }
 }

@@ -16,7 +16,7 @@ impl<'a> SummaryGenerator<'a> {
         Self { db, provider }
     }
 
-    pub fn generate(&self, symbol_name: &str) -> Result<String, String> {
+    pub fn generate(&self, symbol_name: &str) -> Result<(String, bool), String> {
         // 1. Get the symbol from the database
         let mut stmt = self.db.conn.prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")
             .map_err(|e| e.to_string())?;
@@ -59,7 +59,7 @@ impl<'a> SummaryGenerator<'a> {
 
         // 5. Check Cache
         if let Ok(Some(cached_summary)) = self.db.get_cached_summary(symbol_id, &source_hash, &context_hash, model_name) {
-            return Ok(format!("(Cached)\n{}", cached_summary));
+            return Ok((format!("(Cached)\n{}", cached_summary), true));
         }
 
         // 6. Build Prompt & Call AI (with latency tracking!)
@@ -80,7 +80,7 @@ impl<'a> SummaryGenerator<'a> {
             elapsed_ms
         );
 
-        Ok(summary)
+        Ok((summary, false))
     }
 }
 
@@ -100,12 +100,12 @@ impl<'a> ProjectOverviewGenerator<'a> {
         Self { db, provider }
     }
 
-    pub fn generate(&self) -> Result<String, String> {
+    pub fn generate(&self) -> Result<(String, bool), String> {
         let repo_hash = self.db.get_repository_topology_hash().map_err(|e| e.to_string())?;
         let model_name = self.provider.model_name();
 
         if let Ok(Some(cached_overview)) = self.db.get_cached_repository_overview(&repo_hash, model_name) {
-            return Ok(format!("(Cached Overview)\n{}", cached_overview));
+            return Ok((format!("(Cached Overview)\n{}", cached_overview), true));
         }
 
         let raw_overview = query::engine::build_project_overview(self.db).map_err(|e| e.to_string())?;
@@ -121,6 +121,6 @@ impl<'a> ProjectOverviewGenerator<'a> {
 
         let _ = self.db.save_repository_overview(&repo_hash, model_name, &summary);
 
-        Ok(summary)
+        Ok((summary, false))
     }
 }

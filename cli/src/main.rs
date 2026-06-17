@@ -260,8 +260,8 @@ fn main() {
             let generator = semantic::generator::SummaryGenerator::new(&db, provider);
             
             match generator.generate(&symbol) {
-                Ok(summary) => {
-                    println!("\n=== SEMANTIC SUMMARY ===");
+                Ok((summary, _)) => {
+                    println!("\n=== Generated Summary ===");
                     println!("{}", summary);
                     println!("========================\n");
                 }
@@ -277,14 +277,28 @@ fn main() {
             });
         }
         Commands::Metrics => {
-            println!("--- CodeBroker Metrics Engine ---");
-            println!("Tokens Avoided Today: 1.45M");
-            println!("Estimated Savings: $4.35");
+            println!("--- CodeBroker Analytics Engine ---");
+            if let Ok(conn) = rusqlite::Connection::open("codebroker.db") {
+                let total_tokens_avoided: i64 = conn.query_row("SELECT SUM(token_reduction) FROM mcp_analytics_events", [], |row| row.get(0)).unwrap_or(0);
+                let cache_hits: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_analytics_events WHERE cache_hit = 1", [], |row| row.get(0)).unwrap_or(0);
+                let cache_misses: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_analytics_events WHERE cache_hit = 0", [], |row| row.get(0)).unwrap_or(0);
+                let hit_rate = if cache_hits + cache_misses > 0 {
+                    (cache_hits as f64 / (cache_hits + cache_misses) as f64) * 100.0
+                } else {
+                    0.0
+                };
+                let total_cost_saved_cents = (total_tokens_avoided as f64 / 1_000_000.0) * 300.0;
+
+                println!("Lifetime Tokens Avoided: {}", total_tokens_avoided);
+                println!("Global Cache Hit Rate: {:.1}%", hit_rate);
+                println!("LLM Calls Avoided: {}", cache_hits);
+                println!("Estimated Cost Savings: ${:.2}", total_cost_saved_cents / 100.0);
+            } else {
+                println!("Could not connect to codebroker.db");
+            }
         }
         Commands::Analytics => {
-            println!("--- Historical Analytics ---");
-            println!("Cache Hit Rate (7d): 89%");
-            println!("Latency Avoided: 450 seconds");
+            println!("Use 'cargo run -- metrics' or 'cargo run -- dashboard' instead.");
         }
 
 
