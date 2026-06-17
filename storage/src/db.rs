@@ -12,7 +12,7 @@ pub struct CodeBrokerStats {
     pub files_indexed: i64,
     pub summaries_generated: i64,
     pub total_cache_hits: i64,
-    pub extensions: Vec<String>,
+    pub extensions: std::collections::HashMap<String, i64>,
 }
 
 impl Database {
@@ -164,12 +164,12 @@ impl Database {
         let total_cache_hits: i64 = self.conn.query_row("SELECT SUM(hit_count) FROM semantic_summaries", [], |row| row.get(0)).unwrap_or(0);
         
         // Grab all file paths so we can calculate languages
-        let mut extensions = Vec::new();
+        let mut extensions = std::collections::HashMap::new();
         if let Ok(mut stmt) = self.conn.prepare("SELECT path FROM files") {
             if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
                 for path in rows.flatten() {
                     if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
-                        extensions.push(ext.to_string());
+                        *extensions.entry(ext.to_string()).or_insert(0) += 1;
                     }
                 }
             }

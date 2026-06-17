@@ -32,7 +32,7 @@ pub struct ProjectOverview {
     pub files: i64,
     pub symbols: i64,
     pub edges: i64,
-    pub languages: Vec<String>,
+    pub languages: std::collections::HashMap<String, i64>,
     pub top_level_directories: Vec<(String, i64)>,
 }
 

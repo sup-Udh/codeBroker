@@ -204,7 +204,7 @@ fn main() {
 
                 // Calculate Languages
                 let mut languages = Vec::new();
-                for ext in stats.extensions {
+                for (ext, _count) in stats.extensions {
                     match ext.as_str() {
                         "rs" => if !languages.contains(&"Rust") { languages.push("Rust"); },
                         "ts" | "tsx" => if !languages.contains(&"TypeScript") { languages.push("TypeScript"); },
