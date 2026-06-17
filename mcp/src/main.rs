@@ -127,6 +127,10 @@ fn main() {
                                                 "symbol": {
                                                     "type": "string",
                                                     "description": "The exact name of the symbol."
+                                                },
+                                                "context_lines": {
+                                                    "type": "number",
+                                                    "description": "Optional. Number of lines of context to fetch above and below the symbol. Defaults to 3."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -223,10 +227,21 @@ fn main() {
                             }
                             "search_codebase" => {
                                 let keyword = arguments.get("keyword").and_then(|s| s.as_str()).unwrap_or("");
+                                
+                                // Perform Semantic Expansion if token is present
+                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                let semantic_tokens = if !hf_token.is_empty() {
+                                    use semantic::provider::LlmProvider;
+                                    let provider = semantic::huggingface::HuggingFaceProvider::new(hf_token);
+                                    provider.expand_query(keyword).map(|(tokens, _)| tokens).unwrap_or_default()
+                                } else {
+                                    vec![]
+                                };
+
                                 match storage::Database::new("codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword) {
+                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens) {
                                             Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
                                             Err(e) => format!("Error searching: {}", e),
                                         }
@@ -236,10 +251,12 @@ fn main() {
                             }
                             "find_symbol" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let context_lines = arguments.get("context_lines").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
+                                
                                 match storage::Database::new("codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
-                                        match query::engine::find_symbol_exact(&db, symbol) {
+                                        match query::engine::find_symbol_exact(&db, symbol, context_lines) {
                                             Ok(results) => {
                                                 if results.is_empty() {
                                                     format!("Symbol '{}' not found.", symbol)

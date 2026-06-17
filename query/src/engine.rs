@@ -70,7 +70,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
     dp[len_a][len_b]
 }
 
-pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>, rusqlite::Error> {
+pub fn search_symbols(db: &Database, keyword: &str, semantic_tokens: &[String]) -> Result<Vec<SearchResult>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.name, symbols.kind 
          FROM symbols 
@@ -78,7 +78,14 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
     )?;
     
     let query_lower = keyword.to_lowercase();
-    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    let mut query_tokens: Vec<String> = query_lower.split_whitespace().map(|s| s.to_string()).collect();
+    
+    // Inject the AI-generated semantic synonyms into our token pool
+    for st in semantic_tokens {
+        if !query_tokens.contains(st) {
+            query_tokens.push(st.clone());
+        }
+    }
     
     let mut rows = stmt.query([])?;
     let mut results = Vec::new();
@@ -99,9 +106,9 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
 
         // 2. Multi-word conceptual matching & fuzzy match
         for token in &query_tokens {
-            if name_lower == *token {
+            if &name_lower == token {
                 score += 100;
-            } else if name_lower.contains(*token) {
+            } else if name_lower.contains(token) {
                 score += 50;
             } else {
                 // Fuzzy match (Levenshtein)
@@ -115,7 +122,7 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
         // 3. File path relevance (if query mentions 'database', give bonus to 'database.rs')
         let path_lower = path.to_lowercase();
         for token in &query_tokens {
-            if path_lower.contains(*token) {
+            if path_lower.contains(token) {
                 score += 10;
             }
         }
@@ -131,12 +138,12 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
 }
 
 
-pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
+pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.kind, symbols.line_number 
          FROM symbols 
          JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name = ?1"
+         WHERE symbols.name = ?1 LIMIT 5"
     )?;
     
     let mut rows = stmt.query(params![name])?;
@@ -149,8 +156,8 @@ pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, Strin
         let mut preview = String::new();
         if let Ok(content) = std::fs::read_to_string(&path) {
             let lines: Vec<&str> = content.lines().collect();
-            let start = (line_number.saturating_sub(4)).max(0) as usize;
-            let end = (line_number + 3).min(lines.len() as i64) as usize;
+            let start = (line_number.saturating_sub(context_lines as i64 + 1)).max(0) as usize;
+            let end = (line_number + context_lines as i64).min(lines.len() as i64) as usize;
             if start < lines.len() {
                 preview = lines[start..end].join("\n");
             }
