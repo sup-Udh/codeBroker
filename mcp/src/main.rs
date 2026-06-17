@@ -245,8 +245,8 @@ fn main() {
                                                     format!("Symbol '{}' not found.", symbol)
                                                 } else {
                                                     let mut s = format!("Exact matches for '{}':\n", symbol);
-                                                    for (path, kind, line) in results {
-                                                        s.push_str(&format!("- [{}] at {}:{}\n", kind, path, line));
+                                                    for (path, kind, line, preview) in results {
+                                                        s.push_str(&format!("- [{}] at {}:{}\n```rust\n{}\n```\n\n", kind, path, line, preview));
                                                     }
                                                     s
                                                 }

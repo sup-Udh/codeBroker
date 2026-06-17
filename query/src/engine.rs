@@ -60,9 +60,12 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
         let name: String = row.get(1)?;
         let kind: String = row.get(2)?;
         
-        let score = if name == keyword {
+        let name_lower = name.to_lowercase();
+        let keyword_lower = keyword.to_lowercase();
+        
+        let score = if name_lower == keyword_lower {
             100
-        } else if name.starts_with(keyword) {
+        } else if name_lower.starts_with(&keyword_lower) {
             50
         } else {
             10
@@ -76,7 +79,7 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
     Ok(results)
 }
 
-pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, String, i64)>, rusqlite::Error> {
+pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.kind, symbols.line_number 
          FROM symbols 
@@ -90,7 +93,18 @@ pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, Strin
         let path: String = row.get(0)?;
         let kind: String = row.get(1)?;
         let line_number: i64 = row.get(2)?;
-        results.push((path, kind, line_number));
+        
+        let mut preview = String::new();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = (line_number.saturating_sub(4)).max(0) as usize;
+            let end = (line_number + 3).min(lines.len() as i64) as usize;
+            if start < lines.len() {
+                preview = lines[start..end].join("\n");
+            }
+        }
+        
+        results.push((path, kind, line_number, preview));
     }
     Ok(results)
 }
