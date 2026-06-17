@@ -44,16 +44,43 @@ pub struct SearchResult {
     pub score: i32,
 }
 
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let len_a = a.len();
+    let len_b = b.len();
+
+    let mut dp = vec![vec![0; len_b + 1]; len_a + 1];
+
+    for i in 0..=len_a {
+        dp[i][0] = i;
+    }
+    for j in 0..=len_b {
+        dp[0][j] = j;
+    }
+
+    for i in 1..=len_a {
+        for j in 1..=len_b {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+        }
+    }
+    dp[len_a][len_b]
+}
+
 pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.name, symbols.kind 
          FROM symbols 
-         JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name LIKE ?1 LIMIT 200"
+         JOIN files ON symbols.file_id = files.id"
     )?;
     
-    let pattern = format!("%{}%", keyword);
-    let mut rows = stmt.query(params![pattern])?;
+    let query_lower = keyword.to_lowercase();
+    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    
+    let mut rows = stmt.query([])?;
     let mut results = Vec::new();
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
@@ -61,23 +88,48 @@ pub fn search_symbols(db: &Database, keyword: &str) -> Result<Vec<SearchResult>,
         let kind: String = row.get(2)?;
         
         let name_lower = name.to_lowercase();
-        let keyword_lower = keyword.to_lowercase();
+        let mut score = 0;
+
+        // 1. Exact Full Query Match (highest priority)
+        if name_lower == query_lower {
+            score += 1000;
+        } else if name_lower.contains(&query_lower) {
+            score += 500;
+        }
+
+        // 2. Multi-word conceptual matching & fuzzy match
+        for token in &query_tokens {
+            if name_lower == *token {
+                score += 100;
+            } else if name_lower.contains(*token) {
+                score += 50;
+            } else {
+                // Fuzzy match (Levenshtein)
+                let dist = levenshtein(&name_lower, token);
+                if dist <= 2 && token.len() > 3 {
+                    score += 25 - (dist as i32 * 5);
+                }
+            }
+        }
         
-        let score = if name_lower == keyword_lower {
-            100
-        } else if name_lower.starts_with(&keyword_lower) {
-            50
-        } else {
-            10
-        };
-        
-        results.push(SearchResult { path, name, kind, score });
+        // 3. File path relevance (if query mentions 'database', give bonus to 'database.rs')
+        let path_lower = path.to_lowercase();
+        for token in &query_tokens {
+            if path_lower.contains(*token) {
+                score += 10;
+            }
+        }
+
+        if score > 0 {
+            results.push(SearchResult { path, name, kind, score });
+        }
     }
     
     results.sort_by(|a, b| b.score.cmp(&a.score));
     results.truncate(50);
     Ok(results)
 }
+
 
 pub fn find_symbol_exact(db: &Database, name: &str) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(

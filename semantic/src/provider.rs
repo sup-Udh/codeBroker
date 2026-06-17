@@ -4,6 +4,9 @@ pub trait LlmProvider {
     
     /// Generates a semantic summary of the code and returns (Summary, TokenCount)
     fn generate_summary(&self, prompt: &str) -> Result<(String, usize), String>;
+
+    /// Expands a conceptual query into a list of technical synonyms
+    fn expand_query(&self, keyword: &str) -> Result<(Vec<String>, usize), String>;
 }
 
 // Don't forget to update the MockProvider so it compiles!
@@ -18,5 +21,9 @@ impl LlmProvider for MockProvider {
         let fake_summary = format!("(Simulated AI Response)\n\nI have analyzed the prompt. The target symbol is critical to the architecture. Here is the prompt I received:\n\n---\n{}...", &prompt[..150]);
         // Simulate a response that used 142 tokens
         Ok((fake_summary, 142)) 
+    }
+
+    fn expand_query(&self, _keyword: &str) -> Result<(Vec<String>, usize), String> {
+        Ok((vec!["mock".to_string(), "synonym".to_string()], 10))
     }
 }
