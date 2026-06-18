@@ -11,7 +11,10 @@ pub const INIT_SQL: &str = "
         file_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
-        line_number INTEGER NOT NULL,
+        start_line INTEGER NOT NULL,
+        end_line INTEGER NOT NULL,
+        start_byte INTEGER NOT NULL,
+        end_byte INTEGER NOT NULL,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 

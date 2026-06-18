@@ -5,10 +5,13 @@
 pub struct SymbolNode {
     pub name: String,
     pub kind: String,
-    pub line_number: usize
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 pub struct ImportNode {
     pub name: String,
-    pub line_number: usize
+    pub line_number: usize,
 }

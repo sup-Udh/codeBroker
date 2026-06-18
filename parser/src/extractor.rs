@@ -37,11 +37,15 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
             let capture_kind = &query.capture_names()[capture.index as usize];
             
             if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
+                let parent = node.parent().unwrap_or(node);
+                let end_line = parent.end_position().row + 1;
                 symbols.push(SymbolNode {
                     name: name.to_string(),
                     kind: capture_kind.to_string(),
-                    // Tree-sitter rows are 0-indexed, so  add 1 for human readability
-                    line_number: node.start_position().row + 1,
+                    start_line: node.start_position().row + 1,
+                    end_line,
+                    start_byte: parent.start_byte(),
+                    end_byte: parent.end_byte(),
                 });
             }
         }

@@ -42,13 +42,14 @@ fn main() {
             let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");
             use parser::frontend::{LanguageFrontend, RustFrontend};
-            use parser::typescript_frontend::TypeScriptFrontend;
+            use parser::typescript_frontend::{TypeScriptFrontend, TsxFrontend};
             use parser::python_frontend::PythonFrontend;
             use parser::javascript_frontend::JavaScriptFrontend;
             use parser::config_frontend::ConfigFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
                 Box::new(TypeScriptFrontend),
+                Box::new(TsxFrontend),
                 Box::new(PythonFrontend),
                 Box::new(JavaScriptFrontend),
                 Box::new(ConfigFrontend),

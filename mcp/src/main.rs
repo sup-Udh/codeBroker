@@ -162,6 +162,52 @@ fn main() {
                                             "properties": {},
                                             "required": []
                                         }
+                                    },
+                                    {
+                                        "name": "read_symbol_source",
+                                        "description": "Read exact source code for a symbol without returning the entire file.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": { "type": "string" }
+                                            },
+                                            "required": ["symbol"]
+                                        }
+                                    },
+                                    {
+                                        "name": "read_file_snippet",
+                                        "description": "Read a specific line range from a file.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "path": { "type": "string" },
+                                                "start_line": { "type": "number" },
+                                                "end_line": { "type": "number" }
+                                            },
+                                            "required": ["path", "start_line", "end_line"]
+                                        }
+                                    },
+                                    {
+                                        "name": "get_implementation",
+                                        "description": "Return everything necessary to understand how a symbol is implemented.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": { "type": "string" }
+                                            },
+                                            "required": ["symbol"]
+                                        }
+                                    },
+                                    {
+                                        "name": "get_edit_context",
+                                        "description": "Prepare future code-editing workflows with target implementation and context.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": { "type": "string" }
+                                            },
+                                            "required": ["symbol"]
+                                        }
                                     }
                                 ]
                             }),
@@ -328,6 +374,59 @@ fn main() {
                                     }
                                 }
                             }
+                            "read_symbol_source" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::retrieval::read_symbol_source(&db, symbol) {
+                                            Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
+                                            Err(e) => format!("Error reading source: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "read_file_snippet" => {
+                                let path = arguments.get("path").and_then(|s| s.as_str()).unwrap_or("");
+                                let start_line = arguments.get("start_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
+                                let end_line = arguments.get("end_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
+                                match query::retrieval::read_file_snippet(path, start_line, end_line) {
+                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                                    Err(e) => format!("Error reading file snippet: {}", e),
+                                }
+                            }
+                            "get_implementation" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        let source = query::retrieval::read_symbol_source(&db, symbol).unwrap_or_default();
+                                        let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
+                                        let implementation = serde_json::json!({
+                                            "symbol_source": source,
+                                            "context": context
+                                        });
+                                        serde_json::to_string_pretty(&implementation).unwrap_or_default()
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "get_edit_context" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        let source = query::retrieval::read_symbol_source(&db, symbol).unwrap_or_default();
+                                        let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
+                                        let edit_context = serde_json::json!({
+                                            "target_implementation": source,
+                                            "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
+                                            "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
+                                            "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
+                                        });
+                                        serde_json::to_string_pretty(&edit_context).unwrap_or_default()
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
                             _ => {
                                 format!("Error: Unknown tool '{}'", tool_name)
                             }
@@ -335,6 +434,10 @@ fn main() {
 
                         let execution_time_ms = start_time.elapsed().as_millis() as usize;
                         let delivered_token_count = analytics::accounting::TokenAccounting::estimate_tokens(tool_result.len());
+                        let source_lines_returned = tool_result.lines().count();
+
+                        eprintln!("[Analytics] Tool: {}, Exec Time: {}ms, Lines: {}, Tokens: {}, Cache Hit: {}", 
+                                   tool_name, execution_time_ms, source_lines_returned, delivered_token_count, cache_hit);
 
                         if let Ok(db) = storage::Database::new("codebroker.db") {
                             let collector = analytics::collector::MetricsCollector::new(&db);

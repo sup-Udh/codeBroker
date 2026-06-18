@@ -140,7 +140,7 @@ pub fn search_symbols(db: &Database, keyword: &str, semantic_tokens: &[String]) 
 
 pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
-        "SELECT files.path, symbols.kind, symbols.line_number 
+        "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line 
          FROM symbols 
          JOIN files ON symbols.file_id = files.id 
          WHERE symbols.name = ?1 LIMIT 5"
@@ -151,19 +151,20 @@ pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Res
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
         let kind: String = row.get(1)?;
-        let line_number: i64 = row.get(2)?;
+        let start_line: i64 = row.get(2)?;
+        let end_line: i64 = row.get(3).unwrap_or(start_line); // Default to start_line if missing
         
         let mut preview = String::new();
         if let Ok(content) = std::fs::read_to_string(&path) {
             let lines: Vec<&str> = content.lines().collect();
-            let start = (line_number.saturating_sub(context_lines as i64 + 1)).max(0) as usize;
-            let end = (line_number + context_lines as i64).min(lines.len() as i64) as usize;
+            let start = (start_line.saturating_sub(context_lines as i64 + 1)).max(0) as usize;
+            let end = (end_line + context_lines as i64).min(lines.len() as i64) as usize;
             if start < lines.len() {
                 preview = lines[start..end].join("\n");
             }
         }
         
-        results.push((path, kind, line_number, preview));
+        results.push((path, kind, start_line, preview));
     }
     Ok(results)
 }
