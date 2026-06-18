@@ -47,6 +47,8 @@ fn main() {
             use parser::python_frontend::PythonFrontend;
             use parser::javascript_frontend::JavaScriptFrontend;
             use parser::config_frontend::ConfigFrontend;
+            use parser::vue_frontend::VueFrontend;
+            use parser::svelte_frontend::SvelteFrontend;
              let frontends: Vec<Box<dyn LanguageFrontend>> = vec![
                 Box::new(RustFrontend),
                 Box::new(TypeScriptFrontend),
@@ -54,6 +56,8 @@ fn main() {
                 Box::new(PythonFrontend),
                 Box::new(JavaScriptFrontend),
                 Box::new(ConfigFrontend),
+                Box::new(VueFrontend),
+                Box::new(SvelteFrontend),
             ];
 
             // 1.5 Load Aliases
@@ -110,15 +114,28 @@ fn main() {
                             
                             let mut route_path = None;
                             let mut route_segment = None;
-                            if file_path.contains("app/") {
-                                let parts: Vec<&str> = file_path.split("app/").collect();
-                                if parts.len() > 1 {
-                                    let route_parts: Vec<&str> = parts[1].split('/').collect();
-                                    if route_parts.len() > 0 {
-                                        let file_name = route_parts.last().unwrap();
-                                        route_segment = Some(file_name.split('.').next().unwrap_or(file_name).to_string());
-                                        let dir_path = route_parts[..route_parts.len()-1].join("/");
-                                        route_path = Some(format!("/{}", dir_path));
+                            
+                            // Universal route discovery
+                            let route_prefixes = [("app/", "/"), ("src/routes/", "/"), ("pages/", "/")];
+                            for (prefix, _route_base) in route_prefixes.iter() {
+                                if file_path.contains(prefix) {
+                                    let parts: Vec<&str> = file_path.split(prefix).collect();
+                                    if parts.len() > 1 {
+                                        let route_parts: Vec<&str> = parts[1].split('/').collect();
+                                        if !route_parts.is_empty() {
+                                            let file_name = route_parts.last().unwrap();
+                                            route_segment = Some(file_name.split('.').next().unwrap_or(file_name).to_string());
+                                            
+                                            // Handle Remix dot notation e.g. dashboard.users.tsx
+                                            let dir_path = if file_name.contains('.') && !file_name.starts_with('+') && *prefix == "app/" {
+                                                file_name.split('.').collect::<Vec<&str>>()[..file_name.split('.').count()-1].join("/")
+                                            } else {
+                                                route_parts[..route_parts.len()-1].join("/")
+                                            };
+                                            
+                                            route_path = Some(format!("/{}", dir_path));
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -180,6 +197,44 @@ fn main() {
                     
                     if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
                         let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
+                        edges_created += 1;
+                    }
+                }
+            }
+
+            // 3. Link Prop Types
+            let mut prop_stmt = db.conn.prepare("SELECT file_id, prop_type FROM symbols WHERE prop_type IS NOT NULL").unwrap();
+            let mut prop_rows = prop_stmt.query([]).unwrap();
+            while let Some(row) = prop_rows.next().unwrap_or(None) {
+                let file_id: i64 = row.get(0).unwrap();
+                let prop_type: String = row.get(1).unwrap();
+                if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(&prop_type) {
+                    let _ = db.insert_edge(file_id, target_symbol_id, "accepts_props");
+                    edges_created += 1;
+                }
+            }
+
+            // 4. Link Layouts to Pages (wraps_route)
+            let mut layout_stmt = db.conn.prepare(
+                "SELECT id, path FROM files WHERE path LIKE '%layout.%' OR path LIKE '%+layout.%'"
+            ).unwrap();
+            let mut layout_rows = layout_stmt.query([]).unwrap();
+            while let Some(row) = layout_rows.next().unwrap_or(None) {
+                let layout_file_id: i64 = row.get(0).unwrap();
+                let layout_path: String = row.get(1).unwrap();
+                
+                if let Some(dir_end) = layout_path.rfind('/') {
+                    let dir_prefix = &layout_path[..dir_end + 1];
+                    let search_pattern = format!("{}%", dir_prefix);
+                    
+                    let mut page_stmt = db.conn.prepare(
+                        "SELECT symbols.id FROM symbols JOIN files ON symbols.file_id = files.id 
+                         WHERE files.path LIKE ?1 AND symbols.kind = 'page'"
+                    ).unwrap();
+                    let mut page_rows = page_stmt.query(params![search_pattern]).unwrap();
+                    while let Some(page_row) = page_rows.next().unwrap_or(None) {
+                        let page_symbol_id: i64 = page_row.get(0).unwrap();
+                        let _ = db.insert_edge(layout_file_id, page_symbol_id, "wraps_route");
                         edges_created += 1;
                     }
                 }

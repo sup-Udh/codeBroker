@@ -75,8 +75,22 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let query_str = "
         (class_declaration name: (type_identifier) @type)
         (interface_declaration name: (type_identifier) @type)
-        (function_declaration name: (identifier) @function)
-        (lexical_declaration (variable_declarator name: (identifier) @function value: (arrow_function)))
+        (function_declaration 
+            name: (identifier) @function
+            parameters: (formal_parameters 
+                (required_parameter type: (type_annotation (type_identifier) @prop_type))
+            )?
+        )
+        (lexical_declaration 
+            (variable_declarator 
+                name: (identifier) @function 
+                value: (arrow_function 
+                    parameters: (formal_parameters 
+                        (required_parameter type: (type_annotation (type_identifier) @prop_type))
+                    )?
+                )
+            )
+        )
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -84,39 +98,55 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
+        let mut symbol_name = String::new();
+        let mut symbol_kind = String::new();
+        let mut prop_type = None;
+        let mut parent_node = None;
+        let mut main_node = None;
+
         for capture in m.captures {
             let node = capture.node;
             let capture_kind = &query.capture_names()[capture.index as usize];
-            if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
-                let name_str = name.to_string();
-                let mut kind = capture_kind.to_string();
+            if let Ok(text) = node.utf8_text(source_code.as_bytes()) {
+                if *capture_kind == "function" || *capture_kind == "type" {
+                    symbol_name = text.to_string();
+                    symbol_kind = capture_kind.to_string();
+                    main_node = Some(node);
+                    parent_node = Some(node.parent().unwrap_or(node));
+                } else if *capture_kind == "prop_type" {
+                    prop_type = Some(text.to_string());
+                }
+            }
+        }
 
-                if kind == "function" {
-                    if name_str.starts_with("use") {
-                        kind = "hook".to_string();
-                    } else if name_str.ends_with("Provider") {
-                        kind = "provider".to_string();
-                    } else if is_tsx && name_str.chars().next().unwrap_or('a').is_uppercase() {
-                        kind = "component".to_string();
-                        if filename == "page.tsx" {
-                            kind = "page".to_string();
-                        } else if filename == "layout.tsx" {
-                            kind = "layout".to_string();
-                        }
+        if let (Some(name_str), Some(node), Some(parent)) = (Some(symbol_name).filter(|s| !s.is_empty()), main_node, parent_node) {
+            let mut kind = symbol_kind;
+
+            if kind == "function" {
+                if name_str.starts_with("use") {
+                    kind = "hook".to_string();
+                } else if name_str.ends_with("Provider") {
+                    kind = "provider".to_string();
+                } else if is_tsx && name_str.chars().next().unwrap_or('a').is_uppercase() {
+                    kind = "component".to_string();
+                    if filename == "page.tsx" {
+                        kind = "page".to_string();
+                    } else if filename == "layout.tsx" {
+                        kind = "layout".to_string();
                     }
                 }
-
-                let parent = node.parent().unwrap_or(node);
-                let end_line = parent.end_position().row + 1;
-                symbols.push(SymbolNode {
-                    name: name_str,
-                    kind,
-                    start_line: node.start_position().row + 1,
-                    end_line,
-                    start_byte: parent.start_byte(),
-                    end_byte: parent.end_byte(),
-                });
             }
+
+            let end_line = parent.end_position().row + 1;
+            symbols.push(SymbolNode {
+                name: name_str,
+                kind,
+                prop_type,
+                start_line: node.start_position().row + 1,
+                end_line,
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
+            });
         }
     }
     symbols

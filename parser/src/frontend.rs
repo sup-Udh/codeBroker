@@ -7,6 +7,12 @@ pub trait LanguageFrontend {
     fn parse_and_extract(&self, source_code: &str, path: &str) -> Option<(graph::models::FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)>;
 }
 
+pub use crate::javascript_frontend::JavaScriptFrontend;
+pub use crate::python_frontend::PythonFrontend;
+pub use crate::config_frontend::ConfigFrontend;
+pub use crate::vue_frontend::VueFrontend;
+pub use crate::svelte_frontend::SvelteFrontend;
+
 pub struct RustFrontend;
 
 impl LanguageFrontend for RustFrontend {

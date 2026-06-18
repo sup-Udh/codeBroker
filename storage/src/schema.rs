@@ -14,6 +14,7 @@ pub const INIT_SQL: &str = "
         file_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
+        prop_type TEXT,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         start_byte INTEGER NOT NULL,

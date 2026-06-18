@@ -31,6 +31,7 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN start_byte INTEGER NOT NULL DEFAULT 0;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER NOT NULL DEFAULT 0;", []);
+        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN prop_type TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN directive TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
@@ -59,8 +60,8 @@ impl Database {
     /// Inserts a symbol attached to a specific file
     pub fn insert_symbol(&self, file_id: i64, symbol: &SymbolNode) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![file_id, symbol.name, symbol.kind, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64],
+            "INSERT INTO symbols (file_id, name, kind, prop_type, start_line, end_line, start_byte, end_byte) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![file_id, symbol.name, symbol.kind, symbol.prop_type, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
     }

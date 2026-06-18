@@ -45,6 +45,7 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 symbols.push(SymbolNode {
                     name: name.to_string(),
                     kind: capture_kind.to_string(),
+                    prop_type: None,
                     start_line: node.start_position().row + 1,
                     end_line,
                     start_byte: parent.start_byte(),

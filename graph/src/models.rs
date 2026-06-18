@@ -11,6 +11,7 @@ pub struct FileMetadata {
 pub struct SymbolNode {
     pub name: String,
     pub kind: String,
+    pub prop_type: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     pub start_byte: usize,

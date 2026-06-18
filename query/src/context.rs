@@ -11,12 +11,10 @@ pub struct ContextObject {
     pub line_number: usize,
 
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
-
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
-
     pub forward_dependencies: Vec<String>, // what this file imports
-
-
+    pub prop_interfaces: Vec<crate::retrieval::SymbolSourceResult>, // bundled prop interfaces
+    pub wrapped_by: Vec<String>, // layout files that wrap this route
 }
 
 impl ContextObject {
@@ -79,6 +77,38 @@ impl ContextObject {
             forward_dependencies.push(row.get(0)?);
         }
 
+        // 4.5 Fetch Props Interfaces
+        // Find 'accepts_props' edges from this file
+        let mut props_stmt = db.conn.prepare(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id
+             WHERE edges.source_file_id = ?1 AND edges.kind = 'accepts_props'"
+        )?;
+        let mut props_rows = props_stmt.query(rusqlite::params![file_id])?;
+        let mut prop_interfaces = Vec::new();
+        while let Some(row) = props_rows.next()? {
+            let prop_name: String = row.get(0)?;
+            if let Ok(srcs) = crate::retrieval::read_symbol_source(db, &prop_name) {
+                prop_interfaces.extend(srcs);
+            }
+        }
+
+        // 4.6 Fetch Wrappers
+        // Find 'wraps_route' edges pointing to THIS symbol
+        let mut wrap_stmt = db.conn.prepare(
+            "SELECT files.path 
+             FROM edges 
+             JOIN files ON edges.source_file_id = files.id
+             WHERE edges.target_symbol_id = (SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1) 
+             AND edges.kind = 'wraps_route'"
+        )?;
+        let mut wrap_rows = wrap_stmt.query(rusqlite::params![file_id, symbol_name])?;
+        let mut wrapped_by = Vec::new();
+        while let Some(row) = wrap_rows.next()? {
+            wrapped_by.push(row.get(0)?);
+        }
+
         // 5. Package it all up into our pristine, JSON-ready Context Object
         Ok(Some(ContextObject {
             target_name: name,
@@ -88,6 +118,8 @@ impl ContextObject {
             reverse_dependencies: rev_deps,
             forward_dependencies,
             siblings,
+            prop_interfaces,
+            wrapped_by,
         }))
     }
 }

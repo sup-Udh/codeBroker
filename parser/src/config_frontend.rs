@@ -24,6 +24,7 @@ impl LanguageFrontend for ConfigFrontend {
                         symbols.push(SymbolNode {
                             name: k.clone(),
                             kind: "dependency".to_string(),
+                            prop_type: None,
                             start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
                         });
                     }
@@ -33,6 +34,7 @@ impl LanguageFrontend for ConfigFrontend {
                         symbols.push(SymbolNode {
                             name: k.clone(),
                             kind: "devDependency".to_string(),
+                            prop_type: None,
                             start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
                         });
                     }
@@ -42,6 +44,7 @@ impl LanguageFrontend for ConfigFrontend {
                         symbols.push(SymbolNode {
                             name: k.clone(),
                             kind: "script".to_string(),
+                            prop_type: None,
                             start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
                         });
                     }
