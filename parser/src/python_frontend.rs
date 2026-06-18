@@ -9,21 +9,21 @@ impl LanguageFrontend for PythonFrontend {
         path.ends_with(".py")
     }
 
-    fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {
+    fn parse_and_extract(&self, source_code: &str, _path: &str) -> Option<(graph::models::FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
         let language = tree_sitter_python::LANGUAGE.into();
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
         
         let tree = parser.parse(source_code, None)?;
 
-        let symbols = extract_py_symbols(&tree, source_code);
-        let imports = extract_py_imports(&tree, source_code);
+        let symbols = extract_py_symbols(&tree, source_code, language.clone());
+        let imports = extract_py_imports(&tree, source_code, language);
 
-        Some((symbols, imports))
+        Some((graph::models::FileMetadata::default(), symbols, imports))
     }
 }
 
-fn extract_py_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
+fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Language) -> Vec<SymbolNode> {
     let mut symbols = Vec::new();
     let query_str = "
         (class_definition name: (identifier) @type)
@@ -56,28 +56,41 @@ fn extract_py_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
     symbols
 }
 
-fn extract_py_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
+fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Language) -> Vec<ImportNode> {
     let mut imports = Vec::new();
     // Grab any individual identifier inside any import statement
     let query_str = "
         (import_statement) @import
-        (import_from_statement) @import
+        (import_from_statement module_name: (identifier) @source) @import
     ";
     
-    let language = tree_sitter_python::LANGUAGE.into();
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
+        let mut import_name = String::new();
+        let mut import_source = String::new();
+        let mut line_number = 0;
+        
         for capture in m.captures {
             let node = capture.node;
-            if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
-                imports.push(ImportNode {
-                    name: name.trim().to_string(),
-                    line_number: node.start_position().row + 1,
-                });
+            let capture_kind = &query.capture_names()[capture.index as usize];
+            if let Ok(text) = node.utf8_text(source_code.as_bytes()) {
+                if *capture_kind == "import" {
+                    import_name = text.trim().to_string();
+                    line_number = node.start_position().row + 1;
+                } else if *capture_kind == "source" {
+                    import_source = text.trim().to_string();
+                }
             }
+        }
+        if !import_name.is_empty() {
+            imports.push(ImportNode {
+                name: import_name,
+                source: if import_source.is_empty() { None } else { Some(import_source) },
+                line_number,
+            });
         }
     }
     imports

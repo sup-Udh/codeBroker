@@ -3,7 +3,10 @@
 pub const INIT_SQL: &str = "
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        path TEXT NOT NULL UNIQUE
+        path TEXT NOT NULL UNIQUE,
+        directive TEXT,
+        route_path TEXT,
+        route_segment TEXT
     );
 
     CREATE TABLE IF NOT EXISTS symbols (
@@ -31,6 +34,7 @@ pub const INIT_SQL: &str = "
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id INTEGER NOT NULL,
         name TEXT NOT NULL,
+        source TEXT,
         line_number INTEGER NOT NULL,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );

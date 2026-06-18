@@ -1044,6 +1044,7 @@ name = "parser"
 version = "0.1.0"
 dependencies = [
  "graph",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-python",

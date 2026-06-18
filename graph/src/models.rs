@@ -1,7 +1,13 @@
-#[derive(Debug)]
 // main src of truth that plays the major role between parser db and the cli
 
 // retruning the following below
+#[derive(Debug, Default)]
+pub struct FileMetadata {
+    pub directive: Option<String>,
+    pub route_path: Option<String>,
+    pub route_segment: Option<String>,
+}
+
 pub struct SymbolNode {
     pub name: String,
     pub kind: String,
@@ -13,5 +19,6 @@ pub struct SymbolNode {
 
 pub struct ImportNode {
     pub name: String,
+    pub source: Option<String>,
     pub line_number: usize,
 }

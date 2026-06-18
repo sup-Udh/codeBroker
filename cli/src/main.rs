@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use parser::frontend;
 use std::fs;
+use rusqlite::params;
 
 // 1. Define the CLI arguments
 #[derive(Parser)]
@@ -55,12 +56,32 @@ fn main() {
                 Box::new(ConfigFrontend),
             ];
 
+            // 1.5 Load Aliases
+            let mut alias_map: Vec<(String, String)> = Vec::new();
+            if let Ok(config_str) = fs::read_to_string("tsconfig.json").or_else(|_| fs::read_to_string("jsconfig.json")) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                    if let Some(paths) = json.get("compilerOptions").and_then(|c| c.get("paths")).and_then(|p| p.as_object()) {
+                        for (k, v) in paths {
+                            if let Some(v_arr) = v.as_array() {
+                                if let Some(first) = v_arr.first().and_then(|s| s.as_str()) {
+                                    let key_clean = k.replace("/*", "");
+                                    let val_clean = first.replace("/*", "");
+                                    alias_map.push((key_clean, val_clean));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if alias_map.is_empty() {
+                alias_map.push(("@/".to_string(), "src/".to_string()));
+            }
+
             // 2. Walk the file system
             let files = indexer::walker::collect_files(".");
             println!("Found {} files to index.", files.len());
 
-            
-                 // 3. The Main Indexing Loop
+            // 3. The Main Indexing Loop
             for file_path in files {
                 if let Ok(source_code) = fs::read_to_string(&file_path) {
                     
@@ -85,8 +106,25 @@ fn main() {
                         let file_id = db.insert_file(&file_path).unwrap();
 
                         // D. The Universal Extraction (Zero language-specific code here!)
-                        if let Some((symbols, imports)) = frontend.parse_and_extract(&source_code) {
+                        if let Some((metadata, symbols, imports)) = frontend.parse_and_extract(&source_code, &file_path) {
                             
+                            let mut route_path = None;
+                            let mut route_segment = None;
+                            if file_path.contains("app/") {
+                                let parts: Vec<&str> = file_path.split("app/").collect();
+                                if parts.len() > 1 {
+                                    let route_parts: Vec<&str> = parts[1].split('/').collect();
+                                    if route_parts.len() > 0 {
+                                        let file_name = route_parts.last().unwrap();
+                                        route_segment = Some(file_name.split('.').next().unwrap_or(file_name).to_string());
+                                        let dir_path = route_parts[..route_parts.len()-1].join("/");
+                                        route_path = Some(format!("/{}", dir_path));
+                                    }
+                                }
+                            }
+
+                            db.update_file_metadata(file_id, metadata.directive.as_deref(), route_path.as_deref(), route_segment.as_deref()).unwrap();
+
                             for symbol in symbols {
                                 db.insert_symbol(file_id, &symbol).unwrap();
                             }
@@ -107,16 +145,40 @@ fn main() {
             let mut edges_created = 0;
 
             // 2. Loop through every single staged import
-            for (_raw_id, source_file_id, import_name) in raw_imports {
-                // Split the import path (like `storage::Database` or `graph::{SymbolNode}`) into individual words
+            for (_raw_id, source_file_id, import_name, import_source) in raw_imports {
+                // Determine if we have a source path we can resolve via aliases
+                let mut resolved_source = import_source.clone();
+                if let Some(src) = &import_source {
+                    for (alias, path_prefix) in &alias_map {
+                        if src.starts_with(alias) {
+                            resolved_source = Some(src.replace(alias, path_prefix));
+                            break;
+                        }
+                    }
+                }
+
+                // If we resolved a path, let's try to link exactly to that file's export
+                if let Some(src) = resolved_source {
+                    // Very rudimentary resolution: find a file containing the path
+                    let mut file_stmt = db.conn.prepare("SELECT id FROM files WHERE path LIKE ?1 LIMIT 1").unwrap();
+                    let search_path = format!("%{}%", src);
+                    if let Ok(target_file_id) = file_stmt.query_row(params![search_path], |row| row.get::<_, i64>(0)) {
+                        // find a symbol in that file that matches the name
+                        let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
+                        if let Ok(target_symbol_id) = sym_stmt.query_row(params![target_file_id, import_name], |row| row.get::<_, i64>(0)) {
+                            let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
+                            edges_created += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // Fallback to global symbol resolution
                 let words: Vec<&str> = import_name.split(|c: char| !c.is_alphanumeric()).collect();
-                
                 for word in words {
                     if word.is_empty() { continue; }
                     
-                    // 3. Ask the database if a real Symbol exists with this exact word
                     if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
-                        // 4. We found a match! Draw the physical Edge in the graph.
                         let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
                         edges_created += 1;
                     }

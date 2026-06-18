@@ -11,6 +11,9 @@ pub struct SymbolSourceResult {
     pub start_line: usize,
     pub end_line: usize,
     pub source: String,
+    pub directive: Option<String>,
+    pub route_path: Option<String>,
+    pub route_segment: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -23,7 +26,7 @@ pub struct FileSnippetResult {
 
 pub fn read_symbol_source(db: &Database, symbol: &str) -> Result<Vec<SymbolSourceResult>, String> {
     let mut stmt = db.conn.prepare(
-        "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte 
+        "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment 
          FROM symbols 
          JOIN files ON symbols.file_id = files.id 
          WHERE symbols.name = ?1 LIMIT 5"
@@ -39,6 +42,9 @@ pub fn read_symbol_source(db: &Database, symbol: &str) -> Result<Vec<SymbolSourc
         let end_line: i64 = row.get(3).unwrap_or(start_line);
         let start_byte: i64 = row.get(4).unwrap_or(0);
         let end_byte: i64 = row.get(5).unwrap_or(start_byte);
+        let directive: Option<String> = row.get(6).unwrap_or(None);
+        let route_path: Option<String> = row.get(7).unwrap_or(None);
+        let route_segment: Option<String> = row.get(8).unwrap_or(None);
         
         let mut source = String::new();
         if let Ok(content) = fs::read(&file_path) {
@@ -65,6 +71,9 @@ pub fn read_symbol_source(db: &Database, symbol: &str) -> Result<Vec<SymbolSourc
             start_line: start_line as usize,
             end_line: end_line as usize,
             source,
+            directive,
+            route_path,
+            route_segment,
         });
     }
     

@@ -78,6 +78,7 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
                 imports.push(ImportNode {
                     // Tree-sitter includes spaces sometimes, so we trim it
                     name: name.trim().to_string(),
+                    source: None,
                     line_number: node.start_position().row + 1,
                 });
             }

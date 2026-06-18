@@ -31,6 +31,10 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN start_byte INTEGER NOT NULL DEFAULT 0;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER NOT NULL DEFAULT 0;", []);
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN directive TEXT;", []);
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
+        let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
         
         Ok(())
     }
@@ -42,6 +46,14 @@ impl Database {
             params![path],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_file_metadata(&self, file_id: i64, directive: Option<&str>, route_path: Option<&str>, route_segment: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET directive = ?1, route_path = ?2, route_segment = ?3 WHERE id = ?4",
+            params![directive, route_path, route_segment, file_id],
+        )?;
+        Ok(())
     }
 
     /// Inserts a symbol attached to a specific file
@@ -56,8 +68,8 @@ impl Database {
     /// Inserts an import as a special kind of symbol
      pub fn insert_raw_import(&self, file_id: i64, import: &ImportNode) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO raw_imports (file_id, name, line_number) VALUES (?1, ?2, ?3)",
-            params![file_id, import.name, import.line_number as i64],
+            "INSERT INTO raw_imports (file_id, name, source, line_number) VALUES (?1, ?2, ?3, ?4)",
+            params![file_id, import.name, import.source, import.line_number as i64],
         )?;
         Ok(self.conn.last_insert_rowid())
     
@@ -66,15 +78,16 @@ impl Database {
     // new methods: 
 
         /// Pass 2 Helper: Gets all staged imports that need to be resolved
-    pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String)>> {
-        // Returns a tuple of (raw_import_id, file_id, import_name)
-        let mut stmt = self.conn.prepare("SELECT id, file_id, name FROM raw_imports")?;
+    pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String, Option<String>)>> {
+        // Returns a tuple of (raw_import_id, file_id, import_name, source)
+        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source FROM raw_imports")?;
         
         let import_iter = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
 
