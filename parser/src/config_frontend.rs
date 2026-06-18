@@ -25,7 +25,7 @@ impl LanguageFrontend for ConfigFrontend {
                             name: k.clone(),
                             kind: "dependency".to_string(),
                             prop_type: None,
-                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
+                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0, signature: None,
                         });
                     }
                 }
@@ -35,7 +35,7 @@ impl LanguageFrontend for ConfigFrontend {
                             name: k.clone(),
                             kind: "devDependency".to_string(),
                             prop_type: None,
-                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
+                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0, signature: None,
                         });
                     }
                 }
@@ -46,6 +46,7 @@ impl LanguageFrontend for ConfigFrontend {
                             kind: "script".to_string(),
                             prop_type: None,
                             start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
+                            signature: None,
                         });
                     }
                 }

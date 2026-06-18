@@ -26,34 +26,103 @@ impl LanguageFrontend for PythonFrontend {
 fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Language) -> Vec<SymbolNode> {
     let mut symbols = Vec::new();
     let query_str = "
-        (class_definition name: (identifier) @type)
-        (function_definition name: (identifier) @function)
+        (class_definition name: (identifier) @name) @class
+        (function_definition name: (identifier) @name) @function
     ";
     
-    let language = tree_sitter_python::LANGUAGE.into();
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
+        let mut name = String::new();
+        let mut kind = String::new();
+        let mut def_node = None;
+        
         for capture in m.captures {
-            let node = capture.node;
-            let capture_kind = &query.capture_names()[capture.index as usize];
-            if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
-                let parent = node.parent().unwrap_or(node);
-                let end_line = parent.end_position().row + 1;
-                symbols.push(SymbolNode {
-                    name: name.to_string(),
-                    kind: capture_kind.to_string(),
-                    prop_type: None,
-                    start_line: node.start_position().row + 1,
-                    end_line,
-                    start_byte: parent.start_byte(),
-                    end_byte: parent.end_byte(),
-                });
+            let capture_name = &query.capture_names()[capture.index as usize];
+            if *capture_name == "name" {
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    name = text.to_string();
+                }
+            } else if *capture_name == "class" {
+                kind = "class".to_string();
+                def_node = Some(capture.node);
+            } else if *capture_name == "function" {
+                kind = "function".to_string();
+                def_node = Some(capture.node);
             }
         }
+        
+        if let Some(node) = def_node {
+            let mut signature_parts = Vec::new();
+            
+            // 1. Check for decorators
+            if let Some(parent) = node.parent() {
+                if parent.kind() == "decorated_definition" {
+                    let mut wcursor = parent.walk();
+                    for child in parent.children(&mut wcursor) {
+                        if child.kind() == "decorator" {
+                            if let Ok(text) = child.utf8_text(source_code.as_bytes()) {
+                                signature_parts.push(format!("[{}]", text.trim()));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // 2. If it's a function, check if it's a method
+            if kind == "function" {
+                let mut current = node.parent();
+                while let Some(p) = current {
+                    if p.kind() == "class_definition" {
+                        if let Some(class_name_node) = p.child_by_field_name("name") {
+                            if let Ok(class_name) = class_name_node.utf8_text(source_code.as_bytes()) {
+                                name = format!("{}.{}", class_name, name);
+                                kind = "method".to_string();
+                            }
+                        }
+                        break;
+                    }
+                    if p.kind() == "decorated_definition" {
+                        current = p.parent();
+                        continue;
+                    }
+                    current = p.parent();
+                }
+                
+                // 3. Extract parameters for signature
+                if let Some(params_node) = node.child_by_field_name("parameters") {
+                    if let Ok(params_text) = params_node.utf8_text(source_code.as_bytes()) {
+                        let clean_params = params_text.replace("\n", "").replace("  ", " ");
+                        signature_parts.push(clean_params);
+                    }
+                }
+            }
+            
+            let signature = if signature_parts.is_empty() {
+                None
+            } else {
+                Some(signature_parts.join(" "))
+            };
+
+            let end_line = node.end_position().row + 1;
+            symbols.push(SymbolNode {
+                name,
+                kind,
+                prop_type: None,
+                start_line: node.start_position().row + 1,
+                end_line,
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                signature,
+            });
+        }
     }
+    
+    symbols.sort_by_key(|s| s.start_byte);
+    symbols.dedup_by_key(|s| s.start_byte);
+
     symbols
 }
 

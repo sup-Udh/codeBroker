@@ -9,6 +9,7 @@ pub struct ContextObject {
     pub target_kind: String,
     pub defining_file: String,
     pub line_number: usize,
+    pub signature: Option<String>,
 
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
@@ -25,7 +26,7 @@ impl ContextObject {
         
         // 1. Fetch the primary target's core definition (Distance-0 Context)
         let mut stmt = db.conn.prepare(
-            "SELECT symbols.name, symbols.kind, files.path, symbols.line_number, symbols.file_id
+            "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 LIMIT 1"
@@ -38,10 +39,11 @@ impl ContextObject {
                 row.get::<_, String>(2)?, // path
                 row.get::<_, i64>(3)?,    // line_number
                 row.get::<_, i64>(4)?,    // file_id
+                row.get::<_, Option<String>>(5)?, // signature
             ))
         });
 
-        let (name, kind, path, line_number, file_id) = match target_info {
+        let (name, kind, path, line_number, file_id, signature) = match target_info {
             Ok(info) => info,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e),
@@ -143,6 +145,7 @@ impl ContextObject {
             target_kind: kind,
             defining_file: path,
             line_number: line_number as usize,
+            signature,
             reverse_dependencies: rev_deps,
             forward_dependencies,
             siblings,

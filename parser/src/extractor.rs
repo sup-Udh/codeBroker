@@ -47,6 +47,7 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
                     end_line,
                     start_byte: parent.start_byte(),
                     end_byte: parent.end_byte(),
+                    signature: None,
                 });
             }
         }

@@ -17,8 +17,9 @@ pub const INIT_SQL: &str = "
         prop_type TEXT,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
-        start_byte INTEGER NOT NULL,
-        end_byte INTEGER NOT NULL,
+        start_byte INTEGER NOT NULL DEFAULT 0,
+        end_byte INTEGER NOT NULL DEFAULT 0,
+        signature TEXT,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 

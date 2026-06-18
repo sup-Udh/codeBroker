@@ -194,6 +194,11 @@ fn main() {
                             break;
                         }
                     }
+
+                    if resolved_source.is_none() && src.contains('.') && !src.contains('/') {
+                        let py_path = src.replace(".", "/");
+                        resolved_source = Some(format!("{}.py", py_path));
+                    }
                 }
 
                 // If we resolved a path, let's try to link exactly to that file's export
@@ -273,7 +278,7 @@ fn main() {
             
             // For Phase 0, we just do a raw SQL search across our symbols
             let mut stmt = db.conn.prepare(
-                "SELECT files.path, symbols.kind, symbols.name, symbols.line_number 
+                "SELECT files.path, symbols.kind, symbols.name, symbols.start_line 
                  FROM symbols 
                  JOIN files ON symbols.file_id = files.id 
                  WHERE symbols.name LIKE ?1"

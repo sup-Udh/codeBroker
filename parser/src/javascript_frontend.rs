@@ -82,6 +82,7 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     end_line,
                     start_byte: parent.start_byte(),
                     end_byte: parent.end_byte(),
+                    signature: None,
                 });
             }
         }

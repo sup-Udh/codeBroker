@@ -16,6 +16,7 @@ pub struct SymbolNode {
     pub end_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub signature: Option<String>,
 }
 
 pub struct ImportNode {
