@@ -61,8 +61,8 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let mut imports = Vec::new();
     // Grab any individual identifier inside any import statement
     let query_str = "
-        (import_statement) @import
-        (import_from_statement module_name: (identifier) @source) @import
+        (import_statement name: (_) @import)
+        (import_from_statement module_name: (_) @source name: (_) @import)
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -91,6 +91,7 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 name: import_name,
                 source: if import_source.is_empty() { None } else { Some(import_source) },
                 line_number,
+                kind: None,
             });
         }
     }

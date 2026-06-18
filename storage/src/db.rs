@@ -36,6 +36,7 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
+        let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
         
         Ok(())
     }
@@ -69,8 +70,8 @@ impl Database {
     /// Inserts an import as a special kind of symbol
      pub fn insert_raw_import(&self, file_id: i64, import: &ImportNode) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO raw_imports (file_id, name, source, line_number) VALUES (?1, ?2, ?3, ?4)",
-            params![file_id, import.name, import.source, import.line_number as i64],
+            "INSERT INTO raw_imports (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, import.name, import.source, import.line_number as i64, import.kind],
         )?;
         Ok(self.conn.last_insert_rowid())
     
@@ -79,9 +80,9 @@ impl Database {
     // new methods: 
 
         /// Pass 2 Helper: Gets all staged imports that need to be resolved
-    pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String, Option<String>)>> {
-        // Returns a tuple of (raw_import_id, file_id, import_name, source)
-        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source FROM raw_imports")?;
+    pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>)>> {
+        // Returns a tuple of (raw_import_id, file_id, import_name, source, kind)
+        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source, kind FROM raw_imports")?;
         
         let import_iter = stmt.query_map([], |row| {
             Ok((
@@ -89,6 +90,7 @@ impl Database {
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
 

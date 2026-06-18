@@ -37,6 +37,7 @@ pub const INIT_SQL: &str = "
         name TEXT NOT NULL,
         source TEXT,
         line_number INTEGER NOT NULL,
+        kind TEXT,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 

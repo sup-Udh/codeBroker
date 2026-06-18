@@ -100,6 +100,9 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             (import_clause (identifier) @import)
             source: (string (string_fragment) @source)
         )
+        (jsx_opening_element (identifier) @jsx_element)
+        (jsx_self_closing_element (identifier) @jsx_element)
+        (call_expression function: (identifier) @hook_call)
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -111,6 +114,8 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         let mut import_source = String::new();
         let mut line_number = 0;
 
+        let mut import_kind = "imports".to_string();
+
         for capture in m.captures {
             let node = capture.node;
             let capture_kind = &query.capture_names()[capture.index as usize];
@@ -120,6 +125,20 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "source" {
                     import_source = text.trim().to_string();
+                } else if *capture_kind == "jsx_element" {
+                    let name = text.trim().to_string();
+                    if name.chars().next().unwrap_or('a').is_uppercase() {
+                        import_name = name;
+                        import_kind = "renders_component".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "hook_call" {
+                    let name = text.trim().to_string();
+                    if name.starts_with("use") {
+                        import_name = name;
+                        import_kind = "consumes_hook".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
                 }
             }
         }
@@ -129,6 +148,7 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 name: import_name,
                 source: if import_source.is_empty() { None } else { Some(import_source) },
                 line_number,
+                kind: Some(import_kind),
             });
         }
     }

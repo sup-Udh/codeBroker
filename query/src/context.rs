@@ -15,6 +15,8 @@ pub struct ContextObject {
     pub forward_dependencies: Vec<String>, // what this file imports
     pub prop_interfaces: Vec<crate::retrieval::SymbolSourceResult>, // bundled prop interfaces
     pub wrapped_by: Vec<String>, // layout files that wrap this route
+    pub renders_components: Vec<String>, // components rendered by this file
+    pub consumes_hooks: Vec<String>, // hooks consumed by this file
 }
 
 impl ContextObject {
@@ -109,6 +111,32 @@ impl ContextObject {
             wrapped_by.push(row.get(0)?);
         }
 
+        // 4.7 Fetch Rendered Components
+        let mut render_stmt = db.conn.prepare(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id
+             WHERE edges.source_file_id = ?1 AND edges.kind = 'renders_component'"
+        )?;
+        let mut render_rows = render_stmt.query(rusqlite::params![file_id])?;
+        let mut renders_components = Vec::new();
+        while let Some(row) = render_rows.next()? {
+            renders_components.push(row.get(0)?);
+        }
+
+        // 4.8 Fetch Consumed Hooks
+        let mut hook_stmt = db.conn.prepare(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id
+             WHERE edges.source_file_id = ?1 AND edges.kind = 'consumes_hook'"
+        )?;
+        let mut hook_rows = hook_stmt.query(rusqlite::params![file_id])?;
+        let mut consumes_hooks = Vec::new();
+        while let Some(row) = hook_rows.next()? {
+            consumes_hooks.push(row.get(0)?);
+        }
+
         // 5. Package it all up into our pristine, JSON-ready Context Object
         Ok(Some(ContextObject {
             target_name: name,
@@ -120,6 +148,8 @@ impl ContextObject {
             siblings,
             prop_interfaces,
             wrapped_by,
+            renders_components,
+            consumes_hooks,
         }))
     }
 }

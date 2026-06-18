@@ -62,6 +62,8 @@ fn main() {
 
             // 1.5 Load Aliases
             let mut alias_map: Vec<(String, String)> = Vec::new();
+            
+            // A. Try tsconfig.json / jsconfig.json
             if let Ok(config_str) = fs::read_to_string("tsconfig.json").or_else(|_| fs::read_to_string("jsconfig.json")) {
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                     if let Some(paths) = json.get("compilerOptions").and_then(|c| c.get("paths")).and_then(|p| p.as_object()) {
@@ -77,6 +79,25 @@ fn main() {
                     }
                 }
             }
+
+            // B. Try vite.config.ts / vite.config.js
+            if let Ok(config_str) = fs::read_to_string("vite.config.ts").or_else(|_| fs::read_to_string("vite.config.js")) {
+                if let Ok(re) = regex::Regex::new(r#"['"]?([^'"]+)['"]?\s*:\s*(?:fileURLToPath\(new URL\(['"]([^'"]+)['"]|path\.resolve\(__dirname,\s*['"]([^'"]+)['"]|['"]([^'"]+)['"])"#) {
+                    for cap in re.captures_iter(&config_str) {
+                        let key = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                        let val = cap.get(2)
+                            .or_else(|| cap.get(3))
+                            .or_else(|| cap.get(4))
+                            .map_or("", |m| m.as_str())
+                            .to_string();
+                        if !key.is_empty() && !val.is_empty() {
+                            let val_clean = val.replace("./", "");
+                            alias_map.push((key, val_clean));
+                        }
+                    }
+                }
+            }
+
             if alias_map.is_empty() {
                 alias_map.push(("@/".to_string(), "src/".to_string()));
             }
@@ -162,7 +183,8 @@ fn main() {
             let mut edges_created = 0;
 
             // 2. Loop through every single staged import
-            for (_raw_id, source_file_id, import_name, import_source) in raw_imports {
+            for (_raw_id, source_file_id, import_name, import_source, import_kind) in raw_imports {
+                let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
                 // Determine if we have a source path we can resolve via aliases
                 let mut resolved_source = import_source.clone();
                 if let Some(src) = &import_source {
@@ -183,7 +205,7 @@ fn main() {
                         // find a symbol in that file that matches the name
                         let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
                         if let Ok(target_symbol_id) = sym_stmt.query_row(params![target_file_id, import_name], |row| row.get::<_, i64>(0)) {
-                            let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
+                            let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
                             edges_created += 1;
                             continue;
                         }
@@ -196,7 +218,7 @@ fn main() {
                     if word.is_empty() { continue; }
                     
                     if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
-                        let _ = db.insert_edge(source_file_id, target_symbol_id, "imports");
+                        let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
                         edges_created += 1;
                     }
                 }

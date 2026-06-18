@@ -22,4 +22,5 @@ pub struct ImportNode {
     pub name: String,
     pub source: Option<String>,
     pub line_number: usize,
+    pub kind: Option<String>, // e.g., "imports", "renders_component", "consumes_hook"
 }

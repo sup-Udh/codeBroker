@@ -236,6 +236,7 @@ dependencies = [
  "indexer",
  "parser",
  "query",
+ "regex",
  "rusqlite",
  "semantic",
  "serde",

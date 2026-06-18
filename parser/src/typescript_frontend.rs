@@ -29,7 +29,7 @@ impl LanguageFrontend for TypeScriptFrontend {
         };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
-        let imports = extract_ts_imports(&tree, source_code, language);
+        let imports = extract_ts_imports(&tree, source_code, language, false);
 
         Some((metadata, symbols, imports))
     }
@@ -62,7 +62,7 @@ impl LanguageFrontend for TsxFrontend {
         };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
-        let imports = extract_ts_imports(&tree, source_code, language);
+        let imports = extract_ts_imports(&tree, source_code, language, true);
 
         Some((metadata, symbols, imports))
     }
@@ -152,9 +152,9 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     symbols
 }
 
-fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Language) -> Vec<ImportNode> {
+fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Language, is_tsx: bool) -> Vec<ImportNode> {
     let mut imports = Vec::new();
-    let query_str = "
+    let mut query_str = String::from("
         (import_statement 
             (import_clause (named_imports (import_specifier name: (identifier) @import)))
             source: (string (string_fragment) @source)
@@ -163,9 +163,20 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             (import_clause (identifier) @import)
             source: (string (string_fragment) @source)
         )
-    ";
+        (call_expression function: (identifier) @hook_call)
+    ");
     
-    let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
+    if is_tsx {
+        query_str.push_str("
+        (jsx_opening_element (identifier) @jsx_element)
+        (jsx_self_closing_element (identifier) @jsx_element)
+        ");
+    }
+    
+    let query = match Query::new(&language, &query_str) {
+        Ok(q) => q,
+        Err(_) => return imports, // Fallback gracefully if query fails
+    };
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
@@ -173,6 +184,8 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         let mut import_name = String::new();
         let mut import_source = String::new();
         let mut line_number = 0;
+
+        let mut import_kind = "imports".to_string();
 
         for capture in m.captures {
             let node = capture.node;
@@ -183,6 +196,20 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "source" {
                     import_source = text.trim().to_string();
+                } else if *capture_kind == "jsx_element" {
+                    let name = text.trim().to_string();
+                    if name.chars().next().unwrap_or('a').is_uppercase() {
+                        import_name = name;
+                        import_kind = "renders_component".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "hook_call" {
+                    let name = text.trim().to_string();
+                    if name.starts_with("use") {
+                        import_name = name;
+                        import_kind = "consumes_hook".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
                 }
             }
         }
@@ -192,6 +219,7 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 name: import_name,
                 source: if import_source.is_empty() { None } else { Some(import_source) },
                 line_number,
+                kind: Some(import_kind),
             });
         }
     }
