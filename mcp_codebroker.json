@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codebroker": {
+      "command": "cargo",
+      "args": ["run", "-p", "mcp"],
+      "cwd": "/home/labuser/code/codeBroker",
+      "env": {
+        "HF_API_TOKEN": "your-token-here"
+      }
+    }
+  }
+}
