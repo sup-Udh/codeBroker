@@ -179,6 +179,24 @@ fn main() {
                                         }
                                     },
                                     {
+                                        "name": "read_file_skeleton",
+                                        "description": "Returns a skeletonized view of a file where sibling functions and classes are collapsed down to their signatures.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "file_path": {
+                                                    "type": "string",
+                                                    "description": "The path to the file to skeletonize."
+                                                },
+                                                "target_symbol": {
+                                                    "type": "string",
+                                                    "description": "Optional. The exact name of the symbol to keep fully expanded. All other sibling symbols will be collapsed."
+                                                }
+                                            },
+                                            "required": ["file_path"]
+                                        }
+                                    },
+                                    {
                                         "name": "read_file_snippet",
                                         "description": "Read a specific line range from a file.",
                                         "inputSchema": {
