@@ -14,7 +14,8 @@ pub struct ContextObject {
 
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
-    pub forward_dependencies: Vec<String>, // what this file imports
+    pub forward_dependencies: Vec<String>, // local symbols this file imports
+    pub external_imports: Vec<String>, // unresolved or third-party package imports
     pub prop_interfaces: Vec<crate::retrieval::SymbolSourceResult>, // bundled prop interfaces
     pub wrapped_by: Vec<String>, // layout files that wrap this route
     pub renders_components: Vec<String>, // components rendered by this file
@@ -88,7 +89,7 @@ impl ContextObject {
             siblings.push(row.get(0)?);
         }
 
-        // 4. Fetch Forward Dependencies (What does this file import?)
+        // 4. Fetch Forward Dependencies (Local symbols this file imports)
         let mut fwd_stmt = db.conn.prepare(
             "SELECT symbols.name 
              FROM edges 
@@ -99,7 +100,33 @@ impl ContextObject {
         let mut fwd_rows = fwd_stmt.query(rusqlite::params![file_id])?;
         let mut forward_dependencies = Vec::new();
         while let Some(row) = fwd_rows.next()? {
-            forward_dependencies.push(row.get(0)?);
+            forward_dependencies.push(row.get::<_, String>(0)?);
+        }
+
+        // 4.1 Fetch External / Unresolved Imports
+        // Get all raw imports and diff them against the resolved local symbols
+        let mut ext_stmt = db.conn.prepare(
+            "SELECT name, source FROM raw_imports WHERE file_id = ?1"
+        )?;
+        let mut ext_rows = ext_stmt.query(rusqlite::params![file_id])?;
+        let mut external_imports = Vec::new();
+        while let Some(row) = ext_rows.next()? {
+            let name: String = row.get(0)?;
+            let source: Option<String> = row.get(1)?;
+            
+            // If the raw import name is NOT in our resolved local edges, it's external
+            if !forward_dependencies.contains(&name) {
+                if let Some(src) = source {
+                    // Only add the 'from' if it's explicitly available, preventing redundancy
+                    if !src.is_empty() {
+                        external_imports.push(format!("{} (from {})", name, src));
+                    } else {
+                        external_imports.push(name);
+                    }
+                } else {
+                    external_imports.push(name);
+                }
+            }
         }
 
         // 4.5 Fetch Props Interfaces
@@ -209,6 +236,7 @@ impl ContextObject {
             reverse_dependencies: abs_rev_deps,
             siblings,
             forward_dependencies,
+            external_imports,
             prop_interfaces,
             wrapped_by: abs_wrapped_by,
             renders_components,

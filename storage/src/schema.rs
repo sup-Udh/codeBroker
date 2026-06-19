@@ -67,6 +67,15 @@ pub const INIT_SQL: &str = "
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS subsystem_overviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        subsystem_name TEXT NOT NULL,
+        subsystem_hash TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        overview_text TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     -- Layer 4.5: Unified Analytics Events
     CREATE TABLE IF NOT EXISTS mcp_analytics_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

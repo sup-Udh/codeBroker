@@ -212,6 +212,28 @@ fn main() {
                                             },
                                             "required": ["symbol"]
                                         }
+                                    },
+                                    {
+                                        "name": "subsystem_stats",
+                                        "description": "Deterministic discovery of a subsystem (files, symbols, dependencies, entrypoints). Does not use AI.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "subsystem_name": { "type": "string" }
+                                            },
+                                            "required": ["subsystem_name"]
+                                        }
+                                    },
+                                    {
+                                        "name": "subsystem_overview",
+                                        "description": "Generate an AI architectural explanation of a subsystem.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "subsystem_name": { "type": "string" }
+                                            },
+                                            "required": ["subsystem_name"]
+                                        }
                                     }
                                 ]
                             }),
@@ -391,6 +413,19 @@ fn main() {
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
+                            "read_file_skeleton" => {
+                                let path = arguments.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
+                                let target_symbol = arguments.get("target_symbol").and_then(|s| s.as_str());
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::retrieval::skeletonize_file(&db, path, target_symbol) {
+                                            Ok(res) => res,
+                                            Err(e) => format!("Error reading file skeleton: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
                             "read_file_snippet" => {
                                 let path = arguments.get("path").and_then(|s| s.as_str()).unwrap_or("");
                                 let start_line = arguments.get("start_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
@@ -429,6 +464,46 @@ fn main() {
                                             "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
                                         });
                                         serde_json::to_string_pretty(&edit_context).unwrap_or_default()
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "subsystem_stats" => {
+                                let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::subsystem::discover_subsystem(&db, name) {
+                                            Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
+                                            Err(e) => format!("Error discovering subsystem: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "subsystem_overview" => {
+                                let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        let _ = db.init_schema();
+                                        match query::subsystem::discover_subsystem(&db, name) {
+                                            Ok(stats) => {
+                                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                                if hf_token.is_empty() {
+                                                    "Error: HF_API_TOKEN environment variable is not set.".to_string()
+                                                } else {
+                                                    let provider: Box<dyn semantic::provider::LlmProvider> = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                                    let generator = semantic::subsystem::SubsystemOverviewGenerator::new(&provider, &db, "qwen2.5-coder".to_string());
+                                                    match generator.generate_overview(&stats) {
+                                                        Ok(overview) => {
+                                                            cache_hit = false;
+                                                            overview
+                                                        }
+                                                        Err(e) => format!("Error generating overview: {}", e)
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => format!("Error discovering subsystem: {}", e),
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }

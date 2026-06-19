@@ -169,3 +169,78 @@ pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Resu
         source,
     })
 }
+
+pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&str>) -> Result<String, String> {
+    let content = fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    
+    let mut file_id_stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1").map_err(|e| e.to_string())?;
+    let file_id: i64 = file_id_stmt.query_row(rusqlite::params![file_path], |r| Ok(r.get::<_, i64>(0).unwrap_or(0))).unwrap_or(0);
+    if file_id == 0 {
+        return Err(format!("File '{}' not found in index.", file_path));
+    }
+    
+    let mut target_start = 0;
+    let mut target_end = 0;
+    if let Some(target) = target_symbol {
+        let mut target_stmt = db.conn.prepare("SELECT start_byte, end_byte FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").map_err(|e| e.to_string())?;
+        if let Ok((ts, te)) = target_stmt.query_row(rusqlite::params![file_id, target], |r| Ok((r.get::<_, i64>(0).unwrap_or(0), r.get::<_, i64>(1).unwrap_or(0)))) {
+            target_start = ts;
+            target_end = te;
+        } else {
+            return Err(format!("Symbol '{}' not found in '{}'", target, file_path));
+        }
+    }
+    
+    let mut stmt = db.conn.prepare("SELECT name, start_byte, end_byte, signature FROM symbols WHERE file_id = ?1 ORDER BY start_byte ASC").map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(rusqlite::params![file_id]).map_err(|e| e.to_string())?;
+    
+    let mut output = String::new();
+    let mut current_byte: usize = 0;
+    
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let name: String = row.get(0).unwrap_or_default();
+        let start_byte: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
+        let end_byte: usize = row.get::<_, i64>(2).unwrap_or(0) as usize;
+        let signature: Option<String> = row.get(3).unwrap_or(None);
+        
+        if start_byte < current_byte {
+            continue;
+        }
+        
+        let mut contains_target = false;
+        if target_symbol.is_some() {
+            if start_byte <= target_start as usize && end_byte >= target_end as usize {
+                contains_target = true;
+            }
+        }
+        
+        if contains_target {
+            continue;
+        }
+        
+        if current_byte <= start_byte && start_byte <= content.len() {
+            output.push_str(&String::from_utf8_lossy(&content[current_byte..start_byte]));
+        }
+        
+        let sig = signature.unwrap_or(name);
+        output.push_str(&sig);
+        
+        if file_path.ends_with(".py") {
+            if !sig.trim_end().ends_with(':') {
+                output.push_str(":\n    ... ");
+            } else {
+                output.push_str("\n    ... ");
+            }
+        } else {
+            output.push_str(" { ... }");
+        }
+        
+        current_byte = end_byte;
+    }
+    
+    if current_byte < content.len() {
+        output.push_str(&String::from_utf8_lossy(&content[current_byte..]));
+    }
+    
+    Ok(output)
+}

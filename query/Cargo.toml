@@ -10,5 +10,6 @@ graph = { path = "../graph" }
 rusqlite = "0.40.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json="1.0"
+sha2 = "0.10.8"
 storage = { path = "../storage" }
 
