@@ -227,3 +227,181 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
         edges,
     })
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PathNode {
+    pub symbol_name: String,
+    pub symbol_kind: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PathEdge {
+    pub source: String,
+    pub target: String,
+    pub edge_kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShortestPathResponse {
+    pub from: String,
+    pub to: String,
+    pub found: bool,
+    pub distance: usize,
+    pub nodes: Vec<PathNode>,
+    pub edges: Vec<PathEdge>,
+}
+
+pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Result<ShortestPathResponse> {
+    // 1. Find root and target symbol IDs
+    let mut stmt = db.conn.prepare(
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.name = ?1 LIMIT 1"
+    )?;
+    
+    let from_info: Option<(i64, String, String, String)> = stmt.query_row(rusqlite::params![from_symbol], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }).optional()?;
+
+    let to_info: Option<(i64, String, String, String)> = stmt.query_row(rusqlite::params![to_symbol], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }).optional()?;
+
+    if from_info.is_none() || to_info.is_none() {
+        return Ok(ShortestPathResponse {
+            from: from_symbol.to_string(),
+            to: to_symbol.to_string(),
+            found: false,
+            distance: 0,
+            nodes: vec![],
+            edges: vec![],
+        });
+    }
+
+    let from_info = from_info.unwrap();
+    let to_info = to_info.unwrap();
+
+    let from_id = from_info.0;
+    let to_id = to_info.0;
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    
+    // Maps target_id -> (source_id, edge_kind)
+    let mut parent_map: std::collections::HashMap<i64, (i64, String)> = std::collections::HashMap::new();
+
+    queue.push_back(from_id);
+    visited.insert(from_id);
+
+    let mut out_stmt = db.conn.prepare(
+        "SELECT target_symbol_id, kind 
+         FROM edges 
+         WHERE source_file_id = (SELECT file_id FROM symbols WHERE id = ?1 LIMIT 1)"
+    )?;
+
+    let mut found = false;
+
+    while let Some(curr_id) = queue.pop_front() {
+        if curr_id == to_id {
+            found = true;
+            break;
+        }
+
+        let mut out_rows = out_stmt.query(rusqlite::params![curr_id])?;
+        while let Some(row) = out_rows.next()? {
+            let target_id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+
+            if !visited.contains(&target_id) {
+                visited.insert(target_id);
+                parent_map.insert(target_id, (curr_id, kind));
+                queue.push_back(target_id);
+                
+                // Early exit if we found the target
+                if target_id == to_id {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found {
+            break;
+        }
+    }
+
+    if !found {
+        return Ok(ShortestPathResponse {
+            from: from_symbol.to_string(),
+            to: to_symbol.to_string(),
+            found: false,
+            distance: 0,
+            nodes: vec![],
+            edges: vec![],
+        });
+    }
+
+    // Reconstruct path
+    let mut path_edges = Vec::new();
+    let mut path_nodes = Vec::new();
+    let mut current = to_id;
+
+    // We will collect edges backwards from 'to' to 'from'
+    let mut path_ids = vec![current];
+    let mut edges_backward = Vec::new();
+
+    while current != from_id {
+        if let Some(&(parent_id, ref kind)) = parent_map.get(&current) {
+            edges_backward.push((parent_id, current, kind.clone()));
+            current = parent_id;
+            path_ids.push(current);
+        } else {
+            break;
+        }
+    }
+
+    // Reverse to get 'from' -> 'to'
+    path_ids.reverse();
+    edges_backward.reverse();
+
+    let mut resolve_sym_stmt = db.conn.prepare(
+        "SELECT symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.id = ?1 LIMIT 1"
+    )?;
+
+    for id in path_ids {
+        if let Ok((name, kind, path)) = resolve_sym_stmt.query_row(rusqlite::params![id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }) {
+            path_nodes.push(PathNode {
+                symbol_name: name,
+                symbol_kind: kind,
+                file_path: path,
+            });
+        }
+    }
+
+    for (src_id, tgt_id, kind) in edges_backward {
+        // Let's just use IDs as strings or resolve them
+        let src_name_str = resolve_sym_stmt.query_row(rusqlite::params![src_id], |r| r.get::<_, String>(0)).unwrap_or_else(|_| src_id.to_string());
+        let tgt_name_str = resolve_sym_stmt.query_row(rusqlite::params![tgt_id], |r| r.get::<_, String>(0)).unwrap_or_else(|_| tgt_id.to_string());
+
+        path_edges.push(PathEdge {
+            source: src_name_str,
+            target: tgt_name_str,
+            edge_kind: kind,
+        });
+    }
+
+    Ok(ShortestPathResponse {
+        from: from_symbol.to_string(),
+        to: to_symbol.to_string(),
+        found: true,
+        distance: path_edges.len(),
+        nodes: path_nodes,
+        edges: path_edges,
+    })
+}

@@ -265,6 +265,18 @@ fn main() {
                                             },
                                             "required": ["symbol", "depth", "direction"]
                                         }
+                                    },
+                                    {
+                                        "name": "shortest_path",
+                                        "description": "Find the shortest relationship path between two symbols in the repository graph.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "from": { "type": "string", "description": "The starting symbol" },
+                                                "to": { "type": "string", "description": "The target symbol" }
+                                            },
+                                            "required": ["from", "to"]
+                                        }
                                     }
                                 ]
                             }),
@@ -469,6 +481,23 @@ fn main() {
                                         match query::graph::explore_graph(&db, symbol, depth, direction) {
                                             Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph".to_string()),
                                             Err(e) => format!("Error exploring graph: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "shortest_path" => {
+                                let from_symbol = arguments.get("from").and_then(|s| s.as_str()).unwrap_or("");
+                                let to_symbol = arguments.get("to").and_then(|s| s.as_str()).unwrap_or("");
+                                
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::graph::shortest_path(&db, from_symbol, to_symbol) {
+                                            Ok(res) => {
+                                                estimated_raw_context_tokens = res.nodes.len() * 50; // rough estimation
+                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing path".to_string())
+                                            },
+                                            Err(e) => format!("Error finding shortest path: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
