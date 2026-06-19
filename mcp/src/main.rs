@@ -252,6 +252,19 @@ fn main() {
                                             },
                                             "required": ["subsystem_name"]
                                         }
+                                    },
+                                    {
+                                        "name": "explore_graph",
+                                        "description": "Explore the code graph from a symbol using BFS traversal.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": { "type": "string" },
+                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." },
+                                                "direction": { "type": "string", "description": "Incoming, Outgoing, or Both" }
+                                            },
+                                            "required": ["symbol", "depth", "direction"]
+                                        }
                                     }
                                 ]
                             }),
@@ -439,6 +452,23 @@ fn main() {
                                         match query::retrieval::skeletonize_file(&db, path, target_symbol) {
                                             Ok(res) => res,
                                             Err(e) => format!("Error reading file skeleton: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "explore_graph" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(2) as usize;
+                                let direction_str = arguments.get("direction").and_then(|s| s.as_str()).unwrap_or("both");
+                                let direction = query::graph::GraphDirection::from(direction_str);
+                                
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                        match query::graph::explore_graph(&db, symbol, depth, direction) {
+                                            Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph".to_string()),
+                                            Err(e) => format!("Error exploring graph: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
