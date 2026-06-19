@@ -14,6 +14,8 @@ pub struct SymbolSourceResult {
     pub directive: Option<String>,
     pub route_path: Option<String>,
     pub route_segment: Option<String>,
+    #[serde(default)]
+    pub is_dependency: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -24,7 +26,7 @@ pub struct FileSnippetResult {
     pub source: String,
 }
 
-pub fn read_symbol_source(db: &Database, symbol: &str) -> Result<Vec<SymbolSourceResult>, String> {
+pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: bool) -> Result<Vec<SymbolSourceResult>, String> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment 
          FROM symbols 
@@ -67,17 +69,84 @@ pub fn read_symbol_source(db: &Database, symbol: &str) -> Result<Vec<SymbolSourc
         results.push(SymbolSourceResult {
             symbol_name: symbol.to_string(),
             symbol_kind: kind,
-            file_path,
+            file_path: file_path.clone(),
             start_line: start_line as usize,
             end_line: end_line as usize,
             source,
             directive,
             route_path,
             route_segment,
+            is_dependency: false,
         });
+        
+        if include_dependencies {
+            let mut file_id_stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1").unwrap();
+            if let Ok(file_id) = file_id_stmt.query_row(rusqlite::params![file_path], |r: &rusqlite::Row| Ok(r.get::<_, i64>(0).unwrap_or(0))) {
+                // To fetch dependencies, we need the signature. Since read_symbol_source doesn't fetch signature by default,
+                // we'll quickly query the signature from the symbols table for this specific symbol id.
+                let mut sig_stmt = db.conn.prepare("SELECT signature FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
+                let signature: Option<String> = sig_stmt.query_row(rusqlite::params![file_id, symbol], |r: &rusqlite::Row| Ok(r.get::<_, Option<String>>(0).unwrap_or(None))).unwrap_or(None);
+                
+                let deps = fetch_data_model_dependencies(db, symbol, file_id, signature.as_deref());
+                results.extend(deps);
+            }
+        }
     }
     
     Ok(results)
+}
+
+pub fn fetch_data_model_dependencies(db: &Database, _symbol_name: &str, file_id: i64, signature: Option<&str>) -> Vec<SymbolSourceResult> {
+    let mut deps = Vec::new();
+    
+    // Schema Auto-Expansion (Python & TS Types)
+    if let Some(sig) = signature {
+        let words: Vec<&str> = sig.split(|c: char| !c.is_alphabetic()).collect();
+        for word in words {
+            if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" {
+                continue;
+            }
+            // Check if this word exists as a symbol
+            let mut check_stmt = db.conn.prepare("SELECT name, file_id FROM symbols WHERE name = ?1 LIMIT 1").unwrap();
+            if let Ok((_name, found_file_id)) = check_stmt.query_row(rusqlite::params![word], |row| Ok((row.get::<_, String>(0).unwrap(), row.get::<_, i64>(1).unwrap()))) {
+                if let Ok(mut srcs) = read_symbol_source(db, word, false) { // false to prevent infinite recursion
+                    for src in &mut srcs { src.is_dependency = true; }
+                    deps.extend(srcs);
+                }
+                
+                // Follow inherits edges!
+                let mut inherits_stmt = db.conn.prepare(
+                    "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND edges.kind = 'inherits'"
+                ).unwrap();
+                let mut inherits_rows = inherits_stmt.query(rusqlite::params![found_file_id]).unwrap();
+                while let Some(i_row) = inherits_rows.next().unwrap_or(None) {
+                    let i_name: String = i_row.get(0).unwrap();
+                    if let Ok(mut srcs) = read_symbol_source(db, &i_name, false) {
+                        for src in &mut srcs { src.is_dependency = true; }
+                        deps.extend(srcs);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: Also check if THIS file defines inherits or accepts_props edges directly
+    let mut direct_edges_stmt = db.conn.prepare(
+        "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND (edges.kind = 'inherits' OR edges.kind = 'accepts_props')"
+    ).unwrap();
+    let mut direct_rows = direct_edges_stmt.query(rusqlite::params![file_id]).unwrap();
+    while let Some(row) = direct_rows.next().unwrap_or(None) {
+        let name: String = row.get(0).unwrap();
+        // Prevent dupes if it was already fetched via signature
+        if !deps.iter().any(|d| d.symbol_name == name) {
+            if let Ok(mut srcs) = read_symbol_source(db, &name, false) {
+                for src in &mut srcs { src.is_dependency = true; }
+                deps.extend(srcs);
+            }
+        }
+    }
+
+    deps
 }
 
 pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Result<FileSnippetResult, String> {

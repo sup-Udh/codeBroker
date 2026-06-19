@@ -169,7 +169,11 @@ fn main() {
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string" }
+                                                "symbol": { "type": "string" },
+                                                "include_dependencies": { 
+                                                    "type": "boolean",
+                                                    "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)." 
+                                                }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -376,9 +380,10 @@ fn main() {
                             }
                             "read_symbol_source" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
                                 match storage::Database::new("codebroker.db") {
                                     Ok(db) => {
-                                        match query::retrieval::read_symbol_source(&db, symbol) {
+                                        match query::retrieval::read_symbol_source(&db, symbol, include_deps) {
                                             Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
                                             Err(e) => format!("Error reading source: {}", e),
                                         }
@@ -397,9 +402,10 @@ fn main() {
                             }
                             "get_implementation" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
                                 match storage::Database::new("codebroker.db") {
                                     Ok(db) => {
-                                        let source = query::retrieval::read_symbol_source(&db, symbol).unwrap_or_default();
+                                        let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
                                         let implementation = serde_json::json!({
                                             "symbol_source": source,
@@ -414,7 +420,7 @@ fn main() {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 match storage::Database::new("codebroker.db") {
                                     Ok(db) => {
-                                        let source = query::retrieval::read_symbol_source(&db, symbol).unwrap_or_default();
+                                        let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
                                         let edit_context = serde_json::json!({
                                             "target_implementation": source,

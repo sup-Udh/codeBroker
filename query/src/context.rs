@@ -114,39 +114,14 @@ impl ContextObject {
         let mut prop_interfaces = Vec::new();
         while let Some(row) = props_rows.next()? {
             let prop_name: String = row.get(0)?;
-            if let Ok(srcs) = crate::retrieval::read_symbol_source(db, &prop_name) {
+            if let Ok(srcs) = crate::retrieval::read_symbol_source(db, &prop_name, false) {
                 prop_interfaces.extend(srcs);
             }
         }
 
         // Schema Auto-Expansion (Python & TS Types)
-        if let Some(sig) = &signature {
-            let words: Vec<&str> = sig.split(|c: char| !c.is_alphabetic()).collect();
-            for word in words {
-                if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" {
-                    continue;
-                }
-                // Check if this word exists as a symbol
-                let mut check_stmt = db.conn.prepare("SELECT name, file_id FROM symbols WHERE name = ?1 LIMIT 1").unwrap();
-                if let Ok((_name, found_file_id)) = check_stmt.query_row(rusqlite::params![word], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))) {
-                    if let Ok(srcs) = crate::retrieval::read_symbol_source(db, word) {
-                        prop_interfaces.extend(srcs);
-                    }
-                    
-                    // NEW: Follow inherits edges!
-                    let mut inherits_stmt = db.conn.prepare(
-                        "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND edges.kind = 'inherits'"
-                    ).unwrap();
-                    let mut inherits_rows = inherits_stmt.query(rusqlite::params![found_file_id]).unwrap();
-                    while let Some(i_row) = inherits_rows.next().unwrap_or(None) {
-                        let i_name: String = i_row.get(0).unwrap();
-                        if let Ok(srcs) = crate::retrieval::read_symbol_source(db, &i_name) {
-                            prop_interfaces.extend(srcs);
-                        }
-                    }
-                }
-            }
-        }
+        let deps = crate::retrieval::fetch_data_model_dependencies(db, &name, file_id, signature.as_deref());
+        prop_interfaces.extend(deps);
 
         // 4.6 Fetch Wrappers
         // Find 'wraps_route' edges pointing to THIS symbol
