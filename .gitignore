@@ -19,3 +19,5 @@
 # add storages additional files. like in the gitignore
 .env
  
+# ignore yaml files with secrets
+**/*.yaml
