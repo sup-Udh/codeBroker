@@ -28,6 +28,7 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let query_str = "
         (class_definition name: (identifier) @name) @class
         (function_definition name: (identifier) @name) @function
+        (expression_statement (assignment left: (identifier) @name)) @variable
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -50,6 +51,9 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 def_node = Some(capture.node);
             } else if *capture_name == "function" {
                 kind = "function".to_string();
+                def_node = Some(capture.node);
+            } else if *capture_name == "variable" {
+                kind = "variable".to_string();
                 def_node = Some(capture.node);
             }
         }
@@ -132,6 +136,8 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let query_str = "
         (import_statement name: (_) @import)
         (import_from_statement module_name: (_) @source name: (_) @import)
+        (class_definition superclasses: (argument_list (identifier) @inherits))
+        (assignment right: (call function: (identifier) @instantiates))
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -141,6 +147,7 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     while let Some(m) = matches.next() {
         let mut import_name = String::new();
         let mut import_source = String::new();
+        let mut import_kind = None;
         let mut line_number = 0;
         
         for capture in m.captures {
@@ -152,6 +159,14 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "source" {
                     import_source = text.trim().to_string();
+                } else if *capture_kind == "inherits" {
+                    import_name = text.trim().to_string();
+                    line_number = node.start_position().row + 1;
+                    import_kind = Some("inherits".to_string());
+                } else if *capture_kind == "instantiates" {
+                    import_name = text.trim().to_string();
+                    line_number = node.start_position().row + 1;
+                    import_kind = Some("instantiates".to_string());
                 }
             }
         }
@@ -160,7 +175,7 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 name: import_name,
                 source: if import_source.is_empty() { None } else { Some(import_source) },
                 line_number,
-                kind: None,
+                kind: import_kind,
             });
         }
     }

@@ -10,6 +10,7 @@ pub struct ContextObject {
     pub defining_file: String,
     pub line_number: usize,
     pub signature: Option<String>,
+    pub decorators: Vec<String>,
 
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
@@ -43,9 +44,29 @@ impl ContextObject {
             ))
         });
 
+        if symbol_name.trim().is_empty() {
+            return Ok(None);
+        }
+
         let (name, kind, path, line_number, file_id, signature) = match target_info {
             Ok(info) => info,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                // Fallback: check if the 'symbol_name' is actually a file path
+                let mut file_stmt = db.conn.prepare("SELECT id, path FROM files WHERE path LIKE ?1 LIMIT 1")?;
+                let file_search = format!("%{}%", symbol_name);
+                if let Ok((f_id, f_path)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))) {
+                    (
+                        std::path::Path::new(&f_path).file_name().and_then(|n| n.to_str()).unwrap_or(&f_path).to_string(),
+                        "file".to_string(),
+                        f_path,
+                        1,
+                        f_id,
+                        None
+                    )
+                } else {
+                    return Ok(None);
+                }
+            },
             Err(e) => return Err(e),
         };
 
@@ -98,6 +119,35 @@ impl ContextObject {
             }
         }
 
+        // Schema Auto-Expansion (Python & TS Types)
+        if let Some(sig) = &signature {
+            let words: Vec<&str> = sig.split(|c: char| !c.is_alphabetic()).collect();
+            for word in words {
+                if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" {
+                    continue;
+                }
+                // Check if this word exists as a symbol
+                let mut check_stmt = db.conn.prepare("SELECT name, file_id FROM symbols WHERE name = ?1 LIMIT 1").unwrap();
+                if let Ok((_name, found_file_id)) = check_stmt.query_row(rusqlite::params![word], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))) {
+                    if let Ok(srcs) = crate::retrieval::read_symbol_source(db, word) {
+                        prop_interfaces.extend(srcs);
+                    }
+                    
+                    // NEW: Follow inherits edges!
+                    let mut inherits_stmt = db.conn.prepare(
+                        "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND edges.kind = 'inherits'"
+                    ).unwrap();
+                    let mut inherits_rows = inherits_stmt.query(rusqlite::params![found_file_id]).unwrap();
+                    while let Some(i_row) = inherits_rows.next().unwrap_or(None) {
+                        let i_name: String = i_row.get(0).unwrap();
+                        if let Ok(srcs) = crate::retrieval::read_symbol_source(db, &i_name) {
+                            prop_interfaces.extend(srcs);
+                        }
+                    }
+                }
+            }
+        }
+
         // 4.6 Fetch Wrappers
         // Find 'wraps_route' edges pointing to THIS symbol
         let mut wrap_stmt = db.conn.prepare(
@@ -110,7 +160,7 @@ impl ContextObject {
         let mut wrap_rows = wrap_stmt.query(rusqlite::params![file_id, symbol_name])?;
         let mut wrapped_by = Vec::new();
         while let Some(row) = wrap_rows.next()? {
-            wrapped_by.push(row.get(0)?);
+            wrapped_by.push(row.get::<_, String>(0)?);
         }
 
         // 4.7 Fetch Rendered Components
@@ -123,7 +173,7 @@ impl ContextObject {
         let mut render_rows = render_stmt.query(rusqlite::params![file_id])?;
         let mut renders_components = Vec::new();
         while let Some(row) = render_rows.next()? {
-            renders_components.push(row.get(0)?);
+            renders_components.push(row.get::<_, String>(0)?);
         }
 
         // 4.8 Fetch Consumed Hooks
@@ -136,21 +186,56 @@ impl ContextObject {
         let mut hook_rows = hook_stmt.query(rusqlite::params![file_id])?;
         let mut consumes_hooks = Vec::new();
         while let Some(row) = hook_rows.next()? {
-            consumes_hooks.push(row.get(0)?);
+            consumes_hooks.push(row.get::<_, String>(0)?);
         }
 
         // 5. Package it all up into our pristine, JSON-ready Context Object
+        // Decorator Extraction
+        let mut final_signature = signature.clone();
+        let mut decorators = Vec::new();
+        if let Some(sig_str) = &signature {
+            let parts: Vec<&str> = sig_str.split_whitespace().collect();
+            let mut cleaned_parts = Vec::new();
+            for part in parts {
+                if part.starts_with('@') {
+                    decorators.push(part.to_string());
+                } else {
+                    cleaned_parts.push(part);
+                }
+            }
+            if cleaned_parts.is_empty() {
+                final_signature = None;
+            } else {
+                final_signature = Some(cleaned_parts.join(" "));
+            }
+        }
+
+        // Make paths absolute
+        let current_dir = std::env::current_dir().unwrap_or_default().display().to_string();
+        let abs_path = format!("{}/{}", current_dir, path);
+        
+        let mut abs_rev_deps = Vec::new();
+        for p in rev_deps {
+            abs_rev_deps.push(format!("{}/{}", current_dir, p));
+        }
+        
+        let mut abs_wrapped_by = Vec::new();
+        for p in wrapped_by {
+            abs_wrapped_by.push(format!("{}/{}", current_dir, p));
+        }
+
         Ok(Some(ContextObject {
             target_name: name,
             target_kind: kind,
-            defining_file: path,
+            defining_file: abs_path,
             line_number: line_number as usize,
-            signature,
-            reverse_dependencies: rev_deps,
-            forward_dependencies,
+            signature: final_signature,
+            decorators,
+            reverse_dependencies: abs_rev_deps,
             siblings,
+            forward_dependencies,
             prop_interfaces,
-            wrapped_by,
+            wrapped_by: abs_wrapped_by,
             renders_components,
             consumes_hooks,
         }))

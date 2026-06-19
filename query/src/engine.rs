@@ -6,17 +6,22 @@ Result<Vec<String>, rusqlite::Error> {
 
     // pefroms sql joins across all the edges
 
-    let mut  stmt = db.conn.prepare(
+    let parent_class = if target_symbol_name.contains('.') {
+        target_symbol_name.split('.').next().unwrap_or(target_symbol_name)
+    } else {
+        target_symbol_name
+    };
+
+    let mut stmt = db.conn.prepare(
         "SELECT files.path 
         FROM edges
         JOIN symbols ON edges.target_symbol_id = symbols.id
         JOIN files ON edges.source_file_id = files.id
-        WHERE symbols.name = ?1 and edges.kind = 'imports'"
-
+        WHERE (symbols.name = ?1 OR symbols.name = ?2) AND edges.kind = 'imports'"
     )?;
 
 
-    let mut rows = stmt.query(params![target_symbol_name])?;
+    let mut rows = stmt.query(params![target_symbol_name, parent_class])?;
     let mut dependents = Vec::new();
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
@@ -87,8 +92,38 @@ pub fn search_symbols(db: &Database, keyword: &str, semantic_tokens: &[String]) 
         }
     }
     
-    let mut rows = stmt.query([])?;
     let mut results = Vec::new();
+
+    // 0. explicitly check files table for matches
+    let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
+    let mut file_rows = file_stmt.query([])?;
+    while let Some(row) = file_rows.next()? {
+        let path: String = row.get(0)?;
+        let path_lower = path.to_lowercase();
+        
+        // Extract filename from path for matching
+        let filename = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_lowercase();
+
+        let mut score = 0;
+        if filename == query_lower { score += 1000; }
+        else if filename.contains(&query_lower) { score += 500; }
+        
+        for token in &query_tokens {
+            if filename == *token { score += 100; }
+            else if filename.contains(token) { score += 50; }
+        }
+
+        if score > 0 {
+            results.push(SearchResult {
+                path: path.clone(),
+                name: std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string(),
+                kind: "file".to_string(),
+                score,
+            });
+        }
+    }
+    
+    let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
         let name: String = row.get(1)?;

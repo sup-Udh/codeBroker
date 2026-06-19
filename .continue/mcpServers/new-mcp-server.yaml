@@ -1,0 +1,11 @@
+name: codebroker
+version: 0.0.1
+schema: v1
+mcpServers:
+  - name: codebroker
+    command: bash
+    args:
+      - "-c"
+      - "cd /home/labuser/code/codeBroker/testing/PyShop && /home/labuser/code/codeBroker/target/debug/mcp"
+    env:
+      HF_API_TOKEN: "<YOUR_HUGGINGFACE_TOKEN>"
