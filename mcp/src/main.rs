@@ -295,6 +295,18 @@ fn main() {
                                             "type": "object",
                                             "properties": {}
                                         }
+                                    },
+                                    {
+                                        "name": "graph_subtree",
+                                        "description": "Extract the undirected neighborhood dependency subtree originating from a root symbol.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "root_symbol": { "type": "string", "description": "The root symbol name" },
+                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." }
+                                            },
+                                            "required": ["root_symbol", "depth"]
+                                        }
                                     }
                                 ]
                             }),
@@ -546,6 +558,23 @@ fn main() {
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
                                             },
                                             Err(e) => format!("Error detecting dependency cycles: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "graph_subtree" => {
+                                let root_symbol = arguments.get("root_symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
+                                
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::graph::graph_subtree(&db, root_symbol, depth) {
+                                            Ok(res) => {
+                                                estimated_raw_context_tokens = res.node_count * 50; // rough estimation
+                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
+                                            },
+                                            Err(e) => format!("Error exploring graph subtree: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),

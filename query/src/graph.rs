@@ -670,3 +670,201 @@ pub fn dependency_cycles(db: &Database) -> Result<DependencyCyclesResponse> {
         cycles,
     })
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubtreeNode {
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub depth: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubtreeEdge {
+    pub source: String,
+    pub target: String,
+    pub edge_kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GraphSubtreeResponse {
+    pub root: String,
+    pub depth: usize,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub nodes: Vec<SubtreeNode>,
+    pub edges: Vec<SubtreeEdge>,
+}
+
+pub fn graph_subtree(db: &Database, root_symbol: &str, depth: usize) -> Result<GraphSubtreeResponse> {
+    let safe_depth = std::cmp::min(depth, 5);
+    let max_nodes = 500;
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+
+    let mut stmt = db.conn.prepare(
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.name = ?1 LIMIT 1"
+    )?;
+    
+    let root_info: Option<(i64, String, String, String)> = stmt.query_row(rusqlite::params![root_symbol], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }).optional()?;
+
+    let root_info = match root_info {
+        Some(info) => info,
+        None => {
+            return Ok(GraphSubtreeResponse {
+                root: root_symbol.to_string(),
+                depth: safe_depth,
+                node_count: 0,
+                edge_count: 0,
+                nodes: vec![],
+                edges: vec![],
+            });
+        }
+    };
+
+    let (root_id, r_name, r_kind, r_path) = root_info;
+
+    let mut visited_symbols = HashSet::new();
+    let mut visited_edges = HashSet::new();
+    
+    let mut queue = VecDeque::new();
+
+    nodes.push(SubtreeNode {
+        name: r_name,
+        kind: r_kind,
+        file_path: r_path,
+        depth: 0,
+    });
+    visited_symbols.insert(root_id);
+    queue.push_back((root_id, 0));
+
+    let mut out_stmt = db.conn.prepare(
+        "SELECT target_symbol_id, kind 
+         FROM edges 
+         WHERE source_file_id = (SELECT file_id FROM symbols WHERE id = ?1 LIMIT 1)"
+    )?;
+
+    let mut in_stmt = db.conn.prepare(
+        "SELECT source_file_id, kind 
+         FROM edges 
+         WHERE target_symbol_id = ?1"
+    )?;
+
+    let mut resolve_sym_stmt = db.conn.prepare(
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.id = ?1 LIMIT 1"
+    )?;
+
+    let mut resolve_file_syms_stmt = db.conn.prepare(
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.file_id = ?1"
+    )?;
+
+    let mut actual_depth_reached = 0;
+
+    while let Some((curr_id, current_depth)) = queue.pop_front() {
+        if current_depth > actual_depth_reached {
+            actual_depth_reached = current_depth;
+        }
+
+        if current_depth >= safe_depth {
+            continue;
+        }
+
+        // Outgoing
+        let mut out_rows = out_stmt.query(rusqlite::params![curr_id])?;
+        while let Some(row) = out_rows.next()? {
+            let target_id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+
+            let edge_key = (curr_id, target_id, kind.clone());
+            if !visited_edges.contains(&edge_key) {
+                visited_edges.insert(edge_key);
+                
+                let src_name_str = resolve_sym_stmt.query_row(rusqlite::params![curr_id], |r| r.get::<_, String>(1)).unwrap_or_else(|_| curr_id.to_string());
+                let tgt_name_str = resolve_sym_stmt.query_row(rusqlite::params![target_id], |r| r.get::<_, String>(1)).unwrap_or_else(|_| target_id.to_string());
+                
+                edges.push(SubtreeEdge {
+                    source: src_name_str,
+                    target: tgt_name_str,
+                    edge_kind: kind,
+                });
+            }
+
+            if !visited_symbols.contains(&target_id) && nodes.len() < max_nodes {
+                visited_symbols.insert(target_id);
+                queue.push_back((target_id, current_depth + 1));
+                
+                if let Ok((_id, name, kind, path)) = resolve_sym_stmt.query_row(rusqlite::params![target_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?))
+                }) {
+                    nodes.push(SubtreeNode {
+                        name,
+                        kind,
+                        file_path: path,
+                        depth: current_depth + 1,
+                    });
+                }
+            }
+        }
+
+        // Incoming
+        let mut in_rows = in_stmt.query(rusqlite::params![curr_id])?;
+        while let Some(row) = in_rows.next()? {
+            let source_file_id: i64 = row.get(0)?;
+            let kind: String = row.get(1)?;
+
+            let mut sym_rows = resolve_file_syms_stmt.query(rusqlite::params![source_file_id])?;
+            while let Some(sym_row) = sym_rows.next()? {
+                let source_id: i64 = sym_row.get(0)?;
+                let source_name: String = sym_row.get(1)?;
+                let source_kind: String = sym_row.get(2)?;
+                let source_path: String = sym_row.get(3)?;
+
+                let edge_key = (source_id, curr_id, kind.clone());
+                if !visited_edges.contains(&edge_key) {
+                    visited_edges.insert(edge_key);
+                    
+                    let tgt_name_str = resolve_sym_stmt.query_row(rusqlite::params![curr_id], |r| r.get::<_, String>(1)).unwrap_or_else(|_| curr_id.to_string());
+                    
+                    edges.push(SubtreeEdge {
+                        source: source_name.clone(),
+                        target: tgt_name_str,
+                        edge_kind: kind.clone(),
+                    });
+                }
+
+                if !visited_symbols.contains(&source_id) && nodes.len() < max_nodes {
+                    visited_symbols.insert(source_id);
+                    queue.push_back((source_id, current_depth + 1));
+                    
+                    nodes.push(SubtreeNode {
+                        name: source_name,
+                        kind: source_kind,
+                        file_path: source_path,
+                        depth: current_depth + 1,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(GraphSubtreeResponse {
+        root: root_symbol.to_string(),
+        depth: actual_depth_reached,
+        node_count: nodes.len(),
+        edge_count: edges.len(),
+        nodes,
+        edges,
+    })
+}
