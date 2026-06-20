@@ -28,12 +28,12 @@ fn main() {
     if !std::path::Path::new("codebroker.db").exists() {
         eprintln!("No codebroker.db found in the current directory. Auto-initializing codebase...");
         
-        // Find the 'cli' sibling binary
+        // Find the 'codebroker' sibling binary
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
-                let cli_path = parent.join("cli");
+                let cli_path = parent.join("codebroker");
                 
-                // Shell out to 'cli init' and wait for it to finish
+                // Shell out to 'codebroker init' and wait for it to finish
                 let status = std::process::Command::new(cli_path)
                     .arg("init")
                     .status();

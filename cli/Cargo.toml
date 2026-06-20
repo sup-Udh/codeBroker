@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 
-
 indexer = { path = "../indexer" }
 query = { path = "../query" }
 storage = { path = "../storage" }
@@ -20,3 +19,6 @@ tokio = {version = "1.52.3", features = ["full"]}
 rusqlite = "0.40.1"
 regex = "1.12.4"
 
+[[bin]]
+name = "codebroker"
+path = "src/main.rs"

@@ -450,13 +450,10 @@ fn main() {
         Commands::Bind => {
             println!("Binding CodeBroker to current directory...");
             
-            // 1. Get current path and mcp binary path
+            // 1. Get current path and use the globally installed mcp binary
             let current_dir = std::env::current_dir().unwrap().to_string_lossy().to_string();
-            let mut mcp_path = std::env::current_exe().unwrap();
-            mcp_path.set_file_name("mcp"); // mcp is next to cli
             
-            let mcp_path_str = mcp_path.to_string_lossy().to_string();
-            let new_arg = format!("cd {} && {}", current_dir, mcp_path_str);
+            let new_arg = format!("cd {} && codebroker-mcp", current_dir);
             
             // 2. Paths to configs
             let home_dir = std::env::var("HOME").unwrap_or_default();
