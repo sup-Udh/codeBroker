@@ -512,3 +512,161 @@ pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResp
         top_hotspots: nodes,
     })
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CycleNode {
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DependencyCycle {
+    pub length: usize,
+    pub nodes: Vec<CycleNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DependencyCyclesResponse {
+    pub cycles_found: usize,
+    pub truncated: bool,
+    pub nodes_scanned: usize,
+    pub edges_scanned: usize,
+    pub cycles: Vec<DependencyCycle>,
+}
+
+pub fn dependency_cycles(db: &Database) -> Result<DependencyCyclesResponse> {
+    const MAX_CYCLES: usize = 500;
+
+    let mut adj: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    let mut stmt = db.conn.prepare(
+        "SELECT symbols.id, edges.target_symbol_id 
+         FROM symbols 
+         JOIN edges ON symbols.file_id = edges.source_file_id"
+    )?;
+    
+    let mut rows = stmt.query([])?;
+    let mut edges_scanned = 0;
+    while let Some(row) = rows.next()? {
+        let source_id: i64 = row.get(0)?;
+        let target_id: i64 = row.get(1)?;
+        adj.entry(source_id).or_default().push(target_id);
+        edges_scanned += 1;
+    }
+
+    let mut nodes_scanned = 0;
+    let mut visited: HashSet<i64> = HashSet::new();
+    let mut in_stack: HashSet<i64> = HashSet::new();
+    let mut path: Vec<i64> = Vec::new();
+    let mut unique_cycles: HashSet<Vec<i64>> = HashSet::new();
+    let mut truncated = false;
+
+    let all_nodes: Vec<i64> = adj.keys().copied().collect();
+
+    struct DfsState<'a> {
+        adj: &'a std::collections::HashMap<i64, Vec<i64>>,
+        visited: &'a mut std::collections::HashSet<i64>,
+        in_stack: &'a mut std::collections::HashSet<i64>,
+        path: &'a mut Vec<i64>,
+        unique_cycles: &'a mut std::collections::HashSet<Vec<i64>>,
+        truncated: &'a mut bool,
+        nodes_scanned: &'a mut usize,
+    }
+
+    fn dfs(node: i64, state: &mut DfsState) {
+        if *state.truncated {
+            return;
+        }
+
+        state.visited.insert(node);
+        *state.nodes_scanned += 1;
+        state.in_stack.insert(node);
+        state.path.push(node);
+
+        if let Some(neighbors) = state.adj.get(&node) {
+            for &neighbor in neighbors {
+                if *state.truncated {
+                    break;
+                }
+                if state.in_stack.contains(&neighbor) {
+                    if let Some(pos) = state.path.iter().position(|&x| x == neighbor) {
+                        let cycle_slice = &state.path[pos..];
+                        
+                        let min_pos = cycle_slice.iter()
+                            .enumerate()
+                            .min_by_key(|&(_, &val)| val)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                            
+                        let mut canonical = Vec::with_capacity(cycle_slice.len());
+                        canonical.extend_from_slice(&cycle_slice[min_pos..]);
+                        canonical.extend_from_slice(&cycle_slice[..min_pos]);
+
+                        if state.unique_cycles.insert(canonical) {
+                            if state.unique_cycles.len() >= MAX_CYCLES {
+                                *state.truncated = true;
+                                break;
+                            }
+                        }
+                    }
+                } else if !state.visited.contains(&neighbor) {
+                    dfs(neighbor, state);
+                }
+            }
+        }
+
+        state.in_stack.remove(&node);
+        state.path.pop();
+    }
+
+    for &node in &all_nodes {
+        if truncated { break; }
+        if !visited.contains(&node) {
+            let mut state = DfsState {
+                adj: &adj,
+                visited: &mut visited,
+                in_stack: &mut in_stack,
+                path: &mut path,
+                unique_cycles: &mut unique_cycles,
+                truncated: &mut truncated,
+                nodes_scanned: &mut nodes_scanned,
+            };
+            dfs(node, &mut state);
+        }
+    }
+
+    let mut sym_stmt = db.conn.prepare(
+        "SELECT symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id 
+         WHERE symbols.id = ?1 LIMIT 1"
+    )?;
+
+    let mut cycles = Vec::new();
+    for cycle_ids in unique_cycles {
+        let mut cycle_nodes = Vec::new();
+        for &id in &cycle_ids {
+            if let Ok((name, kind, path)) = sym_stmt.query_row(rusqlite::params![id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            }) {
+                cycle_nodes.push(CycleNode {
+                    name,
+                    kind,
+                    file_path: path,
+                });
+            }
+        }
+        cycles.push(DependencyCycle {
+            length: cycle_nodes.len(),
+            nodes: cycle_nodes,
+        });
+    }
+
+    Ok(DependencyCyclesResponse {
+        cycles_found: cycles.len(),
+        truncated,
+        nodes_scanned,
+        edges_scanned,
+        cycles,
+    })
+}

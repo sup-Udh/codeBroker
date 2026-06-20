@@ -287,6 +287,14 @@ fn main() {
                                                 "limit": { "type": "number", "description": "Max number of hotspots to return. Default 20." }
                                             }
                                         }
+                                    },
+                                    {
+                                        "name": "dependency_cycles",
+                                        "description": "Detect architectural circular dependencies within the repository graph.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {}
+                                        }
                                     }
                                 ]
                             }),
@@ -524,6 +532,20 @@ fn main() {
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
                                             },
                                             Err(e) => format!("Error calculating architectural hotspots: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "dependency_cycles" => {
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::graph::dependency_cycles(&db) {
+                                            Ok(res) => {
+                                                estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
+                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
+                                            },
+                                            Err(e) => format!("Error detecting dependency cycles: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
