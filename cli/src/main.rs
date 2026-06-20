@@ -208,7 +208,7 @@ fn main() {
                     let search_path = format!("%{}%", src);
                     if let Ok(target_file_id) = file_stmt.query_row(params![search_path], |row| row.get::<_, i64>(0)) {
                         // find a symbol in that file that matches the name
-                        let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
+                        let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND LOWER(name) = LOWER(?2) LIMIT 1").unwrap();
                         if let Ok(target_symbol_id) = sym_stmt.query_row(params![target_file_id, import_name], |row| row.get::<_, i64>(0)) {
                             let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
                             edges_created += 1;

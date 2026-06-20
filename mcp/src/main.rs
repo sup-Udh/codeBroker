@@ -51,7 +51,8 @@ fn main() {
                             result: serde_json::json!({
                                 "protocolVersion": "2024-11-05",
                                 "capabilities": {
-                                    "tools": {} // We will add tools in Phase 3
+                                    "tools": {}, // We will add tools in Phase 3
+                                    "prompts": {}
                                 },
                                 "serverInfo": {
                                     "name": "codebroker-mcp",
@@ -138,20 +139,18 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview",
-                                        "description": "Returns a raw topological map of the repository, including file counts, symbol counts, and subsystem directories.",
+                                        "description": "CRITICAL: Call this tool IMMEDIATELY whenever the user asks vague questions like 'what is this project about', 'explain the codebase', or asks for a general architecture summary. Returns a raw topological map of the local repository connected via MCP.",
                                         "inputSchema": {
                                             "type": "object",
-                                            "properties": {},
-                                            "required": []
+                                            "properties": {}
                                         }
                                     },
                                     {
                                         "name": "project_overview_ai",
-                                        "description": "Returns a deeply cached, AI-generated architectural summary of the entire repository.",
+                                        "description": "CRITICAL: Call this tool IMMEDIATELY whenever the user asks 'what does this code do', 'explain this project', or asks for a high-level summary. Returns a deeply cached, AI-generated architectural summary of the entire repository.",
                                         "inputSchema": {
                                             "type": "object",
-                                            "properties": {},
-                                            "required": []
+                                            "properties": {}
                                         }
                                     },
                                     {
@@ -695,6 +694,61 @@ fn main() {
                                     {
                                         "type": "text",
                                         "text": tool_result
+                                    }
+                                ]
+                            }),
+                        };
+                        println!("{}", serde_json::to_string(&response).unwrap());
+                        stdout.flush().unwrap();
+                    }
+                }
+                "prompts/list" => {
+                    if let Some(id) = request.id {
+                        let response = JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: serde_json::json!({
+                                "prompts": [
+                                    {
+                                        "name": "analyze_project",
+                                        "description": "Get a comprehensive architectural overview of the local repository."
+                                    },
+                                    {
+                                        "name": "explore_subsystem",
+                                        "description": "Map out a specific subsystem or cluster in the codebase."
+                                    }
+                                ]
+                            }),
+                        };
+                        println!("{}", serde_json::to_string(&response).unwrap());
+                        stdout.flush().unwrap();
+                    }
+                }
+                "prompts/get" => {
+                    if let Some(id) = request.id {
+                        let name = request.params.as_ref()
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                            
+                        let message_text = match name {
+                            "analyze_project" => "Please use your CodeBroker tools (such as `project_overview` and `architectural_hotspots`) to analyze the local repository connected via MCP. Give me a high-level summary of what this codebase does and how the architecture is laid out.",
+                            "explore_subsystem" => "Please use your CodeBroker `graph_subtree` and `subsystem_overview` tools to map out the core components of the local repository. Let me know what you find.",
+                            _ => "Unknown prompt.",
+                        };
+
+                        let response = JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: serde_json::json!({
+                                "description": "Automated CodeBroker Prompt",
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": {
+                                            "type": "text",
+                                            "text": message_text
+                                        }
                                     }
                                 ]
                             }),

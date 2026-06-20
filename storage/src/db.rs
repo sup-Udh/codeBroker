@@ -104,7 +104,7 @@ impl Database {
 
     /// Pass 2 Helper: Tries to find a physical symbol matching the import name
     pub fn find_symbol_id_by_name(&self, name: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE name = ?1 LIMIT 1")?;
+        let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE LOWER(name) = LOWER(?1) LIMIT 1")?;
         
         // We use query_row because we only expect 0 or 1 result
         let result = stmt.query_row(params![name], |row| row.get(0));

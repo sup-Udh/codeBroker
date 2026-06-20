@@ -141,10 +141,10 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 name: name_str,
                 kind,
                 prop_type,
-                start_line: node.start_position().row + 1,
-                end_line: node.end_position().row + 1,
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte(),
+                start_line: parent.start_position().row + 1,
+                end_line: parent.end_position().row + 1,
+                start_byte: parent.start_byte(),
+                end_byte: parent.end_byte(),
                 signature: None,
             });
         }

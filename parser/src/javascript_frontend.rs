@@ -78,7 +78,7 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     name: name_str,
                     kind,
                     prop_type: None,
-                    start_line: node.start_position().row + 1,
+                    start_line: parent.start_position().row + 1,
                     end_line,
                     start_byte: parent.start_byte(),
                     end_byte: parent.end_byte(),
