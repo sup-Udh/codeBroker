@@ -405,3 +405,110 @@ pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Resul
         edges: path_edges,
     })
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HotspotNode {
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub incoming_edges: usize,
+    pub outgoing_edges: usize,
+    pub total_edges: usize,
+    pub hotspot_score: usize,
+    pub classification: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HotspotResponse {
+    pub total_symbols: usize,
+    pub total_edges: usize,
+    pub top_hotspots: Vec<HotspotNode>,
+}
+
+pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResponse> {
+    let mut incoming_map = std::collections::HashMap::new();
+    let mut in_stmt = db.conn.prepare(
+        "SELECT edges.target_symbol_id, COUNT(symbols.id) 
+         FROM edges 
+         JOIN symbols ON edges.source_file_id = symbols.file_id 
+         GROUP BY edges.target_symbol_id"
+    )?;
+    
+    let mut in_rows = in_stmt.query([])?;
+    while let Some(row) = in_rows.next()? {
+        let sym_id: i64 = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        incoming_map.insert(sym_id, count);
+    }
+
+    let mut outgoing_map = std::collections::HashMap::new();
+    let mut out_stmt = db.conn.prepare(
+        "SELECT symbols.id, COUNT(edges.id) 
+         FROM symbols 
+         JOIN edges ON symbols.file_id = edges.source_file_id 
+         GROUP BY symbols.id"
+    )?;
+    
+    let mut out_rows = out_stmt.query([])?;
+    while let Some(row) = out_rows.next()? {
+        let sym_id: i64 = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        outgoing_map.insert(sym_id, count);
+    }
+
+    let mut nodes = Vec::new();
+    let mut sym_stmt = db.conn.prepare(
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id"
+    )?;
+    
+    let mut sym_rows = sym_stmt.query([])?;
+    while let Some(row) = sym_rows.next()? {
+        let sym_id: i64 = row.get(0)?;
+        let name: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let path: String = row.get(3)?;
+
+        let incoming = *incoming_map.get(&sym_id).unwrap_or(&0);
+        let outgoing = *outgoing_map.get(&sym_id).unwrap_or(&0);
+        let total = incoming + outgoing;
+        let score = (incoming * 3) + outgoing;
+        
+        let classification = if incoming > 20 {
+            "critical"
+        } else if incoming > 10 {
+            "important"
+        } else {
+            "normal"
+        };
+
+        nodes.push(HotspotNode {
+            name,
+            kind,
+            file_path: path,
+            incoming_edges: incoming as usize,
+            outgoing_edges: outgoing as usize,
+            total_edges: total as usize,
+            hotspot_score: score as usize,
+            classification: classification.to_string(),
+        });
+    }
+
+    nodes.sort_by(|a, b| {
+        b.hotspot_score.cmp(&a.hotspot_score)
+            .then(b.incoming_edges.cmp(&a.incoming_edges))
+            .then(b.total_edges.cmp(&a.total_edges))
+    });
+
+    let total_symbols = nodes.len();
+    let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+
+    nodes.truncate(limit);
+
+    Ok(HotspotResponse {
+        total_symbols,
+        total_edges: total_edges as usize,
+        top_hotspots: nodes,
+    })
+}

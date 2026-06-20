@@ -277,6 +277,16 @@ fn main() {
                                             },
                                             "required": ["from", "to"]
                                         }
+                                    },
+                                    {
+                                        "name": "architectural_hotspots",
+                                        "description": "Identify the most critical and highly connected symbols in the repository.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "limit": { "type": "number", "description": "Max number of hotspots to return. Default 20." }
+                                            }
+                                        }
                                     }
                                 ]
                             }),
@@ -498,6 +508,22 @@ fn main() {
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing path".to_string())
                                             },
                                             Err(e) => format!("Error finding shortest path: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "architectural_hotspots" => {
+                                let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(20) as usize;
+                                
+                                match storage::Database::new("codebroker.db") {
+                                    Ok(db) => {
+                                        match query::graph::architectural_hotspots(&db, limit) {
+                                            Ok(res) => {
+                                                estimated_raw_context_tokens = res.top_hotspots.len() * 50; // rough estimation
+                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
+                                            },
+                                            Err(e) => format!("Error calculating architectural hotspots: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
