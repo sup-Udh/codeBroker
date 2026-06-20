@@ -26,7 +26,9 @@ enum Commands {
     Refresh,
     Metrics,
     Analytics,
-    Dashboard
+    Dashboard,
+    /// Instantly hooks up Claude Desktop and Antigravity to the current directory
+    Bind
 }
 
 
@@ -445,9 +447,53 @@ fn main() {
         Commands::Analytics => {
             println!("Use 'cargo run -- metrics' or 'cargo run -- dashboard' instead.");
         }
-
-
-
-
+        Commands::Bind => {
+            println!("Binding CodeBroker to current directory...");
+            
+            // 1. Get current path and mcp binary path
+            let current_dir = std::env::current_dir().unwrap().to_string_lossy().to_string();
+            let mut mcp_path = std::env::current_exe().unwrap();
+            mcp_path.set_file_name("mcp"); // mcp is next to cli
+            
+            let mcp_path_str = mcp_path.to_string_lossy().to_string();
+            let new_arg = format!("cd {} && {}", current_dir, mcp_path_str);
+            
+            // 2. Paths to configs
+            let home_dir = std::env::var("HOME").unwrap_or_default();
+            let claude_path = format!("{}/.config/Claude/claude_desktop_config.json", home_dir);
+            let gemini_path = format!("{}/.gemini/config/mcp_config.json", home_dir);
+            
+            let paths_to_update = vec![claude_path, gemini_path];
+            
+            for path in paths_to_update {
+                if let Ok(config_str) = fs::read_to_string(&path) {
+                    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                        if let Some(servers) = json.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
+                            if let Some(codebroker) = servers.get_mut("codebroker").and_then(|c| c.as_object_mut()) {
+                                if let Some(args) = codebroker.get_mut("args").and_then(|a| a.as_array_mut()) {
+                                    if args.len() >= 2 {
+                                        args[1] = serde_json::Value::String(new_arg.clone());
+                                        if let Ok(new_json) = serde_json::to_string_pretty(&json) {
+                                            let _ = fs::write(&path, new_json);
+                                            println!("Successfully bound config at {}", path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    println!("Warning: Config not found at {}", path);
+                }
+            }
+            
+            // 3. Auto-Init the directory so it's ready!
+            println!("Initializing CodeBroker database...");
+            let _ = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("init")
+                .status();
+                
+            println!("Done! Restart Claude Desktop or Antigravity to begin.");
+        }
         }
     }

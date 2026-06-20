@@ -1,0 +1,26 @@
+{
+  "file_hashes": {
+    "env.d.ts": "00a29185efbdf41c38089c4164fb1b9415449bcd9eaa57c77623a12b55a50b6f",
+    "src/composables/useInventory.ts": "95664c7fefa3cb40c39ce94a8047dc65fb1736d5e595da1cb6e49ae24a607087",
+    "src/composables/useSuppliers.ts": "023b8e3c0cedf518cbf7a720b96b2466d2a8d3317a5e1bd776353e9fad6116cd",
+    "src/main.ts": "054f7529b2230d509359970c153e86e3ab3c44fa8ca022b8b35307ed6dc66189",
+    "src/repositories/InventoryRepository.ts": "f9cf0516ee5b6bfbd779caca98a087d95496cb89aa99d932398ae012a8f99b19",
+    "src/repositories/SupplierRepository.ts": "4bd894c59ba1467522810aa8601428fb8912b765126cf86e9b9deba795892b73",
+    "src/router/index.ts": "d367f9cf18965a3da8c686fded077820232c67126023417745e1dbc631677f3f",
+    "src/services/InventoryService.ts": "a31b52997ae1ec907b579c1d99921e7a7a8078799bed6d26e9820eae29d22f79",
+    "src/services/SupplierService.ts": "77d50e032cbb016bd3493259c9a5027e2b9c345cc944ffa5bb022d7cd23fc9dd",
+    "src/types/InventoryItem.ts": "63a53601f6a99ac5805d5520942194cf2559b127d3eebf5ed0ca775a829c862d",
+    "src/types/Supplier.ts": "6a3d640fe3a7c92cb6ec049ae8e3be6f06935a8eb2276baa30737e8132f359f3",
+    "src/utils/formatter.ts": "ce3a62a08ba047f60e0f012707b1ea156425afea80dbf3f6681036f5f1c03ee1",
+    "vite.config.ts": "12546183ba486fd92f9347da6a692a56b7efac881f8d43f884d46d05f431cec3"
+  },
+  "indexed_at_commit": "",
+  "indexed_at_timestamp": "2026-06-20T12:42:42.544732543+00:00",
+  "schema_version": 3,
+  "stats": {
+    "total_edges": 29,
+    "total_files": 13,
+    "total_nodes": 21
+  },
+  "vexp_version": "2.0.31"
+}

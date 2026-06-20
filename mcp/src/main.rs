@@ -24,6 +24,29 @@ struct JsonRpcResponse {
 
 
 fn main() {
+    // AUTO-INIT HOOK: If the database doesn't exist in the current directory, build it automatically!
+    if !std::path::Path::new("codebroker.db").exists() {
+        eprintln!("No codebroker.db found in the current directory. Auto-initializing codebase...");
+        
+        // Find the 'cli' sibling binary
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent() {
+                let cli_path = parent.join("cli");
+                
+                // Shell out to 'cli init' and wait for it to finish
+                let status = std::process::Command::new(cli_path)
+                    .arg("init")
+                    .status();
+                    
+                match status {
+                    Ok(s) if s.success() => eprintln!("Auto-initialization complete!"),
+                    Ok(s) => eprintln!("Auto-initialization failed with status: {}", s),
+                    Err(e) => eprintln!("Failed to spawn indexer process: {}", e),
+                }
+            }
+        }
+    }
+
     // it will corrupt the protocol and crash the AI agent!
     eprintln!("CodeBroker MCP Server starting up...");
     let stdin = io::stdin();
