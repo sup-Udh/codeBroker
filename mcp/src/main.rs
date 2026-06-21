@@ -25,7 +25,7 @@ struct JsonRpcResponse {
 
 fn main() {
     // AUTO-INIT HOOK: If the database doesn't exist in the current directory, build it automatically!
-    if !std::path::Path::new("codebroker.db").exists() {
+    if !std::path::Path::new(".codebroker/codebroker.db").exists() {
         eprintln!("No codebroker.db found in the current directory. Auto-initializing codebase...");
         
         // Find the 'codebroker' sibling binary
@@ -355,7 +355,7 @@ fn main() {
                         let tool_result = match tool_name {
                             "get_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::context::ContextObject::assemble(&db, symbol) {
@@ -375,7 +375,7 @@ fn main() {
                                 if hf_token.is_empty() {
                                     "Error: HF_API_TOKEN environment variable is not set.".to_string()
                                 } else {
-                                    match storage::Database::new("codebroker.db") {
+                                    match storage::Database::new(".codebroker/codebroker.db") {
                                         Ok(db) => {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
@@ -405,7 +405,7 @@ fn main() {
                                     vec![]
                                 };
 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
                                         match query::engine::search_symbols(&db, keyword, &semantic_tokens) {
@@ -420,7 +420,7 @@ fn main() {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let context_lines = arguments.get("context_lines").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
                                 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
                                         match query::engine::find_symbol_exact(&db, symbol, context_lines) {
@@ -442,7 +442,7 @@ fn main() {
                                 }
                             }
                             "project_overview" => {
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview(&db) {
@@ -454,7 +454,7 @@ fn main() {
                                 }
                             }
                             "repository_stats" => {
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview(&db) {
@@ -478,7 +478,7 @@ fn main() {
                                 if hf_token.is_empty() {
                                     "Error: HF_API_TOKEN environment variable is not set.".to_string()
                                 } else {
-                                    match storage::Database::new("codebroker.db") {
+                                    match storage::Database::new(".codebroker/codebroker.db") {
                                         Ok(db) => {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
@@ -498,7 +498,7 @@ fn main() {
                             "read_symbol_source" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::retrieval::read_symbol_source(&db, symbol, include_deps) {
                                             Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
@@ -511,7 +511,7 @@ fn main() {
                             "read_file_skeleton" => {
                                 let path = arguments.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
                                 let target_symbol = arguments.get("target_symbol").and_then(|s| s.as_str());
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::retrieval::skeletonize_file(&db, path, target_symbol) {
                                             Ok(res) => res,
@@ -527,7 +527,7 @@ fn main() {
                                 let direction_str = arguments.get("direction").and_then(|s| s.as_str()).unwrap_or("both");
                                 let direction = query::graph::GraphDirection::from(direction_str);
                                 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::graph::explore_graph(&db, symbol, depth, direction) {
@@ -542,7 +542,7 @@ fn main() {
                                 let from_symbol = arguments.get("from").and_then(|s| s.as_str()).unwrap_or("");
                                 let to_symbol = arguments.get("to").and_then(|s| s.as_str()).unwrap_or("");
                                 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::graph::shortest_path(&db, from_symbol, to_symbol) {
                                             Ok(res) => {
@@ -558,7 +558,7 @@ fn main() {
                             "architectural_hotspots" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(20) as usize;
                                 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::graph::architectural_hotspots(&db, limit) {
                                             Ok(res) => {
@@ -572,7 +572,7 @@ fn main() {
                                 }
                             }
                             "dependency_cycles" => {
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::graph::dependency_cycles(&db) {
                                             Ok(res) => {
@@ -589,7 +589,7 @@ fn main() {
                                 let root_symbol = arguments.get("root_symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
                                 
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::graph::graph_subtree(&db, root_symbol, depth) {
                                             Ok(res) => {
@@ -614,7 +614,7 @@ fn main() {
                             "get_implementation" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
@@ -629,7 +629,7 @@ fn main() {
                             }
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
@@ -646,7 +646,7 @@ fn main() {
                             }
                             "subsystem_stats" => {
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         match query::subsystem::discover_subsystem(&db, name) {
                                             Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
@@ -658,7 +658,7 @@ fn main() {
                             }
                             "subsystem_overview" => {
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new("codebroker.db") {
+                                match storage::Database::new(".codebroker/codebroker.db") {
                                     Ok(db) => {
                                         let _ = db.init_schema();
                                         match query::subsystem::discover_subsystem(&db, name) {
@@ -696,7 +696,7 @@ fn main() {
                         eprintln!("[Analytics] Tool: {}, Exec Time: {}ms, Lines: {}, Tokens: {}, Cache Hit: {}", 
                                    tool_name, execution_time_ms, source_lines_returned, delivered_token_count, cache_hit);
 
-                        if let Ok(db) = storage::Database::new("codebroker.db") {
+                        if let Ok(db) = storage::Database::new(".codebroker/codebroker.db") {
                             let collector = analytics::collector::MetricsCollector::new(&db);
                             collector.log_comprehensive_event(
                                 tool_name,

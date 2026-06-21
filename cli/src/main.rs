@@ -38,11 +38,12 @@ fn main() {
         Commands::Init => {
             println!("Initializing CodeBroker...");
 
-            let _ = fs::remove_file("codebroker.db");
+            let _ = fs::remove_file(".codebroker/codebroker.db");
+            let _ = fs::create_dir_all(".codebroker");
 
             
             // 1. Boot up the database
-            let db = storage::Database::new("codebroker.db").expect("Failed to create DB");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");
             use parser::frontend::{LanguageFrontend, RustFrontend};
             use parser::typescript_frontend::{TypeScriptFrontend, TsxFrontend};
@@ -274,7 +275,7 @@ fn main() {
         }
         Commands::Query { text } => {
             // Connect to the existing DB
-            let db = storage::Database::new("codebroker.db").expect("DB not found. Run init first.");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");
             
             println!("Searching for: '{}'", text);
             
@@ -298,7 +299,7 @@ fn main() {
         }
         Commands::Dependents { symbol } => {
 
-                        let db = storage::Database::new("codebroker.db").expect("DB not found.");
+                        let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
             
             println!("Traversing graph to find dependents of '{}'...", symbol);
             
@@ -319,7 +320,7 @@ fn main() {
         }
 
         Commands::Context { symbol } => {
-            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
             
             println!("Assembling context bject for '{}'...\n", symbol);
             // Call our new assembly engine!
@@ -334,7 +335,7 @@ fn main() {
             }
         }
         Commands::Knowledge => {
-            let db = storage::Database::new("codebroker.db").expect("DB not found. Run init first.");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");
             if let Ok(stats) = db.get_codebroker_stats() {
                 println!("\n=== CODEBROKER KNOWLEDGE DASHBOARD ===");
                 println!("Files Indexed: {}", stats.files_indexed);
@@ -371,7 +372,7 @@ fn main() {
             }
         }
         Commands::Refresh => {
-            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
             let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
             if hf_token.is_empty() {
                 println!("Error: HF_API_TOKEN environment variable is not set.");
@@ -393,7 +394,7 @@ fn main() {
             println!("Refresh complete!");
         }
         Commands::Explain { symbol } => {
-            let db = storage::Database::new("codebroker.db").expect("DB not found.");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
             let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
             if hf_token.is_empty() {
                 println!("Error: HF_API_TOKEN environment variable is not set.");
@@ -425,7 +426,7 @@ fn main() {
         }
         Commands::Metrics => {
             println!("--- CodeBroker Analytics Engine ---");
-            if let Ok(conn) = rusqlite::Connection::open("codebroker.db") {
+            if let Ok(conn) = rusqlite::Connection::open(".codebroker/codebroker.db") {
                 let total_tokens_avoided: i64 = conn.query_row("SELECT SUM(token_reduction) FROM mcp_analytics_events", [], |row| row.get(0)).unwrap_or(0);
                 let cache_hits: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_analytics_events WHERE cache_hit = 1", [], |row| row.get(0)).unwrap_or(0);
                 let cache_misses: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_analytics_events WHERE cache_hit = 0", [], |row| row.get(0)).unwrap_or(0);
@@ -481,6 +482,39 @@ fn main() {
                     }
                 } else {
                     println!("Warning: Config not found at {}", path);
+                }
+            }
+            
+            // 2.5 Generate Antigravity instructions.md locally, then sync globally
+            let _ = fs::create_dir_all(".codebroker");
+            let local_instructions_path = ".codebroker/instructions.md";
+            
+            let default_instructions = r#"# CodeBroker MCP Tools
+You are connected to the CodeBroker MCP Server. CodeBroker provides an ultra-fast, semantic-aware graph of the local codebase.
+
+**CRITICAL INSTRUCTIONS FOR ANTIGRAVITY:**
+1. **ALWAYS default to using CodeBroker tools** (`search_codebase`, `find_symbol`, `get_context`) for exploring the codebase instead of native tools like `grep_search`, `list_dir`, or `read_file`.
+2. **DO NOT use `grep_search`** to find functions, classes, or keywords. Use `search_codebase` instead. It is semantic and much faster.
+3. When the user asks "what is this project" or "how does this work", immediately use `project_overview` or `project_overview_ai`.
+4. When you need to read a file, use `find_symbol` and `read_symbol_source` or `read_file_skeleton` first to avoid blowing up your context window. Avoid raw `read_file` or `view_file` unless absolutely necessary.
+5. If you need to understand architectural impact or what relies on a file, use `impact_analysis` or `get_context` instead of guessing or grepping."#;
+
+            // Write locally if it doesn't exist
+            if !std::path::Path::new(local_instructions_path).exists() {
+                let _ = fs::write(local_instructions_path, default_instructions);
+                println!("Created local project instructions at {}", local_instructions_path);
+            }
+
+            // Sync to Antigravity
+            if let Ok(local_content) = fs::read_to_string(local_instructions_path) {
+                let antigravity_dir = format!("{}/.gemini/antigravity/mcp/codebroker", home_dir);
+                if fs::create_dir_all(&antigravity_dir).is_ok() {
+                    let global_instructions_path = format!("{}/instructions.md", antigravity_dir);
+                    if fs::write(&global_instructions_path, local_content).is_ok() {
+                        println!("Successfully synced AI instructions to {}", global_instructions_path);
+                    } else {
+                        println!("Warning: Failed to write global instructions.md at {}", global_instructions_path);
+                    }
                 }
             }
             

@@ -13,7 +13,7 @@ async fn get_overview() -> Json<Value> {
     let mut cache_misses = 0_i64;
     let mut mcp_usage: HashMap<String, i64> = HashMap::new();
 
-    if let Ok(conn) = rusqlite::Connection::open("codebroker.db") {
+    if let Ok(conn) = rusqlite::Connection::open(".codebroker/codebroker.db") {
         total_tokens_avoided = conn.query_row("SELECT SUM(token_reduction) FROM mcp_analytics_events", [], |row| row.get(0)).unwrap_or(0);
         total_context_tokens_used = conn.query_row("SELECT SUM(delivered_token_count) FROM mcp_analytics_events", [], |row| row.get(0)).unwrap_or(0);
         
