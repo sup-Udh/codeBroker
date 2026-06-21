@@ -471,11 +471,18 @@ fn main() {
                                 if let Some(args) = codebroker.get_mut("args").and_then(|a| a.as_array_mut()) {
                                     if args.len() >= 2 {
                                         args[1] = serde_json::Value::String(new_arg.clone());
-                                        if let Ok(new_json) = serde_json::to_string_pretty(&json) {
-                                            let _ = fs::write(&path, new_json);
-                                            println!("Successfully bound config at {}", path);
-                                        }
                                     }
+                                }
+                                
+                                // Inject HF_API_TOKEN
+                                let env_map = codebroker.entry("env").or_insert_with(|| serde_json::json!({}));
+                                if let Some(env_obj) = env_map.as_object_mut() {
+                                    env_obj.insert("HF_API_TOKEN".to_string(), serde_json::Value::String("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".to_string()));
+                                }
+                                
+                                if let Ok(new_json) = serde_json::to_string_pretty(&json) {
+                                    let _ = fs::write(&path, new_json);
+                                    println!("Successfully bound config at {}", path);
                                 }
                             }
                         }
@@ -505,15 +512,27 @@ You are connected to the CodeBroker MCP Server for the current workspace.
                 println!("Created local project instructions at {}", local_instructions_path);
             }
 
-            // Sync to Antigravity
+            // Sync to Antigravity and Claude
             if let Ok(local_content) = fs::read_to_string(local_instructions_path) {
+                // Antigravity
                 let antigravity_dir = format!("{}/.gemini/antigravity/mcp/codebroker", home_dir);
                 if fs::create_dir_all(&antigravity_dir).is_ok() {
                     let global_instructions_path = format!("{}/instructions.md", antigravity_dir);
-                    if fs::write(&global_instructions_path, local_content).is_ok() {
+                    if fs::write(&global_instructions_path, &local_content).is_ok() {
                         println!("Successfully synced AI instructions to {}", global_instructions_path);
                     } else {
                         println!("Warning: Failed to write global instructions.md at {}", global_instructions_path);
+                    }
+                }
+                
+                // Claude Desktop
+                let claude_dir = format!("{}/.config/Claude/mcp/codebroker", home_dir);
+                if fs::create_dir_all(&claude_dir).is_ok() {
+                    let claude_instructions_path = format!("{}/instructions.md", claude_dir);
+                    if fs::write(&claude_instructions_path, &local_content).is_ok() {
+                        println!("Successfully synced AI instructions to {}", claude_instructions_path);
+                    } else {
+                        println!("Warning: Failed to write global instructions.md at {}", claude_instructions_path);
                     }
                 }
             }
