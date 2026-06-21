@@ -379,7 +379,8 @@ fn main() {
                                             "properties": {
                                                 "symbol": { "type": "string" },
                                                 "depth": { "type": "number", "description": "Traversal depth. Max 5." },
-                                                "direction": { "type": "string", "description": "Incoming, Outgoing, or Both" }
+                                                "direction": { "type": "string", "description": "Incoming, Outgoing, or Both" },
+                                                "max_nodes": { "type": "number", "description": "Cap on returned nodes (1-200). Default 100. Lower this for hotspot symbols with large fan-in/out to avoid oversized responses." }
                                             },
                                             "required": ["symbol", "depth", "direction"]
                                         }
@@ -411,7 +412,9 @@ fn main() {
                                         "description": "Detect architectural circular dependencies within the repository graph.",
                                         "inputSchema": {
                                             "type": "object",
-                                            "properties": {}
+                                            "properties": {
+                                                "limit": { "type": "number", "description": "Max number of cycles to return in detail (1-500). Default 25. `cycles_found` in the response always reports the true total." }
+                                            }
                                         }
                                     },
                                     {
@@ -739,11 +742,12 @@ fn main() {
                                 let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(2) as usize;
                                 let direction_str = arguments.get("direction").and_then(|s| s.as_str()).unwrap_or("both");
                                 let direction = query::graph::GraphDirection::from(direction_str);
-                                
+                                let max_nodes = arguments.get("max_nodes").and_then(|n| n.as_u64()).unwrap_or(100) as usize;
+
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::graph::explore_graph(&db, symbol, depth, direction) {
+                                        match query::graph::explore_graph(&db, symbol, depth, direction, max_nodes) {
                                             Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph".to_string()),
                                             Err(e) => format!("Error exploring graph: {}", e),
                                         }
@@ -785,9 +789,10 @@ fn main() {
                                 }
                             }
                             "dependency_cycles" => {
+                                let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(25) as usize;
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::dependency_cycles(&db) {
+                                        match query::graph::dependency_cycles(&db, limit) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
@@ -854,7 +859,11 @@ fn main() {
                                 let path = arguments.get("path").and_then(|s| s.as_str()).unwrap_or("");
                                 let start_line = arguments.get("start_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
                                 let end_line = arguments.get("end_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
-                                match query::retrieval::read_file_snippet(path, start_line, end_line) {
+                                let resolved_path = match storage::Database::new(&db_path) {
+                                    Ok(db) => db.resolve_path(path),
+                                    Err(_) => path.to_string(),
+                                };
+                                match query::retrieval::read_file_snippet(&resolved_path, start_line, end_line) {
                                     Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
                                     Err(e) => format!("Error reading file snippet: {}", e),
                                 }
@@ -944,6 +953,21 @@ fn main() {
                                 else { "Unknown panic".to_string() };
                                 serde_json::json!({ "success": false, "error": format!("Tool execution panicked: {}", msg) }).to_string()
                             }
+                        };
+
+                        // Backstop: regardless of per-tool pagination/limit params, never hand the
+                        // client a payload so large it blows the MCP transport's token limit.
+                        const MAX_TOOL_RESULT_CHARS: usize = 90_000;
+                        let tool_result = if tool_result.len() > MAX_TOOL_RESULT_CHARS {
+                            let mut truncated = tool_result.chars().take(MAX_TOOL_RESULT_CHARS).collect::<String>();
+                            truncated.push_str(&format!(
+                                "\n\n... [TRUNCATED: response was {} chars, exceeding the {} char safety limit. \
+                                Re-run with a smaller `limit`/`max_nodes`/`depth` argument, or a more specific query, to get a complete result.]",
+                                tool_result.len(), MAX_TOOL_RESULT_CHARS
+                            ));
+                            truncated
+                        } else {
+                            tool_result
                         };
 
                         let execution_time_ms = start_time.elapsed().as_millis() as usize;

@@ -46,13 +46,15 @@ pub struct GraphEdge {
 pub struct GraphResponse {
     pub root: String,
     pub depth: usize,
+    pub truncated: bool,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
 }
 
-pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, direction: GraphDirection) -> Result<GraphResponse> {
+pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, direction: GraphDirection, max_nodes: usize) -> Result<GraphResponse> {
     let safe_depth = std::cmp::min(max_depth, 5);
-    let max_nodes = 200;
+    let max_nodes = max_nodes.clamp(1, 200);
+    let max_edges = max_nodes * 3;
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -80,6 +82,7 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
             return Ok(GraphResponse {
                 root: symbol_name.to_string(),
                 depth: safe_depth,
+                truncated: false,
                 nodes: vec![],
                 edges: vec![],
             });
@@ -129,7 +132,12 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
          WHERE symbols.file_id = ?1"
     )?;
 
+    let mut truncated = false;
+
     while let Some((curr_id, current_depth)) = queue.pop_front() {
+        if truncated {
+            break;
+        }
         if current_depth >= safe_depth {
             continue;
         }
@@ -141,8 +149,11 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
         if is_outgoing {
             let mut out_rows = out_stmt.query(rusqlite::params![curr_id])?;
             while let Some(row) = out_rows.next()? {
-                if nodes.len() >= max_nodes { break; }
-                
+                if nodes.len() >= max_nodes || edges.len() >= max_edges {
+                    truncated = true;
+                    break;
+                }
+
                 let target_id: i64 = row.get(0)?;
                 let kind: String = row.get(1)?;
 
@@ -174,20 +185,29 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
             }
         }
 
-        if nodes.len() >= max_nodes { break; }
+        if nodes.len() >= max_nodes || edges.len() >= max_edges {
+            truncated = true;
+            break;
+        }
 
         // Process Incoming dependencies
         if is_incoming {
             let mut in_rows = in_stmt.query(rusqlite::params![curr_id])?;
             while let Some(row) = in_rows.next()? {
-                if nodes.len() >= max_nodes { break; }
-                
+                if nodes.len() >= max_nodes || edges.len() >= max_edges {
+                    truncated = true;
+                    break;
+                }
+
                 let source_file_id: i64 = row.get(0)?;
                 let kind: String = row.get(1)?;
 
                 let mut sym_rows = resolve_file_syms_stmt.query(rusqlite::params![source_file_id])?;
                 while let Some(sym_row) = sym_rows.next()? {
-                    if nodes.len() >= max_nodes { break; }
+                    if nodes.len() >= max_nodes || edges.len() >= max_edges {
+                        truncated = true;
+                        break;
+                    }
 
                     let source_id: i64 = sym_row.get(0)?;
                     let source_name: String = sym_row.get(1)?;
@@ -223,6 +243,7 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
     Ok(GraphResponse {
         root: symbol_name.to_string(),
         depth: safe_depth,
+        truncated,
         nodes,
         edges,
     })
@@ -540,14 +561,17 @@ pub struct DependencyCycle {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DependencyCyclesResponse {
     pub cycles_found: usize,
+    pub cycles_returned: usize,
     pub truncated: bool,
     pub nodes_scanned: usize,
     pub edges_scanned: usize,
     pub cycles: Vec<DependencyCycle>,
 }
 
-pub fn dependency_cycles(db: &Database) -> Result<DependencyCyclesResponse> {
+pub fn dependency_cycles(db: &Database, limit: usize) -> Result<DependencyCyclesResponse> {
     const MAX_CYCLES: usize = 500;
+    let return_limit = limit.clamp(1, MAX_CYCLES);
+    const MAX_NODES_PER_CYCLE: usize = 40;
 
     let mut adj: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
     let mut stmt = db.conn.prepare(
@@ -653,10 +677,11 @@ pub fn dependency_cycles(db: &Database) -> Result<DependencyCyclesResponse> {
          WHERE symbols.id = ?1 LIMIT 1"
     )?;
 
+    let cycles_found = unique_cycles.len();
     let mut cycles = Vec::new();
-    for cycle_ids in unique_cycles {
+    for cycle_ids in unique_cycles.into_iter().take(return_limit) {
         let mut cycle_nodes = Vec::new();
-        for &id in &cycle_ids {
+        for &id in cycle_ids.iter().take(MAX_NODES_PER_CYCLE) {
             if let Ok((name, kind, path)) = sym_stmt.query_row(rusqlite::params![id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
             }) {
@@ -668,14 +693,15 @@ pub fn dependency_cycles(db: &Database) -> Result<DependencyCyclesResponse> {
             }
         }
         cycles.push(DependencyCycle {
-            length: cycle_nodes.len(),
+            length: cycle_ids.len(),
             nodes: cycle_nodes,
         });
     }
 
     Ok(DependencyCyclesResponse {
-        cycles_found: cycles.len(),
-        truncated,
+        cycles_found,
+        cycles_returned: cycles.len(),
+        truncated: truncated || cycles_found > cycles.len(),
         nodes_scanned,
         edges_scanned,
         cycles,

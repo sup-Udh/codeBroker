@@ -4,6 +4,32 @@ use graph::{SymbolNode, ImportNode};
 
 use crate::schema::INIT_SQL;
 
+/// Lexically normalizes a path, collapsing "." and ".." components without
+/// touching the filesystem (the path may not exist yet). This ensures two
+/// different textual spellings of the same path (e.g. an absolute path vs.
+/// a "./relative" path joined onto the project root) compare equal.
+pub fn normalize_path(path: &std::path::Path) -> String {
+    use std::path::Component;
+    let mut components: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match components.last() {
+                    Some(Component::Normal(_)) => { components.pop(); }
+                    _ => { components.push(component); }
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    let mut normalized = std::path::PathBuf::new();
+    for component in components {
+        normalized.push(component.as_os_str());
+    }
+    normalized.to_string_lossy().to_string()
+}
+
 pub struct Database {
     pub conn: Connection,
     pub project_root: String,
@@ -43,7 +69,7 @@ impl Database {
     pub fn resolve_path(&self, relative_path: &str) -> String {
         let root = std::path::Path::new(&self.project_root);
         let rel = std::path::Path::new(relative_path);
-        root.join(rel).to_string_lossy().to_string()
+        normalize_path(&root.join(rel))
     }
 
     /// Creates the tables if they don't already exist

@@ -91,6 +91,14 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
 
                 let mut parent = node.parent().unwrap_or(node);
 
+                // The node that actually owns a "body" field (function/class/arrow),
+                // captured before `parent` gets widened to its lexical_declaration/export_statement.
+                let decl_node = if parent.kind() == "variable_declarator" {
+                    parent.child_by_field_name("value")
+                } else {
+                    Some(parent)
+                };
+
                 let mut is_call_expr_assignment = false;
                 if parent.kind() == "variable_declarator" {
                     if let Some(value_node) = parent.child_by_field_name("value") {
@@ -107,12 +115,18 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                         is_exported = true;
                         break;
                     }
-                    if p.kind() == "program" { break; }
+                    // A statement_block belongs to an enclosing function/method body.
+                    // Anything nested inside one is a local, never a module-level export,
+                    // no matter what wraps the enclosing function.
+                    if p.kind() == "program" || p.kind() == "statement_block" { break; }
                     current = p;
                 }
 
-                if is_call_expr_assignment && kind == "function" && !is_exported {
-                    continue; // Skip indexing this local generic variable
+                if is_call_expr_assignment && kind == "function" {
+                    if !is_exported {
+                        continue; // Skip indexing this local generic variable
+                    }
+                    kind = "variable".to_string();
                 }
 
                 if parent.kind() == "variable_declarator" {
@@ -127,8 +141,17 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                         parent = exp;
                     }
                 }
-                
+
                 let end_line = parent.end_position().row + 1;
+
+                let signature = decl_node
+                    .and_then(|d| d.child_by_field_name("body"))
+                    .and_then(|body| {
+                        source_code.get(parent.start_byte()..body.start_byte())
+                            .map(|s| s.trim_end().to_string())
+                    })
+                    .filter(|s| !s.is_empty());
+
                 symbols.push(SymbolNode {
                     name: name_str,
                     kind,
@@ -137,7 +160,7 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     end_line,
                     start_byte: parent.start_byte(),
                     end_byte: parent.end_byte(),
-                    signature: None,
+                    signature,
                 });
             }
         }

@@ -162,7 +162,8 @@ impl<'a> PatchGenerator<'a> {
             |row| row.get(0)
         ).map_err(|e| e.to_string())?;
         
-        let content = fs::read(&file_path).map_err(|e| e.to_string())?;
+        let abs_file_path = self.db.resolve_path(&file_path);
+        let content = fs::read(&abs_file_path).map_err(|e| e.to_string())?;
         let mut source_code = String::new();
         
         let start = start_byte as usize;

@@ -38,12 +38,24 @@ fn main() {
         Commands::Init => {
             println!("Initializing CodeBroker...");
 
-            let _ = fs::remove_file(".codebroker/codebroker.db");
             let _ = fs::create_dir_all(".codebroker");
 
-            
+            // Build the new index into a temp file and atomically rename it into place
+            // once fully populated. A concurrent reader (e.g. another live
+            // codebroker-mcp process, perhaps from a second Claude session on the
+            // same project) must never observe a partially-rebuilt database; rebuilding
+            // in place via delete+repopulate creates exactly that window.
+            const FINAL_DB_PATH: &str = ".codebroker/codebroker.db";
+            const TMP_DB_PATH: &str = ".codebroker/codebroker.db.tmp";
+            let _ = fs::remove_file(TMP_DB_PATH);
+            let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
+            let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
+
             // 1. Boot up the database
-            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to create DB");
+            // Scoped so `db` (and every Statement borrowed from it) is fully dropped,
+            // releasing the file, before we checkpoint/rename below.
+            {
+            let db = storage::Database::new(TMP_DB_PATH).expect("Failed to create DB");
             db.init_schema().expect("Failed to initialize schema");
             use parser::frontend::{LanguageFrontend, RustFrontend};
             use parser::typescript_frontend::{TypeScriptFrontend, TsxFrontend};
@@ -343,6 +355,17 @@ fn main() {
                 );
             }
             
+            // Flush WAL into the main file before closing, so the temp file is a
+            // single self-contained snapshot before we publish it.
+            let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            }
+
+            let _ = fs::remove_file(format!("{}-wal", FINAL_DB_PATH));
+            let _ = fs::remove_file(format!("{}-shm", FINAL_DB_PATH));
+            fs::rename(TMP_DB_PATH, FINAL_DB_PATH).expect("Failed to publish rebuilt index");
+            let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
+            let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
+
             println!("Indexing complete! Run a query to test it.");
         }
         Commands::Query { text } => {

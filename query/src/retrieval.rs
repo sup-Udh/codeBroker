@@ -217,40 +217,52 @@ pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&s
         }
     }
     
-    let mut stmt = db.conn.prepare("SELECT name, start_byte, end_byte, signature FROM symbols WHERE file_id = ?1 ORDER BY start_byte ASC").map_err(|e| e.to_string())?;
+    let mut stmt = db.conn.prepare("SELECT name, start_byte, end_byte, signature, kind FROM symbols WHERE file_id = ?1 ORDER BY start_byte ASC").map_err(|e| e.to_string())?;
     let mut rows = stmt.query(rusqlite::params![file_id]).map_err(|e| e.to_string())?;
-    
+
     let mut output = String::new();
     let mut current_byte: usize = 0;
-    
+
     while let Some(row) = rows.next().unwrap_or(None) {
         let name: String = row.get(0).unwrap_or_default();
         let start_byte: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
         let end_byte: usize = row.get::<_, i64>(2).unwrap_or(0) as usize;
         let signature: Option<String> = row.get(3).unwrap_or(None);
-        
+        let kind: String = row.get(4).unwrap_or_default();
+
         if start_byte < current_byte {
             continue;
         }
-        
+
         let mut contains_target = false;
         if target_symbol.is_some() {
             if start_byte <= target_start as usize && end_byte >= target_end as usize {
                 contains_target = true;
             }
         }
-        
+
         if contains_target {
             continue;
         }
-        
+
         if current_byte <= start_byte && start_byte <= content.len() {
             output.push_str(&String::from_utf8_lossy(&content[current_byte..start_byte]));
         }
-        
+
+        // Variables/constants are typically one-liners; collapsing them into
+        // "name { ... }" loses the actual value and is nonsensical for kinds
+        // that have no block body at all. Show them as-is instead.
+        if kind == "variable" {
+            if start_byte <= end_byte && end_byte <= content.len() {
+                output.push_str(&String::from_utf8_lossy(&content[start_byte..end_byte]));
+            }
+            current_byte = end_byte;
+            continue;
+        }
+
         let sig = signature.unwrap_or(name);
         output.push_str(&sig);
-        
+
         if file_path.ends_with(".py") {
             if !sig.trim_end().ends_with(':') {
                 output.push_str(":\n    ... ");
@@ -260,7 +272,7 @@ pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&s
         } else {
             output.push_str(" { ... }");
         }
-        
+
         current_byte = end_byte;
     }
     

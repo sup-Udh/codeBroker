@@ -60,7 +60,8 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         
         if let Some(node) = def_node {
             let mut signature_parts = Vec::new();
-            
+            let short_name = name.clone();
+
             // 1. Check for decorators
             if let Some(parent) = node.parent() {
                 if parent.kind() == "decorated_definition" {
@@ -74,7 +75,7 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     }
                 }
             }
-            
+
             // 2. If it's a function, check if it's a method
             if kind == "function" {
                 let mut current = node.parent();
@@ -94,16 +95,32 @@ fn extract_py_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     }
                     current = p.parent();
                 }
-                
+
                 // 3. Extract parameters for signature
+                let mut head = format!("def {}", short_name);
                 if let Some(params_node) = node.child_by_field_name("parameters") {
                     if let Ok(params_text) = params_node.utf8_text(source_code.as_bytes()) {
                         let clean_params = params_text.replace("\n", "").replace("  ", " ");
-                        signature_parts.push(clean_params);
+                        head.push_str(&clean_params);
                     }
                 }
+                if let Some(return_node) = node.child_by_field_name("return_type") {
+                    if let Ok(return_text) = return_node.utf8_text(source_code.as_bytes()) {
+                        head.push_str(" -> ");
+                        head.push_str(return_text.trim());
+                    }
+                }
+                signature_parts.push(head);
+            } else if kind == "class" {
+                let mut head = format!("class {}", short_name);
+                if let Some(bases_node) = node.child_by_field_name("superclasses") {
+                    if let Ok(bases_text) = bases_node.utf8_text(source_code.as_bytes()) {
+                        head.push_str(bases_text.trim());
+                    }
+                }
+                signature_parts.push(head);
             }
-            
+
             let signature = if signature_parts.is_empty() {
                 None
             } else {
