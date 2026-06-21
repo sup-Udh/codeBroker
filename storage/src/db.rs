@@ -19,6 +19,9 @@ impl Database {
     /// Opens a connection to the SQLite database at the given path
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Database { conn })
     }
 
