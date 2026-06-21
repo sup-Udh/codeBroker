@@ -250,9 +250,17 @@ pub struct ShortestPathResponse {
     pub distance: usize,
     pub nodes: Vec<PathNode>,
     pub edges: Vec<PathEdge>,
+    /// True when the repository's dependency graph has zero edges. A caller
+    /// MUST check this before treating `found: false` as "these symbols are
+    /// genuinely unrelated" — with an unindexed graph, `found: false` only
+    /// means no traversal was possible, not that no relationship exists.
+    pub graph_unindexed: bool,
 }
 
 pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Result<ShortestPathResponse> {
+    let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+    let graph_unindexed = total_edges == 0;
+
     // 1. Find root and target symbol IDs
     let mut stmt = db.conn.prepare(
         "SELECT symbols.id, symbols.name, symbols.kind, files.path 
@@ -277,6 +285,7 @@ pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Resul
             distance: 0,
             nodes: vec![],
             edges: vec![],
+            graph_unindexed,
         });
     }
 
@@ -339,6 +348,7 @@ pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Resul
             distance: 0,
             nodes: vec![],
             edges: vec![],
+            graph_unindexed,
         });
     }
 
@@ -403,6 +413,7 @@ pub fn shortest_path(db: &Database, from_symbol: &str, to_symbol: &str) -> Resul
         distance: path_edges.len(),
         nodes: path_nodes,
         edges: path_edges,
+        graph_unindexed,
     })
 }
 

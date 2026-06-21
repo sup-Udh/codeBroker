@@ -173,6 +173,30 @@ fn main() {
                             for import in imports {
                                 db.insert_raw_import(file_id, &import).unwrap();
                             }
+                            
+                            // Angular split file logic
+                            if file_path.ends_with(".component.ts") {
+                                let html_path = file_path.replace(".ts", ".html");
+                                if std::path::Path::new(&html_path).exists() {
+                                    if let Ok(html_content) = std::fs::read_to_string(&html_path) {
+                                        // A simple regex to find (event)="handler(" or (event)="handler"
+                                        let re = regex::Regex::new(r#"\([a-zA-Z0-9_\-]+\)="([a-zA-Z0-9_]+)(?:\(|")"#).unwrap();
+                                        for (line_idx, line_str) in html_content.lines().enumerate() {
+                                            for cap in re.captures_iter(line_str) {
+                                                if let Some(handler) = cap.get(1) {
+                                                    let import_node = graph::ImportNode {
+                                                        name: handler.as_str().to_string(),
+                                                        source: None,
+                                                        line_number: line_idx + 1,
+                                                        kind: Some("calls".to_string())
+                                                    };
+                                                    db.insert_raw_import(file_id, &import_node).unwrap();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -188,6 +212,37 @@ fn main() {
             // 2. Loop through every single staged import
             for (_raw_id, source_file_id, import_name, import_source, import_kind) in raw_imports {
                 let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
+                
+                if edge_kind == "route_push" {
+                    // Fetch all routes to try matching
+                    let mut route_stmt = db.conn.prepare("SELECT id, route_path FROM files WHERE route_path IS NOT NULL").unwrap();
+                    let mut route_rows = route_stmt.query([]).unwrap();
+                    let push_parts: Vec<&str> = import_name.split('/').collect();
+                    while let Some(row) = route_rows.next().unwrap_or(None) {
+                        let target_file_id: i64 = row.get(0).unwrap();
+                        let route_path: String = row.get(1).unwrap();
+                        let path_parts: Vec<&str> = route_path.split('/').collect();
+                        
+                        if push_parts.len() == path_parts.len() {
+                            let mut matched = true;
+                            for (pu, pa) in push_parts.iter().zip(path_parts.iter()) {
+                                if pa.starts_with('[') && pa.ends_with(']') { continue; }
+                                if pu != pa { matched = false; break; }
+                            }
+                            if matched {
+                                // Find the page symbol in this file
+                                let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND kind = 'page' LIMIT 1").unwrap();
+                                if let Ok(target_symbol_id) = sym_stmt.query_row(rusqlite::params![target_file_id], |row| row.get::<_, i64>(0)) {
+                                    let _ = db.insert_edge(source_file_id, target_symbol_id, "navigates_to");
+                                    edges_created += 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Determine if we have a source path we can resolve via aliases
                 let mut resolved_source = import_source.clone();
                 if let Some(src) = &import_source {
@@ -224,6 +279,14 @@ fn main() {
                 let words: Vec<&str> = import_name.split(|c: char| !c.is_alphanumeric()).collect();
                 for word in words {
                     if word.is_empty() { continue; }
+
+                    // Local-First Edge Linking
+                    let mut local_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
+                    if let Ok(local_symbol_id) = local_stmt.query_row(params![source_file_id, word], |row| row.get::<_, i64>(0)) {
+                        let _ = db.insert_edge(source_file_id, local_symbol_id, &edge_kind);
+                        edges_created += 1;
+                        continue;
+                    }
                     
                     if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
                         let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
@@ -271,6 +334,15 @@ fn main() {
             }
 
             println!("Linking complete. Created {} true graph edges.", edges_created);
+            
+            // 5. Update Metadata timestamp
+            if let Ok(timestamp) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                let _ = db.conn.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_indexed_at', ?1)",
+                    rusqlite::params![timestamp.as_secs().to_string()]
+                );
+            }
+            
             println!("Indexing complete! Run a query to test it.");
         }
         Commands::Query { text } => {
@@ -492,9 +564,24 @@ fn main() {
                 }
             }
             
-            // Run claude mcp add globally to bypass manual approval prompts
+            // Register as user-scoped so it's auto-trusted (no approval prompt).
+            // Cross-contamination between projects is prevented by the CWD safety
+            // guards in codebroker-mcp's auto-init hook — each claude session spawns
+            // its own subprocess with the project directory as CWD.
             let hf_token = "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";
+            
+            // Remove first to force a clean re-registration
             let _ = std::process::Command::new("claude")
+                .args(&["mcp", "remove", "codebroker", "-s", "user"])
+                .output(); // use output() to suppress stderr noise
+            
+            // Also clean up any leftover project-scoped .mcp.json entry
+            let _ = std::process::Command::new("claude")
+                .args(&["mcp", "remove", "codebroker", "-s", "local"])
+                .output();
+            
+            // Add as user-scoped (globally trusted, no approval needed)
+            let add_status = std::process::Command::new("claude")
                 .args(&[
                     "mcp", "add", "codebroker",
                     "-s", "user",
@@ -502,27 +589,67 @@ fn main() {
                     "--", "codebroker-mcp"
                 ])
                 .status();
-            println!("Registered CodeBroker MCP Server globally for claude-code.");
+            
+            match add_status {
+                Ok(s) if s.success() => println!("Registered CodeBroker MCP Server for claude-code (user-scoped, auto-trusted)."),
+                _ => println!("Warning: Could not register with claude-code. Is 'claude' CLI installed?"),
+            }
             
             // 2.5 Generate Antigravity instructions.md locally, then sync globally
             let _ = fs::create_dir_all(".codebroker");
             let local_instructions_path = ".codebroker/instructions.md";
             
-            let default_instructions = r#"# CodeBroker MCP Tools
-CodeBroker provides semantic code search and context extraction.
+            let default_instructions = r#"# CodeBroker MCP Tools — Auto-Routing Rules
 
-**Guidelines for Using CodeBroker:**
-1. **Workspace Context:** Please focus your analysis on the current repository where CodeBroker is initialized.
-2. **Recommended Tools:** For optimal performance, please prefer using `search_codebase`, `find_symbol`, and `get_context` rather than basic tools like `grep_search` or `read_file`.
-3. **Semantic Discovery:** `search_codebase` is highly recommended over `grep_search` for exploring the codebase.
-4. **Context Preservation:** To save context window, consider using `read_file_skeleton` or `read_symbol_source` instead of reading full files when possible.
-5. **Architecture:** `project_overview` and `impact_analysis` are great starting points for understanding how features connect."#;
+You are connected to the **CodeBroker MCP Server** for the active workspace. CodeBroker is a semantic code intelligence engine that gives you deep architectural understanding of the codebase.
 
-            // Write locally if it doesn't exist
-            if !std::path::Path::new(local_instructions_path).exists() {
-                let _ = fs::write(local_instructions_path, default_instructions);
-                println!("Created local project instructions at {}", local_instructions_path);
-            }
+## MANDATORY: Auto-Route These Queries Through CodeBroker
+
+**You MUST automatically use CodeBroker tools** for ANY of the following — the user should NEVER have to say "use codebroker":
+
+### 1. Code Understanding & Exploration
+- "How does X work?" → `get_context` or `get_implementation`
+- "What is X?" / "Explain X" → `get_context` + `read_symbol_source`
+- "Show me X" / "Find X" → `find_symbol` or `search_codebase`
+- "Where is X defined?" → `find_symbol`
+- "What calls X?" / "What uses X?" → `explore_graph` (direction: "incoming")
+- "What does X depend on?" → `explore_graph` (direction: "outgoing")
+
+### 2. Architecture & Overview
+- "What does this project do?" → `project_overview`
+- "Give me an overview" → `project_overview`
+- "What's the architecture?" → `project_overview` + `architectural_hotspots`
+- "How are X and Y connected?" → `shortest_path`
+- "What are the most important files?" → `architectural_hotspots`
+- "Are there circular dependencies?" → `dependency_cycles`
+
+### 3. Before ANY Code Change
+- Before editing code → `get_edit_context` to understand dependencies
+- Before refactoring → `impact_analysis` to see what might break
+- "What would break if I change X?" → `impact_analysis`
+- Understanding a subsystem → `subsystem_overview` + `subsystem_stats`
+
+### 4. Reading Code
+- NEVER read entire files with `read_file` when CodeBroker is available
+- Use `read_file_skeleton` to see file structure without full content
+- Use `read_symbol_source` to read specific functions/classes
+- Use `read_file_snippet` for targeted line ranges
+
+## Tool Priority (Always Prefer CodeBroker)
+| Instead of...         | Use CodeBroker's...        |
+|-----------------------|---------------------------|
+| `grep_search`         | `search_codebase`         |
+| `read_file` (full)    | `read_file_skeleton`      |
+| `read_file` (symbol)  | `read_symbol_source`      |
+| Guessing architecture | `project_overview`        |
+| Manual tracing        | `explore_graph`           |
+
+## Key Principle
+If the user asks ANYTHING about the codebase — structure, architecture, how something works, where something is, what depends on what — route it through CodeBroker FIRST. Only fall back to native tools if CodeBroker genuinely cannot answer the query."#;
+
+            // Always write latest instructions (overwrite on upgrade)
+            let _ = fs::write(local_instructions_path, default_instructions);
+            println!("Updated local project instructions at {}", local_instructions_path);
 
             // Sync to Antigravity and Claude
             if let Ok(local_content) = fs::read_to_string(local_instructions_path) {
@@ -552,24 +679,53 @@ CodeBroker provides semantic code search and context extraction.
                 let claude_md_dir = format!("{}/.claude", home_dir);
                 if fs::create_dir_all(&claude_md_dir).is_ok() {
                     let claude_md_path = format!("{}/CLAUDE.md", claude_md_dir);
-                    let claude_md_exists = std::path::Path::new(&claude_md_path).exists();
                     
-                    if claude_md_exists {
-                        if let Ok(existing_content) = fs::read_to_string(&claude_md_path) {
-                            if !existing_content.contains("CodeBroker MCP Tools") {
-                                let new_content = format!("{}\n\n{}", existing_content, local_content);
-                                let _ = fs::write(&claude_md_path, new_content);
-                                println!("Appended AI instructions to global CLAUDE.md");
+                    // Build the CLAUDE.md content — always update to latest instructions
+                    let mut final_content = String::new();
+                    
+                    // Preserve any existing non-CodeBroker content
+                    if let Ok(existing) = fs::read_to_string(&claude_md_path) {
+                        // Strip out old CodeBroker section (everything from "# CodeBroker" to end or next top-level heading)
+                        let mut in_codebroker_section = false;
+                        for line in existing.lines() {
+                            if line.starts_with("# CodeBroker") {
+                                in_codebroker_section = true;
+                                continue;
+                            }
+                            if in_codebroker_section && line.starts_with("# ") && !line.starts_with("# CodeBroker") {
+                                in_codebroker_section = false;
+                            }
+                            if !in_codebroker_section {
+                                final_content.push_str(line);
+                                final_content.push('\n');
                             }
                         }
-                    } else {
-                        let _ = fs::write(&claude_md_path, &local_content);
-                        println!("Created global CLAUDE.md with AI instructions");
                     }
+                    
+                    // Append the latest CodeBroker instructions
+                    if !final_content.is_empty() && !final_content.ends_with("\n\n") {
+                        final_content.push('\n');
+                    }
+                    final_content.push_str(&local_content);
+                    
+                    let _ = fs::write(&claude_md_path, &final_content);
+                    println!("Updated global CLAUDE.md with latest CodeBroker instructions");
                 }
             }
             
-            // 3. Auto-Init the directory so it's ready!
+            // 3. Write the active project pointer so codebroker-mcp always finds the right database
+            let active_project_dir = format!("{}/.codebroker", home_dir);
+            let _ = fs::create_dir_all(&active_project_dir);
+            let active_project_path = format!("{}/active_project", active_project_dir);
+            let current_dir_str = std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if fs::write(&active_project_path, &current_dir_str).is_ok() {
+                println!("Set active project to: {}", current_dir_str);
+            }
+            
+            // 4. Auto-Init the directory so it's ready!
             println!("Initializing CodeBroker database...");
             let _ = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("init")

@@ -89,8 +89,22 @@ pub const INIT_SQL: &str = "
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS search_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query TEXT NOT NULL,
+        result_count INTEGER NOT NULL,
+        latency_ms INTEGER NOT NULL,
+        fallback_used BOOLEAN NOT NULL,
+        llm_used BOOLEAN NOT NULL,
+        top_result TEXT,
+        search_mode TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
 
-
+    CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
     
 ";

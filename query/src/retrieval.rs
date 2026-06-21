@@ -14,8 +14,11 @@ pub struct SymbolSourceResult {
     pub directive: Option<String>,
     pub route_path: Option<String>,
     pub route_segment: Option<String>,
-    #[serde(default)]
     pub is_dependency: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_unavailable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -39,6 +42,7 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
     
     while let Some(row) = rows.next().unwrap_or(None) {
         let file_path: String = row.get(0).unwrap_or_default();
+        let abs_path = db.resolve_path(&file_path);
         let kind: String = row.get(1).unwrap_or_default();
         let start_line: i64 = row.get(2).unwrap_or(0);
         let end_line: i64 = row.get(3).unwrap_or(start_line);
@@ -49,10 +53,10 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
         let route_segment: Option<String> = row.get(8).unwrap_or(None);
         
         let mut source = String::new();
-        if let Ok(content) = fs::read(&file_path) {
+        if let Ok(content) = fs::read(&abs_path) {
             let start = start_byte as usize;
             let end = end_byte as usize;
-            if start <= end && end <= content.len() {
+            if start < end && end <= content.len() {
                 source = String::from_utf8_lossy(&content[start..end]).to_string();
             } else {
                 // Fallback to lines if bytes are messed up
@@ -66,10 +70,18 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
             }
         }
         
+        let mut source_unavailable = None;
+        let mut reason = None;
+        if source.is_empty() {
+            source_unavailable = Some(true);
+            reason = Some("Failed to extract code snippet using byte bounds. Please use native file Read.".to_string());
+            source = "<ERROR: Source extraction failed. The file was read successfully but the requested byte bounds were invalid. Please fall back to the native Read tool using the file path provided.>".to_string();
+        }
+
         results.push(SymbolSourceResult {
             symbol_name: symbol.to_string(),
             symbol_kind: kind,
-            file_path: file_path.clone(),
+            file_path: abs_path,
             start_line: start_line as usize,
             end_line: end_line as usize,
             source,
@@ -77,6 +89,8 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
             route_path,
             route_segment,
             is_dependency: false,
+            source_unavailable,
+            reason,
         });
         
         if include_dependencies {
@@ -171,10 +185,22 @@ pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Resu
 }
 
 pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&str>) -> Result<String, String> {
-    let content = fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let abs_file_path = db.resolve_path(file_path);
+    let content = fs::read(&abs_file_path).map_err(|e| format!("Failed to read file: {}", e))?;
     
-    let mut file_id_stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1").map_err(|e| e.to_string())?;
-    let file_id: i64 = file_id_stmt.query_row(rusqlite::params![file_path], |r| Ok(r.get::<_, i64>(0).unwrap_or(0))).unwrap_or(0);
+    // Find file_id by resolving paths to absolute and comparing
+    let mut files_stmt = db.conn.prepare("SELECT id, path FROM files").map_err(|e| e.to_string())?;
+    let mut files_rows = files_stmt.query([]).map_err(|e| e.to_string())?;
+    let mut file_id = 0;
+    while let Some(row) = files_rows.next().unwrap_or(None) {
+        let id: i64 = row.get(0).unwrap();
+        let path: String = row.get(1).unwrap();
+        if db.resolve_path(&path) == abs_file_path {
+            file_id = id;
+            break;
+        }
+    }
+    
     if file_id == 0 {
         return Err(format!("File '{}' not found in index.", file_path));
     }

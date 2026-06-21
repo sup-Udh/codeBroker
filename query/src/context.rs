@@ -10,6 +10,7 @@ pub struct ContextObject {
     pub defining_file: String,
     pub line_number: usize,
     pub signature: Option<String>,
+    pub directive: Option<String>,
     pub decorators: Vec<String>,
 
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
@@ -20,6 +21,15 @@ pub struct ContextObject {
     pub wrapped_by: Vec<String>, // layout files that wrap this route
     pub renders_components: Vec<String>, // components rendered by this file
     pub consumes_hooks: Vec<String>, // hooks consumed by this file
+    pub callers: Vec<String>, // files that call this symbol
+    pub callees: Vec<String>, // symbols called by this file
+
+    /// False when the repository's dependency graph has zero edges. When this
+    /// is false, all the dependency fields above are NOT a reliable signal of
+    /// "no relationships exist" — they mean "the graph was never built", and
+    /// any analysis built on top of this context (e.g. impact_analysis) is a
+    /// source-only guess, not a real graph traversal.
+    pub graph_indexed: bool,
 }
 
 impl ContextObject {
@@ -28,7 +38,7 @@ impl ContextObject {
         
         // 1. Fetch the primary target's core definition (Distance-0 Context)
         let mut stmt = db.conn.prepare(
-            "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature
+            "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 LIMIT 1"
@@ -42,6 +52,7 @@ impl ContextObject {
                 row.get::<_, i64>(3)?,    // line_number
                 row.get::<_, i64>(4)?,    // file_id
                 row.get::<_, Option<String>>(5)?, // signature
+                row.get::<_, Option<String>>(6)?, // directive
             ))
         });
 
@@ -49,21 +60,14 @@ impl ContextObject {
             return Ok(None);
         }
 
-        let (name, kind, path, line_number, file_id, signature) = match target_info {
+        let (name, kind, path, line_number, file_id, signature, directive) = match target_info {
             Ok(info) => info,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Fallback: check if the 'symbol_name' is actually a file path
-                let mut file_stmt = db.conn.prepare("SELECT id, path FROM files WHERE path LIKE ?1 LIMIT 1")?;
+                let mut file_stmt = db.conn.prepare("SELECT id, path, directive FROM files WHERE path LIKE ?1 LIMIT 1")?;
                 let file_search = format!("%{}%", symbol_name);
-                if let Ok((f_id, f_path)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))) {
-                    (
-                        std::path::Path::new(&f_path).file_name().and_then(|n| n.to_str()).unwrap_or(&f_path).to_string(),
-                        "file".to_string(),
-                        f_path,
-                        1,
-                        f_id,
-                        None
-                    )
+                if let Ok((f_id, f_path, f_dir)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))) {
+                    (symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir)
                 } else {
                     return Ok(None);
                 }
@@ -106,7 +110,7 @@ impl ContextObject {
         // 4.1 Fetch External / Unresolved Imports
         // Get all raw imports and diff them against the resolved local symbols
         let mut ext_stmt = db.conn.prepare(
-            "SELECT name, source FROM raw_imports WHERE file_id = ?1"
+            "SELECT name, source FROM raw_imports WHERE file_id = ?1 AND (kind = 'imports' OR kind = 'renders_component' OR kind = 'consumes_hook')"
         )?;
         let mut ext_rows = ext_stmt.query(rusqlite::params![file_id])?;
         let mut external_imports = Vec::new();
@@ -162,7 +166,8 @@ impl ContextObject {
         let mut wrap_rows = wrap_stmt.query(rusqlite::params![file_id, symbol_name])?;
         let mut wrapped_by = Vec::new();
         while let Some(row) = wrap_rows.next()? {
-            wrapped_by.push(row.get::<_, String>(0)?);
+            let path: String = row.get(0)?;
+            wrapped_by.push(db.resolve_path(&path));
         }
 
         // 4.7 Fetch Rendered Components
@@ -190,8 +195,18 @@ impl ContextObject {
         while let Some(row) = hook_rows.next()? {
             consumes_hooks.push(row.get::<_, String>(0)?);
         }
+        
+        let mut raw_hook_stmt = db.conn.prepare(
+            "SELECT name FROM raw_imports WHERE file_id = ?1 AND kind = 'consumes_hook'"
+        )?;
+        let mut raw_hook_rows = raw_hook_stmt.query(rusqlite::params![file_id])?;
+        while let Some(row) = raw_hook_rows.next()? {
+            let hook_name: String = row.get(0)?;
+            if !consumes_hooks.contains(&hook_name) {
+                consumes_hooks.push(hook_name);
+            }
+        }
 
-        // 5. Package it all up into our pristine, JSON-ready Context Object
         // Decorator Extraction
         let mut final_signature = signature.clone();
         let mut decorators = Vec::new();
@@ -212,35 +227,55 @@ impl ContextObject {
             }
         }
 
-        // Make paths absolute
-        let current_dir = std::env::current_dir().unwrap_or_default().display().to_string();
-        let abs_path = format!("{}/{}", current_dir, path);
-        
-        let mut abs_rev_deps = Vec::new();
-        for p in rev_deps {
-            abs_rev_deps.push(format!("{}/{}", current_dir, p));
+        // 4.9 Fetch Callers
+        let mut callers_stmt = db.conn.prepare(
+            "SELECT files.path 
+             FROM edges 
+             JOIN files ON edges.source_file_id = files.id
+             WHERE edges.target_symbol_id = (SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1) 
+             AND edges.kind = 'calls'"
+        )?;
+        let mut callers_rows = callers_stmt.query(rusqlite::params![file_id, name])?;
+        let mut callers = Vec::new();
+        while let Some(row) = callers_rows.next()? {
+            let path: String = row.get(0)?;
+            callers.push(db.resolve_path(&path));
         }
-        
-        let mut abs_wrapped_by = Vec::new();
-        for p in wrapped_by {
-            abs_wrapped_by.push(format!("{}/{}", current_dir, p));
+
+        // 4.10 Fetch Callees
+        let mut callees_stmt = db.conn.prepare(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id
+             WHERE edges.source_file_id = ?1 AND edges.kind = 'calls'"
+        )?;
+        let mut callees_rows = callees_stmt.query(rusqlite::params![file_id])?;
+        let mut callees = Vec::new();
+        while let Some(row) = callees_rows.next()? {
+            callees.push(row.get::<_, String>(0)?);
         }
+
+        let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
 
         Ok(Some(ContextObject {
             target_name: name,
             target_kind: kind,
-            defining_file: abs_path,
+            defining_file: db.resolve_path(&path),
             line_number: line_number as usize,
             signature: final_signature,
+            directive,
             decorators,
-            reverse_dependencies: abs_rev_deps,
+            reverse_dependencies: rev_deps,
             siblings,
             forward_dependencies,
             external_imports,
             prop_interfaces,
-            wrapped_by: abs_wrapped_by,
+            wrapped_by,
             renders_components,
             consumes_hooks,
+            callers,
+            callees,
+            graph_indexed: total_edges > 0,
         }))
     }
 }

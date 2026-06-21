@@ -39,10 +39,29 @@ impl LanguageFrontend for VueFrontend {
             }
         }
 
-        if is_ts {
+        let mut result = if is_ts {
             TsxFrontend.parse_and_extract(&script_content, path)
         } else {
             JavaScriptFrontend.parse_and_extract(&script_content, path)
+        };
+
+        if let Some((_, _, ref mut imports)) = result {
+            // Process template bindings
+            let re = regex::Regex::new(r#"(?:@|v-on:|v-model|:)[a-zA-Z0-9_\-]+="([a-zA-Z0-9_]+)(?:\(|")"#).unwrap();
+            for (line_idx, line) in source_code.lines().enumerate() {
+                for cap in re.captures_iter(line) {
+                    if let Some(handler) = cap.get(1) {
+                        imports.push(ImportNode {
+                            name: handler.as_str().to_string(),
+                            source: None,
+                            line_number: line_idx + 1,
+                            kind: Some("calls".to_string()),
+                        });
+                    }
+                }
+            }
         }
+        
+        result
     }
 }

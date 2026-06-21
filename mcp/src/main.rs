@@ -21,28 +21,91 @@ struct JsonRpcResponse {
     result: serde_json::Value,
 }
 
+struct ResolvedWorkspace {
+    db_path: String,
+    project_root: String,
+    exists: bool,
+}
 
+/// Resolves the active CodeBroker workspace.
+/// If ~/.codebroker/active_project has ever been set (e.g. via `set_workspace`
+/// or `codebroker bind`), that workspace is always honored verbatim, even if
+/// its database hasn't been indexed yet. We deliberately do NOT fall back to
+/// a CWD-relative database in that case: silently serving a different
+/// project's data is what caused duplicate-tree / stale-graph results when
+/// switching workspaces. Only when no active_project pointer exists at all
+/// do we fall back to a CWD-relative database (first-run behavior).
+fn resolve_workspace() -> ResolvedWorkspace {
+    if let Ok(home) = std::env::var("HOME") {
+        let active_file = format!("{}/.codebroker/active_project", home);
+        if let Ok(project_path) = std::fs::read_to_string(&active_file) {
+            let project_path = project_path.trim().to_string();
+            if !project_path.is_empty() {
+                let db_path = format!("{}/.codebroker/codebroker.db", project_path);
+                let exists = std::path::Path::new(&db_path).exists();
+                if exists {
+                    eprintln!("Using active project database: {}", db_path);
+                } else {
+                    eprintln!("Active workspace '{}' has no index yet at {}", project_path, db_path);
+                }
+                return ResolvedWorkspace { db_path, project_root: project_path, exists };
+            }
+        }
+    }
+
+    // No active_project pointer has ever been set: fall back to CWD.
+    let cwd_db = ".codebroker/codebroker.db".to_string();
+    let exists = std::path::Path::new(&cwd_db).exists();
+    let project_root = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+    ResolvedWorkspace { db_path: cwd_db, project_root, exists }
+}
+
+fn resolve_db_path() -> String {
+    resolve_workspace().db_path
+}
+
+/// Runs `codebroker init` rooted at `project_dir` (via current_dir), rather than
+/// inheriting the MCP server process's own CWD. Previously the auto-init hook
+/// spawned the indexer without pinning its working directory, so it could index
+/// whatever directory the MCP process happened to be launched from instead of
+/// the workspace that `set_workspace` / `active_project` actually pointed to,
+/// leaving the intended workspace's database empty (0 edges) or never indexed.
+fn run_index(project_dir: &str) -> Result<String, String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let parent = current_exe.parent().ok_or_else(|| "Could not resolve codebroker-mcp binary directory".to_string())?;
+    let cli_path = parent.join("codebroker");
+
+    let status = std::process::Command::new(&cli_path)
+        .arg("init")
+        .current_dir(project_dir)
+        .status()
+        .map_err(|e| format!("Failed to spawn indexer process in {}: {}", project_dir, e))?;
+
+    if status.success() {
+        Ok(format!("Indexing complete for workspace: {}", project_dir))
+    } else {
+        Err(format!("Indexer exited with non-zero status ({}) while indexing {}", status, project_dir))
+    }
+}
 
 fn main() {
-    // AUTO-INIT HOOK: If the database doesn't exist in the current directory, build it automatically!
-    if !std::path::Path::new(".codebroker/codebroker.db").exists() {
-        eprintln!("No codebroker.db found in the current directory. Auto-initializing codebase...");
-        
-        // Find the 'codebroker' sibling binary
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(parent) = current_exe.parent() {
-                let cli_path = parent.join("codebroker");
-                
-                // Shell out to 'codebroker init' and wait for it to finish
-                let status = std::process::Command::new(cli_path)
-                    .arg("init")
-                    .status();
-                    
-                match status {
-                    Ok(s) if s.success() => eprintln!("Auto-initialization complete!"),
-                    Ok(s) => eprintln!("Auto-initialization failed with status: {}", s),
-                    Err(e) => eprintln!("Failed to spawn indexer process: {}", e),
-                }
+    // Resolve the active workspace (db path + the project root it belongs to)
+    let resolved = resolve_workspace();
+
+    // AUTO-INIT HOOK: If the resolved workspace has no index yet, index its
+    // actual project root (not the MCP process's ambient CWD).
+    if !resolved.exists {
+        let project_dir = resolved.project_root.clone();
+        let home_dir = std::env::var("HOME").unwrap_or_default();
+        let project_path_buf = std::path::PathBuf::from(&project_dir);
+
+        if project_dir.is_empty() || project_dir == home_dir || project_path_buf.parent().is_none() {
+            eprintln!("Refusing to auto-initialize codebroker in home or root directory to prevent massive indexing.");
+        } else {
+            eprintln!("No index found for workspace '{}'. Auto-initializing...", project_dir);
+            match run_index(&project_dir) {
+                Ok(msg) => eprintln!("{}", msg),
+                Err(e) => eprintln!("Auto-initialization failed: {}", e),
             }
         }
     }
@@ -162,7 +225,7 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview",
-                                        "description": "CRITICAL: Call this tool IMMEDIATELY whenever the user asks vague questions like 'what is this project about', 'explain the codebase', or asks for a general architecture summary. Returns a raw topological map of the local repository connected via MCP.",
+                                        "description": "Returns a raw topological map of the local repository. Use this to understand the high-level architecture.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
@@ -170,7 +233,7 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview_ai",
-                                        "description": "CRITICAL: Call this tool IMMEDIATELY whenever the user asks 'what does this code do', 'explain this project', or asks for a high-level summary. Returns a deeply cached, AI-generated architectural summary of the entire repository.",
+                                        "description": "Returns an AI-generated architectural summary of the entire repository. Use this to explain what the project does.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
@@ -187,17 +250,38 @@ fn main() {
                                     },
                                     {
                                         "name": "read_symbol_source",
-                                        "description": "Read exact source code for a symbol without returning the entire file.",
+                                        "description": "Read exact source code for one or more symbols without returning the entire file.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string" },
+                                                "symbol": { "type": "string", "description": "Single symbol name" },
+                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names (for batch fetching)" },
                                                 "include_dependencies": { 
                                                     "type": "boolean",
                                                     "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)." 
                                                 }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "name": "set_workspace",
+                                        "description": "Change the active CodeBroker indexing workspace. Triggers a database swap, and automatically indexes the new workspace if it hasn't been indexed yet.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "absolute_path": { "type": "string", "description": "Absolute path to the new workspace project root" }
                                             },
-                                            "required": ["symbol"]
+                                            "required": ["absolute_path"]
+                                        }
+                                    },
+                                    {
+                                        "name": "reindex_workspace",
+                                        "description": "Force a full re-index of the active (or given) workspace, rebuilding the symbol table and dependency graph edges from scratch. Use this whenever repository_stats/project_overview reports 0 edges, or after making large changes to the codebase.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "absolute_path": { "type": "string", "description": "Optional. Absolute path to re-index. Defaults to the currently active workspace." }
+                                            }
                                         }
                                     },
                                     {
@@ -229,6 +313,18 @@ fn main() {
                                                 "end_line": { "type": "number" }
                                             },
                                             "required": ["path", "start_line", "end_line"]
+                                        }
+                                    },
+                                    {
+                                        "name": "generate_patch",
+                                        "description": "Generates a unified diff patch to modify a symbol, using CodeBroker's onboard AI and semantic context.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "symbol": { "type": "string", "description": "The exact name of the symbol to modify." },
+                                                "instruction": { "type": "string", "description": "Instructions for what change to make." }
+                                            },
+                                            "required": ["symbol", "instruction"]
                                         }
                                     },
                                     {
@@ -319,6 +415,16 @@ fn main() {
                                         }
                                     },
                                     {
+                                        "name": "find_duplicate_logic",
+                                        "description": "Scan the repository for near-duplicate function/component bodies that live in different files (copy-pasted logic). Unlike graph tools, this catches duplication even when there is no shared call/import edge between the copies.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "min_length": { "type": "number", "description": "Minimum normalized source length (characters) to consider. Default 80. Lower values surface more, noisier matches." }
+                                            }
+                                        }
+                                    },
+                                    {
                                         "name": "graph_subtree",
                                         "description": "Extract the undirected neighborhood dependency subtree originating from a root symbol.",
                                         "inputSchema": {
@@ -343,19 +449,22 @@ fn main() {
                         let params = request.params.unwrap_or_default();
                         let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
                         let default_args = serde_json::json!({});
-                        let arguments = params.get("arguments").unwrap_or(&default_args);
+                        let arguments = params.get("arguments").and_then(|a| a.as_object()).unwrap_or(default_args.as_object().unwrap());
                         
                         eprintln!("AI Agent requested tool execution: {}", tool_name);
 
-                        let start_time = std::time::Instant::now();
-                        let mut cache_hit = false;
+                        // Re-resolve active workspace for each call
+                        let db_path = resolve_db_path();
                         let mut estimated_raw_context_tokens = 0;
+                        let mut cache_hit = false;
+                        let start_time = std::time::Instant::now();
                         let model_used = "Claude Desktop";
 
-                        let tool_result = match tool_name {
+                        let tool_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            match tool_name {
                             "get_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::context::ContextObject::assemble(&db, symbol) {
@@ -375,7 +484,7 @@ fn main() {
                                 if hf_token.is_empty() {
                                     "Error: HF_API_TOKEN environment variable is not set.".to_string()
                                 } else {
-                                    match storage::Database::new(".codebroker/codebroker.db") {
+                                    match storage::Database::new(&db_path) {
                                         Ok(db) => {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
@@ -395,58 +504,77 @@ fn main() {
                             "search_codebase" => {
                                 let keyword = arguments.get("keyword").and_then(|s| s.as_str()).unwrap_or("");
                                 
-                                // Perform Semantic Expansion if token is present
                                 let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                let mut llm_used = false;
                                 let semantic_tokens = if !hf_token.is_empty() {
                                     use semantic::provider::LlmProvider;
                                     let provider = semantic::huggingface::HuggingFaceProvider::new(hf_token);
-                                    provider.expand_query(keyword).map(|(tokens, _)| tokens).unwrap_or_default()
+                                    match provider.expand_query(keyword, 5) {
+                                        Ok((tokens, _)) => {
+                                            llm_used = true;
+                                            tokens
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Semantic expansion failed/skipped: {}", e);
+                                            vec![]
+                                        }
+                                    }
                                 } else {
                                     vec![]
                                 };
 
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens) {
-                                            Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
-                                            Err(e) => format!("Error searching: {}", e),
+                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used) {
+                                            Ok(results) => {
+                                                let payload = serde_json::json!({
+                                                    "workspace_root": db.project_root,
+                                                    "results": results
+                                                });
+                                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                            },
+                                            Err(e) => serde_json::json!({"success": false, "error": format!("Error searching: {}", e)}).to_string(),
                                         }
                                     }
-                                    Err(_) => "Error connecting to db".to_string(),
+                                    Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
                                 }
                             }
                             "find_symbol" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let context_lines = arguments.get("context_lines").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
-                                
-                                match storage::Database::new(".codebroker/codebroker.db") {
+
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
-                                        match query::engine::find_symbol_exact(&db, symbol, context_lines) {
+                                        match query::engine::find_symbol(&db, symbol, context_lines) {
                                             Ok(results) => {
                                                 if results.is_empty() {
-                                                    format!("Symbol '{}' not found.", symbol)
+                                                    format!("Symbol '{}' not found in workspace '{}'.", symbol, db.project_root)
                                                 } else {
-                                                    let mut s = format!("Exact matches for '{}':\n", symbol);
-                                                    for (path, kind, line, preview) in results {
-                                                        s.push_str(&format!("- [{}] at {}:{}\n```rust\n{}\n```\n\n", kind, path, line, preview));
+                                                    let mut s = format!("Workspace: {}\nMatches for '{}':\n", db.project_root, symbol);
+                                                    for (path, kind, line, preview, score) in results {
+                                                        s.push_str(&format!("- [{}] at {}:{} (Score: {})\n```rust\n{}\n```\n\n", kind, path, line, score, preview));
                                                     }
                                                     s
                                                 }
                                             }
-                                            Err(e) => format!("Error finding symbol: {}", e),
+                                            Err(e) => serde_json::json!({"success": false, "error": format!("Error finding symbol: {}", e)}).to_string(),
                                         }
                                     }
-                                    Err(_) => "Error connecting to db".to_string(),
+                                    Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
                                 }
                             }
                             "project_overview" => {
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview(&db) {
-                                            Ok(overview) => serde_json::to_string_pretty(&overview).unwrap_or_default(),
+                                            Ok(overview) => {
+                                                let mut output = serde_json::to_value(&overview).unwrap();
+                                                output["workspace_root"] = serde_json::Value::String(db.project_root.clone());
+                                                serde_json::to_string_pretty(&output).unwrap_or_default()
+                                            },
                                             Err(e) => format!("Error building overview: {}", e),
                                         }
                                     }
@@ -454,7 +582,7 @@ fn main() {
                                 }
                             }
                             "repository_stats" => {
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview(&db) {
@@ -478,7 +606,7 @@ fn main() {
                                 if hf_token.is_empty() {
                                     "Error: HF_API_TOKEN environment variable is not set.".to_string()
                                 } else {
-                                    match storage::Database::new(".codebroker/codebroker.db") {
+                                    match storage::Database::new(&db_path) {
                                         Ok(db) => {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
@@ -496,22 +624,107 @@ fn main() {
                                 }
                             }
                             "read_symbol_source" => {
-                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                match storage::Database::new(".codebroker/codebroker.db") {
-                                    Ok(db) => {
-                                        match query::retrieval::read_symbol_source(&db, symbol, include_deps) {
-                                            Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
-                                            Err(e) => format!("Error reading source: {}", e),
+                                
+                                let mut targets = Vec::new();
+                                if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
+                                    targets.push(s.to_string());
+                                }
+                                if let Some(arr) = arguments.get("symbols").and_then(|a| a.as_array()) {
+                                    for v in arr {
+                                        if let Some(s) = v.as_str() {
+                                            targets.push(s.to_string());
                                         }
                                     }
-                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+
+                                if targets.is_empty() {
+                                    "Error: Must provide 'symbol' or 'symbols'".to_string()
+                                } else {
+                                    match storage::Database::new(&db_path) {
+                                        Ok(db) => {
+                                            let mut combined_results = Vec::new();
+                                            let mut has_error = false;
+                                            let mut err_msg = String::new();
+                                            for symbol in targets {
+                                                match query::retrieval::read_symbol_source(&db, &symbol, include_deps) {
+                                                    Ok(results) => combined_results.extend(results),
+                                                    Err(e) => {
+                                                        has_error = true;
+                                                        err_msg = format!("Error reading source for {}: {}", symbol, e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            if has_error {
+                                                err_msg
+                                            } else {
+                                                serde_json::to_string_pretty(&combined_results).unwrap_or_default()
+                                            }
+                                        }
+                                        Err(_) => "Error connecting to db".to_string(),
+                                    }
+                                }
+                            }
+                            "set_workspace" => {
+                                let path = arguments.get("absolute_path").and_then(|s| s.as_str()).unwrap_or("");
+                                if path.is_empty() {
+                                    "Error: absolute_path is required".to_string()
+                                } else if !std::path::Path::new(path).exists() {
+                                    format!("Error: Path '{}' does not exist.", path)
+                                } else {
+                                    if let Ok(home) = std::env::var("HOME") {
+                                        let active_file = format!("{}/.codebroker/active_project", home);
+                                        std::fs::create_dir_all(format!("{}/.codebroker", home)).unwrap_or_default();
+                                        if let Err(e) = std::fs::write(&active_file, path) {
+                                            format!("Error saving workspace: {}", e)
+                                        } else {
+                                            let new_db_path = format!("{}/.codebroker/codebroker.db", path);
+                                            if std::path::Path::new(&new_db_path).exists() {
+                                                format!("Workspace successfully updated to {}. All subsequent tools will query this database.", path)
+                                            } else {
+                                                match run_index(path) {
+                                                    Ok(_) => format!("Workspace successfully updated to {}. No existing index was found, so it was automatically indexed.", path),
+                                                    Err(e) => format!("Workspace updated to {}, but automatic indexing failed: {}. Call reindex_workspace to retry.", path, e),
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        "Error: HOME environment variable not set.".to_string()
+                                    }
+                                }
+                            }
+                            "reindex_workspace" => {
+                                let target = arguments.get("absolute_path").and_then(|s| s.as_str());
+                                let project_dir = match target {
+                                    Some(p) if !p.is_empty() => p.to_string(),
+                                    _ => resolve_workspace().project_root,
+                                };
+                                if !std::path::Path::new(&project_dir).exists() {
+                                    format!("Error: Path '{}' does not exist.", project_dir)
+                                } else {
+                                    match run_index(&project_dir) {
+                                        Ok(_) => {
+                                            let reindexed_db_path = format!("{}/.codebroker/codebroker.db", project_dir);
+                                            match storage::Database::new(&reindexed_db_path) {
+                                                Ok(db) => match query::engine::build_project_overview(&db) {
+                                                    Ok(overview) => format!(
+                                                        "Re-indexed {}. Files: {}, Symbols: {}, Edges: {}.",
+                                                        project_dir, overview.files, overview.symbols, overview.edges
+                                                    ),
+                                                    Err(e) => format!("Re-indexed {} but failed to read stats: {}", project_dir, e),
+                                                },
+                                                Err(e) => format!("Re-indexed {} but failed to open database afterwards: {}", project_dir, e),
+                                            }
+                                        }
+                                        Err(e) => format!("Error re-indexing {}: {}", project_dir, e),
+                                    }
                                 }
                             }
                             "read_file_skeleton" => {
                                 let path = arguments.get("file_path").and_then(|s| s.as_str()).unwrap_or("");
                                 let target_symbol = arguments.get("target_symbol").and_then(|s| s.as_str());
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::retrieval::skeletonize_file(&db, path, target_symbol) {
                                             Ok(res) => res,
@@ -527,7 +740,7 @@ fn main() {
                                 let direction_str = arguments.get("direction").and_then(|s| s.as_str()).unwrap_or("both");
                                 let direction = query::graph::GraphDirection::from(direction_str);
                                 
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::graph::explore_graph(&db, symbol, depth, direction) {
@@ -542,7 +755,7 @@ fn main() {
                                 let from_symbol = arguments.get("from").and_then(|s| s.as_str()).unwrap_or("");
                                 let to_symbol = arguments.get("to").and_then(|s| s.as_str()).unwrap_or("");
                                 
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::graph::shortest_path(&db, from_symbol, to_symbol) {
                                             Ok(res) => {
@@ -558,7 +771,7 @@ fn main() {
                             "architectural_hotspots" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(20) as usize;
                                 
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::graph::architectural_hotspots(&db, limit) {
                                             Ok(res) => {
@@ -572,7 +785,7 @@ fn main() {
                                 }
                             }
                             "dependency_cycles" => {
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::graph::dependency_cycles(&db) {
                                             Ok(res) => {
@@ -585,21 +798,56 @@ fn main() {
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
+                            "find_duplicate_logic" => {
+                                let min_length = arguments.get("min_length").and_then(|n| n.as_u64()).unwrap_or(80) as usize;
+                                match storage::Database::new(&db_path) {
+                                    Ok(db) => {
+                                        match query::duplicates::find_duplicate_logic(&db, min_length) {
+                                            Ok(res) => {
+                                                estimated_raw_context_tokens = res.groups.len() * 60; // rough estimation
+                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing duplicate logic report".to_string())
+                                            }
+                                            Err(e) => format!("Error scanning for duplicate logic: {}", e),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
                             "graph_subtree" => {
                                 let root_symbol = arguments.get("root_symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
                                 
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::graph::graph_subtree(&db, root_symbol, depth) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.node_count * 50; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
                                             },
-                                            Err(e) => format!("Error exploring graph subtree: {}", e),
+                                    Err(e) => format!("Error exploring graph subtree: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "generate_patch" => {
+                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
+                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                if hf_token.is_empty() {
+                                    "Error: HF_API_TOKEN environment variable is not set.".to_string()
+                                } else {
+                                    match storage::Database::new(&db_path) {
+                                        Ok(db) => {
+                                            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                            let patch_gen = semantic::generator::PatchGenerator::new(&db, provider);
+                                            match patch_gen.generate_patch(symbol, instruction) {
+                                                Ok(patch) => patch,
+                                                Err(e) => format!("Error generating patch: {}", e),
+                                            }
+                                        }
+                                        Err(_) => "Error connecting to db".to_string(),
+                                    }
                                 }
                             }
                             "read_file_snippet" => {
@@ -614,7 +862,7 @@ fn main() {
                             "get_implementation" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
@@ -629,7 +877,7 @@ fn main() {
                             }
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
                                         let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
@@ -646,7 +894,7 @@ fn main() {
                             }
                             "subsystem_stats" => {
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::subsystem::discover_subsystem(&db, name) {
                                             Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
@@ -658,7 +906,7 @@ fn main() {
                             }
                             "subsystem_overview" => {
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
-                                match storage::Database::new(".codebroker/codebroker.db") {
+                                match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         let _ = db.init_schema();
                                         match query::subsystem::discover_subsystem(&db, name) {
@@ -685,7 +933,16 @@ fn main() {
                                 }
                             }
                             _ => {
-                                format!("Error: Unknown tool '{}'", tool_name)
+                                serde_json::json!({"success": false, "error": format!("Tool {} not recognized", tool_name)}).to_string()
+                            }
+                        }
+                        })) {
+                            Ok(res) => res,
+                            Err(panic_err) => {
+                                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() { s.to_string() }
+                                else if let Some(s) = panic_err.downcast_ref::<String>() { s.clone() }
+                                else { "Unknown panic".to_string() };
+                                serde_json::json!({ "success": false, "error": format!("Tool execution panicked: {}", msg) }).to_string()
                             }
                         };
 
@@ -696,7 +953,7 @@ fn main() {
                         eprintln!("[Analytics] Tool: {}, Exec Time: {}ms, Lines: {}, Tokens: {}, Cache Hit: {}", 
                                    tool_name, execution_time_ms, source_lines_returned, delivered_token_count, cache_hit);
 
-                        if let Ok(db) = storage::Database::new(".codebroker/codebroker.db") {
+                        if let Ok(db) = storage::Database::new(&db_path) {
                             let collector = analytics::collector::MetricsCollector::new(&db);
                             collector.log_comprehensive_event(
                                 tool_name,

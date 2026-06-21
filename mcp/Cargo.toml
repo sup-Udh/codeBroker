@@ -13,6 +13,8 @@ storage = { path = "../storage" }
 query = { path = "../query" }
 semantic = { path = "../semantic" }
 analytics = { path = "../analytics" }
+chrono = "0.4.45"
+rusqlite = "0.40.1"
 
 [[bin]]
 name = "codebroker-mcp"

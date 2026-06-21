@@ -42,6 +42,20 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let query_str = "
         (class_declaration name: (identifier) @type)
         (function_declaration name: (identifier) @function)
+        (return_statement (jsx_element) @jsx_render)
+        (return_statement (parenthesized_expression (jsx_element) @jsx_render))
+        (lexical_declaration 
+            (variable_declarator 
+                name: (identifier) @function 
+                value: (arrow_function)
+            )
+        )
+        (lexical_declaration 
+            (variable_declarator 
+                name: (identifier) @function 
+                value: (call_expression)
+            )
+        )
     ";
     
     let language = tree_sitter_javascript::LANGUAGE.into();
@@ -54,10 +68,13 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             let node = capture.node;
             let capture_kind = &query.capture_names()[capture.index as usize];
             if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
-                let name_str = name.to_string();
+                let mut name_str = name.to_string();
                 let mut kind = capture_kind.to_string();
 
-                if kind == "function" {
+                if kind == "jsx_render" {
+                    name_str = "render".to_string();
+                    kind = "jsx_element".to_string();
+                } else if kind == "function" {
                     if name_str.starts_with("use") {
                         kind = "hook".to_string();
                     } else if name_str.ends_with("Provider") {
@@ -72,7 +89,45 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     }
                 }
 
-                let parent = node.parent().unwrap_or(node);
+                let mut parent = node.parent().unwrap_or(node);
+
+                let mut is_call_expr_assignment = false;
+                if parent.kind() == "variable_declarator" {
+                    if let Some(value_node) = parent.child_by_field_name("value") {
+                        if value_node.kind() == "call_expression" {
+                            is_call_expr_assignment = true;
+                        }
+                    }
+                }
+
+                let mut is_exported = false;
+                let mut current = parent;
+                while let Some(p) = current.parent() {
+                    if p.kind() == "export_statement" || p.kind() == "export_clause" {
+                        is_exported = true;
+                        break;
+                    }
+                    if p.kind() == "program" { break; }
+                    current = p;
+                }
+
+                if is_call_expr_assignment && kind == "function" && !is_exported {
+                    continue; // Skip indexing this local generic variable
+                }
+
+                if parent.kind() == "variable_declarator" {
+                    if let Some(lex) = parent.parent() {
+                        if lex.kind() == "lexical_declaration" {
+                            parent = lex;
+                        }
+                    }
+                }
+                if let Some(exp) = parent.parent() {
+                    if exp.kind() == "export_statement" {
+                        parent = exp;
+                    }
+                }
+                
                 let end_line = parent.end_position().row + 1;
                 symbols.push(SymbolNode {
                     name: name_str,
@@ -103,7 +158,11 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         )
         (jsx_opening_element (identifier) @jsx_element)
         (jsx_self_closing_element (identifier) @jsx_element)
-        (call_expression function: (identifier) @hook_call)
+        (jsx_expression (identifier) @call_name)
+        (jsx_expression (member_expression property: (property_identifier) @call_name))
+        (call_expression function: (identifier) @call_name)
+        (call_expression function: (member_expression property: (property_identifier) @call_name))
+        (string (string_fragment) @route_string)
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -129,15 +188,31 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 } else if *capture_kind == "jsx_element" {
                     let name = text.trim().to_string();
                     if name.chars().next().unwrap_or('a').is_uppercase() {
-                        import_name = name;
-                        import_kind = "renders_component".to_string();
+                        import_name = name.clone();
+                        if name.ends_with("Provider") {
+                            import_kind = "renders_provider".to_string();
+                        } else {
+                            import_kind = "renders_component".to_string();
+                        }
                         line_number = node.start_position().row + 1;
                     }
-                } else if *capture_kind == "hook_call" {
+                } else if *capture_kind == "call_name" {
                     let name = text.trim().to_string();
+                    if crate::utils::is_noisy_call_name(&name) {
+                        continue;
+                    }
+                    import_name = name.clone();
                     if name.starts_with("use") {
-                        import_name = name;
                         import_kind = "consumes_hook".to_string();
+                    } else {
+                        import_kind = "calls".to_string();
+                    }
+                    line_number = node.start_position().row + 1;
+                } else if *capture_kind == "route_string" {
+                    let val = text.trim().to_string();
+                    if val.starts_with('/') {
+                        import_name = val;
+                        import_kind = "route_push".to_string();
                         line_number = node.start_position().row + 1;
                     }
                 }

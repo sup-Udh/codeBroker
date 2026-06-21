@@ -72,7 +72,7 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     let mut symbols = Vec::new();
     let filename = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let is_tsx = path.ends_with(".tsx");
-    let query_str = "
+    let mut query_str = String::from("
         (class_declaration name: (type_identifier) @type)
         (interface_declaration name: (type_identifier) @type)
         (function_declaration 
@@ -91,9 +91,22 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 )
             )
         )
-    ";
+        (lexical_declaration 
+            (variable_declarator 
+                name: (identifier) @function 
+                value: (call_expression)
+            )
+        )
+    ");
+
+    if is_tsx {
+        query_str.push_str("
+        (return_statement (jsx_element) @jsx_render)
+        (return_statement (parenthesized_expression (jsx_element) @jsx_render))
+        ");
+    }
     
-    let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
+    let query = Query::new(&language, &query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
 
@@ -119,10 +132,13 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             }
         }
 
-        if let (Some(name_str), Some(node), Some(parent)) = (Some(symbol_name).filter(|s| !s.is_empty()), main_node, parent_node) {
+        if let (Some(mut name_str), Some(node), Some(parent)) = (Some(symbol_name).filter(|s| !s.is_empty()), main_node, parent_node) {
             let mut kind = symbol_kind;
 
-            if kind == "function" {
+            if kind == "jsx_render" {
+                name_str = "render".to_string();
+                kind = "jsx_element".to_string();
+            } else if kind == "function" {
                 if name_str.starts_with("use") {
                     kind = "hook".to_string();
                 } else if name_str.ends_with("Provider") {
@@ -134,6 +150,45 @@ fn extract_ts_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     } else if filename == "layout.tsx" {
                         kind = "layout".to_string();
                     }
+                }
+            }
+
+            let mut parent = parent;
+
+            let mut is_call_expr_assignment = false;
+            if parent.kind() == "variable_declarator" {
+                if let Some(value_node) = parent.child_by_field_name("value") {
+                    if value_node.kind() == "call_expression" {
+                        is_call_expr_assignment = true;
+                    }
+                }
+            }
+
+            let mut is_exported = false;
+            let mut current = parent;
+            while let Some(p) = current.parent() {
+                if p.kind() == "export_statement" || p.kind() == "export_clause" {
+                    is_exported = true;
+                    break;
+                }
+                if p.kind() == "program" { break; }
+                current = p;
+            }
+
+            if is_call_expr_assignment && kind == "function" && !is_exported {
+                continue; // Skip indexing this local generic variable
+            }
+
+            if parent.kind() == "variable_declarator" {
+                if let Some(lex) = parent.parent() {
+                    if lex.kind() == "lexical_declaration" {
+                        parent = lex;
+                    }
+                }
+            }
+            if let Some(exp) = parent.parent() {
+                if exp.kind() == "export_statement" {
+                    parent = exp;
                 }
             }
 
@@ -163,13 +218,17 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             (import_clause (identifier) @import)
             source: (string (string_fragment) @source)
         )
-        (call_expression function: (identifier) @hook_call)
+        (call_expression function: (identifier) @call_name)
+        (call_expression function: (member_expression property: (property_identifier) @call_name))
+        (string (string_fragment) @route_string)
     ");
     
     if is_tsx {
         query_str.push_str("
         (jsx_opening_element (identifier) @jsx_element)
         (jsx_self_closing_element (identifier) @jsx_element)
+        (jsx_expression (identifier) @call_name)
+        (jsx_expression (member_expression property: (property_identifier) @call_name))
         ");
     }
     
@@ -199,15 +258,31 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 } else if *capture_kind == "jsx_element" {
                     let name = text.trim().to_string();
                     if name.chars().next().unwrap_or('a').is_uppercase() {
-                        import_name = name;
-                        import_kind = "renders_component".to_string();
+                        import_name = name.clone();
+                        if name.ends_with("Provider") {
+                            import_kind = "renders_provider".to_string();
+                        } else {
+                            import_kind = "renders_component".to_string();
+                        }
                         line_number = node.start_position().row + 1;
                     }
-                } else if *capture_kind == "hook_call" {
+                } else if *capture_kind == "call_name" {
                     let name = text.trim().to_string();
+                    if crate::utils::is_noisy_call_name(&name) {
+                        continue;
+                    }
+                    import_name = name.clone();
                     if name.starts_with("use") {
-                        import_name = name;
                         import_kind = "consumes_hook".to_string();
+                    } else {
+                        import_kind = "calls".to_string();
+                    }
+                    line_number = node.start_position().row + 1;
+                } else if *capture_kind == "route_string" {
+                    let val = text.trim().to_string();
+                    if val.starts_with('/') {
+                        import_name = val;
+                        import_kind = "route_push".to_string();
                         line_number = node.start_position().row + 1;
                     }
                 }

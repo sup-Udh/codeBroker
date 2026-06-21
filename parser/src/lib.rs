@@ -7,3 +7,4 @@ pub mod config_frontend;
 pub mod vue_frontend;
 pub mod svelte_frontend;
 pub mod javascript_frontend;
+pub mod utils;

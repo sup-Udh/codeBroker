@@ -6,6 +6,7 @@ use crate::schema::INIT_SQL;
 
 pub struct Database {
     pub conn: Connection,
+    pub project_root: String,
 }
 
 pub struct CodeBrokerStats {
@@ -22,7 +23,27 @@ impl Database {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(Database { conn })
+        
+        // Canonicalize the db_path to absolute, then get parent (.codebroker), then get its parent (project root)
+        let abs_db_path = std::path::Path::new(db_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(db_path));
+            
+        let project_root = abs_db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_string_lossy()
+            .to_string();
+
+        Ok(Database { conn, project_root })
+    }
+
+    /// Resolves a stored relative path into an absolute path based on the project root
+    pub fn resolve_path(&self, relative_path: &str) -> String {
+        let root = std::path::Path::new(&self.project_root);
+        let rel = std::path::Path::new(relative_path);
+        root.join(rel).to_string_lossy().to_string()
     }
 
     /// Creates the tables if they don't already exist

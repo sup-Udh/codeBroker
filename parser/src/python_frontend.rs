@@ -138,6 +138,8 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         (import_from_statement module_name: (_) @source name: (_) @import)
         (class_definition superclasses: (argument_list (identifier) @inherits))
         (assignment right: (call function: (identifier) @instantiates))
+        (call function: (identifier) @call_name)
+        (call function: (attribute attribute: (identifier) @call_name))
     ";
     
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -167,6 +169,14 @@ fn extract_py_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     import_name = text.trim().to_string();
                     line_number = node.start_position().row + 1;
                     import_kind = Some("instantiates".to_string());
+                } else if *capture_kind == "call_name" {
+                    let name = text.trim().to_string();
+                    if crate::utils::is_noisy_call_name(&name) {
+                        continue;
+                    }
+                    import_name = name.clone();
+                    line_number = node.start_position().row + 1;
+                    import_kind = Some("calls".to_string());
                 }
             }
         }
