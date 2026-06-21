@@ -492,19 +492,35 @@ fn main() {
                 }
             }
             
+            // Generate local .mcp.json for claude-code
+            let local_mcp_json = serde_json::json!({
+                "mcpServers": {
+                    "codebroker": {
+                        "command": "codebroker-mcp",
+                        "env": {
+                            "HF_API_TOKEN": "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"
+                        }
+                    }
+                }
+            });
+            if let Ok(mcp_json_str) = serde_json::to_string_pretty(&local_mcp_json) {
+                let _ = fs::write(".mcp.json", mcp_json_str);
+                println!("Created local Claude Code configuration at .mcp.json");
+            }
+            
             // 2.5 Generate Antigravity instructions.md locally, then sync globally
             let _ = fs::create_dir_all(".codebroker");
             let local_instructions_path = ".codebroker/instructions.md";
             
             let default_instructions = r#"# CodeBroker MCP Tools
-You are connected to the CodeBroker MCP Server for the current workspace.
+CodeBroker provides semantic code search and context extraction.
 
-**CRITICAL RULES:**
-1. **Focus Exclusively on this Workspace:** Your primary objective is to analyze and edit the repository where CodeBroker is initialized.
-2. **Prioritize CodeBroker Tools:** ALWAYS use `search_codebase`, `find_symbol`, and `get_context` over native tools like `grep_search` or `read_file`.
-3. **Be Concise & Semantic:** Do not use `grep_search` for code discovery; `search_codebase` is semantic and vastly superior.
-4. **Context Management:** Never read entire files unless necessary. Use `read_file_skeleton` or `read_symbol_source` to preserve your context window.
-5. **Architectural Understanding:** When asked how something works or what its impact is, immediately use `project_overview` or `impact_analysis` instead of guessing."#;
+**Guidelines for Using CodeBroker:**
+1. **Workspace Context:** Please focus your analysis on the current repository where CodeBroker is initialized.
+2. **Recommended Tools:** For optimal performance, please prefer using `search_codebase`, `find_symbol`, and `get_context` rather than basic tools like `grep_search` or `read_file`.
+3. **Semantic Discovery:** `search_codebase` is highly recommended over `grep_search` for exploring the codebase.
+4. **Context Preservation:** To save context window, consider using `read_file_skeleton` or `read_symbol_source` instead of reading full files when possible.
+5. **Architecture:** `project_overview` and `impact_analysis` are great starting points for understanding how features connect."#;
 
             // Write locally if it doesn't exist
             if !std::path::Path::new(local_instructions_path).exists() {
@@ -533,6 +549,26 @@ You are connected to the CodeBroker MCP Server for the current workspace.
                         println!("Successfully synced AI instructions to {}", claude_instructions_path);
                     } else {
                         println!("Warning: Failed to write global instructions.md at {}", claude_instructions_path);
+                    }
+                }
+                
+                // claude-code CLAUDE.md (Global)
+                let claude_md_dir = format!("{}/.claude", home_dir);
+                if fs::create_dir_all(&claude_md_dir).is_ok() {
+                    let claude_md_path = format!("{}/CLAUDE.md", claude_md_dir);
+                    let claude_md_exists = std::path::Path::new(&claude_md_path).exists();
+                    
+                    if claude_md_exists {
+                        if let Ok(existing_content) = fs::read_to_string(&claude_md_path) {
+                            if !existing_content.contains("CodeBroker MCP Tools") {
+                                let new_content = format!("{}\n\n{}", existing_content, local_content);
+                                let _ = fs::write(&claude_md_path, new_content);
+                                println!("Appended AI instructions to global CLAUDE.md");
+                            }
+                        }
+                    } else {
+                        let _ = fs::write(&claude_md_path, &local_content);
+                        println!("Created global CLAUDE.md with AI instructions");
                     }
                 }
             }
