@@ -1,10 +1,29 @@
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use std::path::Path;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+use std::fs;
 
-pub fn collect_files(root_dir:&str) -> Vec<String> {
+pub fn collect_files(root_dir: &str) -> Vec<String> {
     let mut valid_files = Vec::new();
+    let mut seen_hashes = HashSet::new();
 
-    let walker = WalkBuilder::new(root_dir).build(); // automatically ignores the .gitingore files the walkbuilder
+    let mut overrides = OverrideBuilder::new(root_dir);
+    // Ignore common build output and dependency directories
+    let _ = overrides.add("!**/node_modules/**");
+    let _ = overrides.add("!**/dist/**");
+    let _ = overrides.add("!**/build/**");
+    let _ = overrides.add("!**/.next/**");
+    let _ = overrides.add("!**/out/**");
+    let _ = overrides.add("!**/.codebroker/**");
+
+    let mut builder = WalkBuilder::new(root_dir);
+    if let Ok(ov) = overrides.build() {
+        builder.overrides(ov);
+    }
+    
+    let walker = builder.build(); // automatically ignores the .gitingore files the walkbuilder
 
     for result in walker {
         if let Ok(entry) = result {
@@ -12,8 +31,18 @@ pub fn collect_files(root_dir:&str) -> Vec<String> {
 
             if path.is_file() {
                 if is_supported_file(path) {
-                    if let Some(path_str) = path.to_str() {
-                        valid_files.push(path_str.to_string());
+                    // Deduplicate by content hash
+                    if let Ok(content) = fs::read(path) {
+                        let mut hasher = DefaultHasher::new();
+                        content.hash(&mut hasher);
+                        let file_hash = hasher.finish();
+
+                        if !seen_hashes.contains(&file_hash) {
+                            seen_hashes.insert(file_hash);
+                            if let Some(path_str) = path.to_str() {
+                                valid_files.push(path_str.to_string());
+                            }
+                        }
                     }
                 }
             }
