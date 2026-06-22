@@ -99,7 +99,7 @@ impl<'a> SummaryGenerator<'a> {
         let prompt = build_prompt(symbol_name, &source_code, &context, &config_text);
 
         let start_time = std::time::Instant::now();
-        let (summary, token_count) = self.provider.generate_summary(&prompt, 20)?;
+        let (summary, token_count) = self.provider.generate_summary(&prompt, 30, 2048)?;
         let elapsed_ms = start_time.elapsed().as_millis();
 
         // 7. Save to Cache with all our rich metadata
@@ -156,7 +156,7 @@ impl<'a> ProjectOverviewGenerator<'a> {
             overview_json
         );
 
-        let (summary, _token_count) = self.provider.generate_summary(&prompt, 45)?;
+        let (summary, _token_count) = self.provider.generate_summary(&prompt, 60, 4096)?;
 
         let _ = self.db.save_repository_overview(&repo_hash, model_name, &summary);
 
@@ -282,7 +282,7 @@ impl<'a> PatchGenerator<'a> {
             .ok_or("Failed to assemble context")?;
 
         let prompt = build_patch_prompt(symbol_name, &full_file_source, &context, instruction);
-        let (patch, _) = self.provider.generate_summary(&prompt, 20)?;
+        let (patch, _) = self.provider.generate_summary(&prompt, 300, 8192)?;
 
         // Grounding check: collect every identifier that's actually known —
         // from the file itself plus the graph context — and flag anything

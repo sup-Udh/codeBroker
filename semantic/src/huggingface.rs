@@ -49,7 +49,7 @@ impl LlmProvider for HuggingFaceProvider {
         &self.model_id
     }
     
-    fn generate_summary(&self, prompt: &str, timeout_secs: u64) -> Result<(String, usize), String> {
+    fn generate_summary(&self, prompt: &str, timeout_secs: u64, max_tokens: usize) -> Result<(String, usize), String> {
         self.check_circuit_breaker()?;
 
         let url = "https://router.huggingface.co/v1/chat/completions";
@@ -62,7 +62,7 @@ impl LlmProvider for HuggingFaceProvider {
                     "content": prompt
                 }
             ],
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "temperature": 0.3
         });
         

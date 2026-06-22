@@ -40,7 +40,7 @@ impl<'a> SubsystemOverviewGenerator<'a> {
         // 3. Generate
         let system_prompt = "You are an expert software architect analyzing a subsystem within a large codebase. Use the provided deterministic subsystem stats to formulate a comprehensive explanation of its role, components, and impact on the broader system.\n\n";
         let full_prompt = format!("{}{}", system_prompt, prompt);
-        let (response, _tokens) = self.provider.generate_summary(&full_prompt, 30)?;
+        let (response, _tokens) = self.provider.generate_summary(&full_prompt, 45, 2048)?;
 
         // 4. Cache
         let mut insert_stmt = self.db.conn.prepare(
