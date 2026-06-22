@@ -283,11 +283,19 @@ impl Database {
         })
     }
 
+    /// Cache key for `project_overview_ai`'s repository overview. Previously
+    /// this only hashed file/symbol/edge COUNTS plus the directory listing —
+    /// so renaming a function, changing its signature, or any other edit
+    /// that doesn't change those counts left the hash identical, and the
+    /// cached (now stale) narrative kept being served indefinitely. Folding
+    /// in every symbol's (path, name, kind, signature) makes the hash change
+    /// whenever any symbol's shape actually changes, while still avoiding a
+    /// full re-read of file contents on every cache check.
     pub fn get_repository_topology_hash(&self) -> Result<String> {
         let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
         let symbols: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0)).unwrap_or(0);
         let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap_or(0);
-        
+
         let mut stmt = self.conn.prepare("SELECT path FROM files")?;
         let mut rows = stmt.query([])?;
         let mut dirs = std::collections::HashSet::new();
@@ -300,11 +308,33 @@ impl Database {
         let mut dirs_vec: Vec<_> = dirs.into_iter().collect();
         dirs_vec.sort();
         let top_modules = dirs_vec.join(",");
-        
+
+        let mut sym_stmt = self.conn.prepare(
+            "SELECT files.path, symbols.name, symbols.kind, symbols.signature
+             FROM symbols JOIN files ON symbols.file_id = files.id
+             ORDER BY files.path, symbols.name"
+        )?;
+        let mut sym_rows = sym_stmt.query([])?;
+        let mut symbol_shapes = String::new();
+        while let Some(row) = sym_rows.next()? {
+            let path: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let signature: Option<String> = row.get(3)?;
+            symbol_shapes.push_str(&path);
+            symbol_shapes.push('|');
+            symbol_shapes.push_str(&name);
+            symbol_shapes.push('|');
+            symbol_shapes.push_str(&kind);
+            symbol_shapes.push('|');
+            symbol_shapes.push_str(signature.as_deref().unwrap_or(""));
+            symbol_shapes.push(';');
+        }
+
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        format!("{}-{}-{}-{}", files, symbols, edges, top_modules).hash(&mut hasher);
+        format!("{}-{}-{}-{}-{}", files, symbols, edges, top_modules, symbol_shapes).hash(&mut hasher);
         Ok(format!("{:x}", hasher.finish()))
     }
 

@@ -64,6 +64,38 @@ fn resolve_db_path() -> String {
     resolve_workspace().db_path
 }
 
+/// Pre-flight ambiguity check for tools that take a bare symbol name and
+/// would otherwise silently pick whichever DB row comes back first when a
+/// common name (e.g. "GET", a Next.js route handler exported from dozens of
+/// files) matches many definitions. Returns Some(json_response) when the
+/// caller should stop and ask for disambiguation instead of guessing; the
+/// response carries the full candidate list (location + kind) so the caller
+/// can pick one and retry with `file_path` set, the same UX `find_symbol`
+/// already provides. Returns None when it's safe to proceed (0 matches, or
+/// exactly 1 match after applying file_hint).
+fn check_symbol_ambiguity(db: &storage::Database, symbol: &str, file_hint: Option<&str>) -> Option<String> {
+    let candidates = query::engine::find_symbol_candidates(db, symbol).ok()?;
+    let filtered: Vec<&query::engine::SymbolCandidate> = match file_hint {
+        Some(hint) => candidates.iter().filter(|c| c.file_path.contains(hint)).collect(),
+        None => candidates.iter().collect(),
+    };
+    if filtered.len() > 1 {
+        Some(serde_json::json!({
+            "ambiguous": true,
+            "symbol": symbol,
+            "match_count": filtered.len(),
+            "candidates": filtered.iter().take(15).map(|c| serde_json::json!({
+                "kind": c.kind,
+                "file_path": c.file_path,
+                "start_line": c.start_line,
+            })).collect::<Vec<_>>(),
+            "hint": "Multiple symbols share this name. Re-run with `file_path` set to a substring of the file you mean (see `candidates` above) to disambiguate."
+        }).to_string())
+    } else {
+        None
+    }
+}
+
 /// Applies an LLM-generated unified diff to `file_path` using the system `patch`
 /// binary, passing the target file explicitly as the "originalfile" argument so
 /// the patch lands on the right file regardless of whatever path headers the
@@ -80,12 +112,17 @@ fn apply_unified_diff(file_path: &str, diff_text: &str) -> Result<(), String> {
         f.write_all(diff_text.as_bytes()).map_err(|e| format!("Failed to write temp diff file: {}", e))?;
     }
 
+    // Same reasoning as run_index/run_incremental_index: `patch`'s own stdout
+    // would otherwise land on this process's stdout, corrupting the JSON-RPC
+    // transport.
     let status = std::process::Command::new("patch")
         .arg("--no-backup-if-mismatch")
         .arg("-p0")
         .arg(file_path)
         .arg("-i")
         .arg(&tmp_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 
     let _ = std::fs::remove_file(&tmp_path);
@@ -111,9 +148,14 @@ fn run_index(project_dir: &str) -> Result<String, String> {
     let parent = current_exe.parent().ok_or_else(|| "Could not resolve codebroker-mcp binary directory".to_string())?;
     let cli_path = parent.join("codebroker");
 
+    // Stdio must NOT be inherited here: the MCP transport is JSON-RPC framed
+    // over this same process's stdout, and a child's plain `println!` output
+    // landing on that stream corrupts every subsequent response.
     let status = std::process::Command::new(&cli_path)
         .arg("init")
         .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("Failed to spawn indexer process in {}: {}", project_dir, e))?;
 
@@ -134,7 +176,12 @@ fn run_incremental_index(project_dir: &str, changed_paths: &[String]) -> Result<
     let cli_path = parent.join("codebroker");
 
     let mut cmd = std::process::Command::new(&cli_path);
-    cmd.arg("reindex-incremental").current_dir(project_dir);
+    cmd.arg("reindex-incremental")
+        .current_dir(project_dir)
+        // Same reasoning as run_index: must not inherit stdout/stderr, or the
+        // child's println! output corrupts the JSON-RPC stream on this fd.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     for p in changed_paths {
         cmd.arg(p);
     }
@@ -225,13 +272,17 @@ fn main() {
                                 "tools": [
                                     {
                                         "name": "get_context",
-                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal.",
+                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal. If 'symbol' is ambiguous (defined in multiple files, e.g. a Next.js route handler named 'GET'), this returns a candidate list instead of guessing — pass 'file_path' to pick one.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": {
                                                     "type": "string",
                                                     "description": "The exact name of the struct, function, or trait."
+                                                },
+                                                "file_path": {
+                                                    "type": "string",
+                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -239,13 +290,17 @@ fn main() {
                                     },
                                     {
                                         "name": "impact_analysis",
-                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. If you only need the raw list of dependents/dependencies, call get_context or explore_graph instead; they are instant and free of AI latency.",
+                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. If you only need the raw list of dependents/dependencies, call get_context or explore_graph instead; they are instant and free of AI latency. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": {
                                                     "type": "string",
                                                     "description": "The exact name of the struct, function, or trait to analyze."
+                                                },
+                                                "file_path": {
+                                                    "type": "string",
+                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -253,7 +308,7 @@ fn main() {
                                     },
                                     {
                                         "name": "search_codebase",
-                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip.",
+                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. Text-mode matching is substring-based by default, which WILL match short keywords inside longer identifiers (e.g. searching 'PORT' matches inside 'export'/'import') — set whole_word: true to require non-identifier boundaries around the match if that's not what you want. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -265,6 +320,10 @@ fn main() {
                                                     "type": "string",
                                                     "enum": ["symbol", "text", "both"],
                                                     "description": "Optional. 'symbol' (default): match indexed symbol/file names only, fast. 'text': grep raw file content for the literal keyword (catches string literals/comments, slower). 'both': try symbol matching first, fall back to text search if that finds nothing."
+                                                },
+                                                "whole_word": {
+                                                    "type": "boolean",
+                                                    "description": "Optional, default false. Only applies to 'text'/'both' modes. When true, requires non-alphanumeric/underscore boundaries around the match — fixes false positives like 'PORT' matching inside 'export'. When false (default), plain substring matching, which is sometimes exactly what you want (e.g. finding all 'use' prefixed hooks)."
                                                 },
                                                 "path_scope": {
                                                     "type": "string",
@@ -328,15 +387,19 @@ fn main() {
                                     },
                                     {
                                         "name": "read_symbol_source",
-                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in.",
+                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in. If any name is ambiguous (defined in multiple files), returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "Single symbol name" },
                                                 "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names (for batch fetching)" },
-                                                "include_dependencies": { 
+                                                "include_dependencies": {
                                                     "type": "boolean",
-                                                    "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)." 
+                                                    "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)."
+                                                },
+                                                "file_path": {
+                                                    "type": "string",
+                                                    "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches."
                                                 }
                                             }
                                         }
@@ -404,36 +467,39 @@ fn main() {
                                     },
                                     {
                                         "name": "generate_patch",
-                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. Each symbol is patched independently (one diff per symbol, not a single cross-file diff) and returned in a `results` array. By default this only returns the diff text for review (dry_run behavior); pass apply: true to have CodeBroker write the diff to disk immediately via `patch`. Check each result's `applied`/`apply_error` field when apply is true.",
+                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added lines that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry. By default this only returns diff text for review (dry_run); pass apply: true to have CodeBroker write it to disk via `patch`.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "The exact name of a single symbol to modify. Use 'symbols' instead for multiple." },
                                                 "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names to patch in one call, e.g. a manifest + a background script + a content script that all need the same kind of change." },
                                                 "instruction": { "type": "string", "description": "Instructions for what change to make. Applied identically to every symbol in 'symbols'." },
-                                                "apply": { "type": "boolean", "description": "Default false: only return the diff text for review (preview/dry-run). Set true to write each diff to disk immediately." }
+                                                "apply": { "type": "boolean", "description": "Default false: only return the diff text for review (preview/dry-run). Set true to write each diff to disk immediately." },
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches." }
                                             },
                                             "required": ["instruction"]
                                         }
                                     },
                                     {
                                         "name": "get_implementation",
-                                        "description": "Equivalent to calling read_symbol_source + get_context together in one round trip: returns the symbol's own source PLUS its forward/reverse graph dependencies, bundled as {symbol_source, context}. Use this (not read_symbol_source) when you need to understand how a symbol works in relation to its callers/callees, not just read its body.",
+                                        "description": "Equivalent to calling read_symbol_source + get_context together in one round trip: returns the symbol's own source PLUS its forward/reverse graph dependencies, bundled as {symbol_source, context}. Use this (not read_symbol_source) when you need to understand how a symbol works in relation to its callers/callees, not just read its body. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string" }
+                                                "symbol": { "type": "string" },
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions." }
                                             },
                                             "required": ["symbol"]
                                         }
                                     },
                                     {
                                         "name": "get_edit_context",
-                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, suggested_edit_boundaries}. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code.",
+                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, suggested_edit_boundaries}. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string" }
+                                                "symbol": { "type": "string" },
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions." }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -499,12 +565,13 @@ fn main() {
                                     },
                                     {
                                         "name": "dependency_cycles",
-                                        "description": "Detect architectural circular dependencies within the repository graph.",
+                                        "description": "Detect architectural circular dependencies within the repository graph. Each cycle is classified as cross_file (spans multiple files — a real cross-module import cycle) or same-file (mutual recursion within one file, usually benign). By default only cross_file cycles are returned, since narrowing path_scope otherwise tends to leave mostly same-file recursion noise as scope shrinks; same_file_cycles_found is still reported so you know how much was filtered out. Set include_same_file: true to get the old behavior back.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "limit": { "type": "number", "description": "Max number of cycles to return in detail (1-500). Default 25. `cycles_found` in the response always reports the true total." },
-                                                "path_scope": { "type": "string", "description": "Optional. Restrict the scanned edge set to symbols whose file path contains this substring." }
+                                                "limit": { "type": "number", "description": "Max number of cycles to return in detail (1-500). Default 25. `cycles_found`/`cross_file_cycles_found`/`same_file_cycles_found` in the response always report the true totals." },
+                                                "path_scope": { "type": "string", "description": "Optional. Restrict the scanned edge set to symbols whose file path contains this substring." },
+                                                "include_same_file": { "type": "boolean", "description": "Default false: only return cross_file cycles. Set true to also include same-file mutual-recursion cycles." }
                                             }
                                         }
                                     },
@@ -521,12 +588,13 @@ fn main() {
                                     },
                                     {
                                         "name": "graph_subtree",
-                                        "description": "DEPRECATED alias, kept for backward compatibility: equivalent to explore_graph(root_symbol, depth, direction: 'undirected', max_nodes: 500), with a fixed max_nodes and a response shape that reports per-node depth and string-named edges instead of ids. Prefer calling explore_graph directly with direction: 'undirected'.",
+                                        "description": "DEPRECATED alias, kept for backward compatibility: equivalent to explore_graph(root_symbol, depth, direction: 'undirected'), with a response shape that reports per-node depth and string-named edges instead of ids. Prefer calling explore_graph directly with direction: 'undirected'.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "root_symbol": { "type": "string", "description": "The root symbol name" },
-                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." }
+                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." },
+                                                "max_nodes": { "type": "number", "description": "Cap on returned nodes (1-500). Default 100 (was a fixed 500 with no escape hatch). Lower this for hub symbols with large fan-in/out." }
                                             },
                                             "required": ["root_symbol", "depth"]
                                         }
@@ -559,15 +627,20 @@ fn main() {
                             match tool_name {
                             "get_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::context::ContextObject::assemble(&db, symbol) {
-                                            Ok(Some(context)) => {
-                                                serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                            amb
+                                        } else {
+                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                            match query::context::ContextObject::assemble_scoped(&db, symbol, file_hint) {
+                                                Ok(Some(context)) => {
+                                                    serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                }
+                                                Ok(None) => format!("Symbol '{}' not found in database.", symbol),
+                                                Err(e) => format!("Error assembling context: {}", e),
                                             }
-                                            Ok(None) => format!("Symbol '{}' not found in database.", symbol),
-                                            Err(e) => format!("Error assembling context: {}", e),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -575,21 +648,29 @@ fn main() {
                             }
                             "impact_analysis" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
                                 let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
                                 if hf_token.is_empty() {
                                     "Error: HF_API_TOKEN environment variable is not set.".to_string()
                                 } else {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
-                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
-                                            let generator = semantic::generator::SummaryGenerator::new(&db, provider);
-                                            match generator.generate(symbol) {
-                                                Ok((summary, hit)) => {
-                                                    cache_hit = hit;
-                                                    summary
-                                                },
-                                                Err(e) => format!("Error generating impact analysis: {}", e),
+                                            // Same ambiguity gate as get_context/get_implementation: don't
+                                            // burn an AI call analyzing the wrong file's symbol when the
+                                            // name matches multiple definitions.
+                                            if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                                amb
+                                            } else {
+                                                estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                                let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                                let generator = semantic::generator::SummaryGenerator::new(&db, provider);
+                                                match generator.generate_scoped(symbol, file_hint) {
+                                                    Ok((summary, hit)) => {
+                                                        cache_hit = hit;
+                                                        summary
+                                                    },
+                                                    Err(e) => format!("Error generating impact analysis: {}", e),
+                                                }
                                             }
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
@@ -601,6 +682,7 @@ fn main() {
                                 let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
                                 let mode_str = arguments.get("mode").and_then(|s| s.as_str()).unwrap_or("symbol");
                                 let mode = query::engine::SearchMode::from(mode_str);
+                                let whole_word = arguments.get("whole_word").and_then(|b| b.as_bool()).unwrap_or(false);
 
                                 let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
                                 let mut llm_used = false;
@@ -624,7 +706,7 @@ fn main() {
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used, path_scope, mode) {
+                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used, path_scope, mode, whole_word) {
                                             Ok((results, reason)) => {
                                                 let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
@@ -739,7 +821,8 @@ fn main() {
                             }
                             "read_symbol_source" => {
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+
                                 let mut targets = Vec::new();
                                 if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
                                     targets.push(s.to_string());
@@ -757,23 +840,33 @@ fn main() {
                                 } else {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
-                                            let mut combined_results = Vec::new();
-                                            let mut has_error = false;
-                                            let mut err_msg = String::new();
-                                            for symbol in targets {
-                                                match query::retrieval::read_symbol_source(&db, &symbol, include_deps) {
-                                                    Ok(results) => combined_results.extend(results),
-                                                    Err(e) => {
-                                                        has_error = true;
-                                                        err_msg = format!("Error reading source for {}: {}", symbol, e);
-                                                        break;
-                                                    }
+                                            let mut ambiguous: Vec<serde_json::Value> = Vec::new();
+                                            for symbol in &targets {
+                                                if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                                    ambiguous.push(serde_json::from_str(&amb).unwrap_or(serde_json::Value::Null));
                                                 }
                                             }
-                                            if has_error {
-                                                err_msg
+                                            if !ambiguous.is_empty() {
+                                                serde_json::json!({ "ambiguous": true, "results": ambiguous }).to_string()
                                             } else {
-                                                serde_json::to_string_pretty(&combined_results).unwrap_or_default()
+                                                let mut combined_results = Vec::new();
+                                                let mut has_error = false;
+                                                let mut err_msg = String::new();
+                                                for symbol in targets {
+                                                    match query::retrieval::read_symbol_source_scoped(&db, &symbol, include_deps, file_hint) {
+                                                        Ok(results) => combined_results.extend(results),
+                                                        Err(e) => {
+                                                            has_error = true;
+                                                            err_msg = format!("Error reading source for {}: {}", symbol, e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if has_error {
+                                                    err_msg
+                                                } else {
+                                                    serde_json::to_string_pretty(&combined_results).unwrap_or_default()
+                                                }
                                             }
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
@@ -920,9 +1013,10 @@ fn main() {
                             "dependency_cycles" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(25) as usize;
                                 let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let include_same_file = arguments.get("include_same_file").and_then(|b| b.as_bool()).unwrap_or(false);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::dependency_cycles(&db, limit, path_scope) {
+                                        match query::graph::dependency_cycles(&db, limit, path_scope, include_same_file) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
@@ -952,10 +1046,11 @@ fn main() {
                             "graph_subtree" => {
                                 let root_symbol = arguments.get("root_symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
-                                
+                                let max_nodes = arguments.get("max_nodes").and_then(|n| n.as_u64()).map(|n| n as usize);
+
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::graph_subtree(&db, root_symbol, depth) {
+                                        match query::graph::graph_subtree(&db, root_symbol, depth, max_nodes) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.node_count * 50; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
@@ -981,6 +1076,7 @@ fn main() {
                                     }
                                 }
                                 let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
                                 // dry_run by default: a generated diff is only a preview until the
                                 // caller explicitly opts into writing it to disk.
                                 let apply = arguments.get("apply").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -998,16 +1094,30 @@ fn main() {
                                                 let patch_gen = semantic::generator::PatchGenerator::new(&db, provider);
                                                 let mut results = Vec::new();
                                                 for symbol in &symbols {
-                                                    match patch_gen.generate_patch(symbol, instruction) {
-                                                        Ok(diff) => {
+                                                    // Don't waste an AI call patching the wrong file: if the name is
+                                                    // ambiguous (e.g. "GET" defined in many route files), stop and
+                                                    // ask the caller to disambiguate with file_path first.
+                                                    if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                                        let amb_val: serde_json::Value = serde_json::from_str(&amb).unwrap_or(serde_json::Value::Null);
+                                                        results.push(amb_val);
+                                                        continue;
+                                                    }
+                                                    match patch_gen.generate_patch_scoped(symbol, instruction, file_hint) {
+                                                        Ok(output) => {
                                                             let mut entry = serde_json::json!({
                                                                 "symbol": symbol,
-                                                                "diff": diff,
+                                                                "diff": output.diff,
+                                                                "introduced_identifiers": output.introduced_identifiers,
                                                                 "applied": false,
                                                             });
+                                                            if !output.introduced_identifiers.is_empty() {
+                                                                entry["warning"] = serde_json::Value::String(
+                                                                    "introduced_identifiers were not found in the target file or its known graph context. Verify each one actually exists (or is intentionally new) before trusting/applying this patch.".to_string()
+                                                                );
+                                                            }
                                                             if apply {
-                                                                match patch_gen.resolve_file_path(symbol) {
-                                                                    Ok(file_path) => match apply_unified_diff(&file_path, &diff) {
+                                                                match patch_gen.resolve_file_path_scoped(symbol, file_hint) {
+                                                                    Ok(file_path) => match apply_unified_diff(&file_path, &output.diff) {
                                                                         Ok(_) => { entry["applied"] = serde_json::Value::Bool(true); }
                                                                         Err(e) => { entry["apply_error"] = serde_json::Value::String(e); }
                                                                     },
@@ -1043,33 +1153,42 @@ fn main() {
                             }
                             "get_implementation" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
-                                        let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
-                                        let implementation = serde_json::json!({
-                                            "symbol_source": source,
-                                            "context": context
-                                        });
-                                        serde_json::to_string_pretty(&implementation).unwrap_or_default()
+                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                            amb
+                                        } else {
+                                            let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
+                                            let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                            let implementation = serde_json::json!({
+                                                "symbol_source": source,
+                                                "context": context
+                                            });
+                                            serde_json::to_string_pretty(&implementation).unwrap_or_default()
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
+                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        let source = query::retrieval::read_symbol_source(&db, symbol, false).unwrap_or_default();
-                                        let context = query::context::ContextObject::assemble(&db, symbol).unwrap_or_default();
-                                        let edit_context = serde_json::json!({
-                                            "target_implementation": source,
-                                            "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
-                                            "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
-                                            "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
-                                        });
-                                        serde_json::to_string_pretty(&edit_context).unwrap_or_default()
+                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                            amb
+                                        } else {
+                                            let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
+                                            let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                            let edit_context = serde_json::json!({
+                                                "target_implementation": source,
+                                                "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
+                                                "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
+                                                "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
+                                            });
+                                            serde_json::to_string_pretty(&edit_context).unwrap_or_default()
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }

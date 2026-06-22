@@ -2,7 +2,42 @@ use storage::Database;
 use rusqlite::params;
 use std::time::Instant;
 
-pub fn find_dependents(db: &Database, target_symbol_name: &str) -> 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SymbolCandidate {
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub start_line: i64,
+}
+
+/// Lists every row matching `name` exactly, with no LIMIT 1 collapse. Used as
+/// a pre-flight check by tools that take a bare symbol name and would
+/// otherwise silently pick whichever row SQLite happens to return first
+/// (insertion order) when a common name like "GET" or "handler" is defined
+/// in many files — that's a real correctness risk, not just a precision nit,
+/// because the caller has no way to know they got the wrong file's symbol.
+pub fn find_symbol_candidates(db: &Database, name: &str) -> Result<Vec<SymbolCandidate>, rusqlite::Error> {
+    let mut stmt = db.conn.prepare(
+        "SELECT symbols.name, symbols.kind, files.path, symbols.start_line
+         FROM symbols
+         JOIN files ON symbols.file_id = files.id
+         WHERE symbols.name = ?1"
+    )?;
+    let mut rows = stmt.query(params![name])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(2)?;
+        out.push(SymbolCandidate {
+            name: row.get(0)?,
+            kind: row.get(1)?,
+            file_path: db.resolve_path(&path),
+            start_line: row.get(3)?,
+        });
+    }
+    Ok(out)
+}
+
+pub fn find_dependents(db: &Database, target_symbol_name: &str) ->
 Result<Vec<String>, rusqlite::Error> {
     let parent_class = if target_symbol_name.contains('.') {
         target_symbol_name.split('.').next().unwrap_or(target_symbol_name)
@@ -222,14 +257,48 @@ fn search_symbol_names(
     Ok(results)
 }
 
+/// True if `haystack_lower` contains `needle_lower` at a position bounded by
+/// non-identifier characters (or string edges) on both sides — i.e. a whole
+/// "word" match, not a substring inside a longer identifier. Both inputs
+/// must already be lowercased by the caller. This is what distinguishes a
+/// search for "port" from incorrectly matching inside "export" or "import".
+fn contains_whole_word(haystack_lower: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return false;
+    }
+    let bytes = haystack_lower.as_bytes();
+    let needle_bytes = needle_lower.as_bytes();
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+
+    let mut start = 0;
+    while let Some(rel_pos) = haystack_lower[start..].find(needle_lower) {
+        let pos = start + rel_pos;
+        let before_ok = pos == 0 || !is_word_byte(bytes[pos - 1]);
+        let end = pos + needle_bytes.len();
+        let after_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = pos + 1;
+        if start >= haystack_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Literal/substring scan over the raw content of indexed files. Unlike symbol
 /// search, this catches string literals, comments, and config values — the
 /// case that drove this addition (a keyword like "leetcode" appearing only in
-/// a string, never as a symbol name).
+/// a string, never as a symbol name). `whole_word` requires non-identifier
+/// boundaries around the match (fixes false positives like "port" matching
+/// inside "export"/"import") at the cost of missing intentional substring
+/// searches — it defaults to off so existing substring behavior is preserved.
 fn search_file_contents(
     db: &Database,
     query_lower: &str,
     path_scope: Option<&str>,
+    whole_word: bool,
 ) -> Result<Vec<SearchResult>, rusqlite::Error> {
     let mut results = Vec::new();
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
@@ -258,7 +327,13 @@ fn search_file_contents(
             if results.len() >= MAX_TEXT_MATCHES {
                 break;
             }
-            if line.to_lowercase().contains(query_lower) {
+            let line_lower = line.to_lowercase();
+            let is_match = if whole_word {
+                contains_whole_word(&line_lower, query_lower)
+            } else {
+                line_lower.contains(query_lower)
+            };
+            if is_match {
                 let trimmed = line.trim();
                 let preview = if trimmed.len() > 160 { format!("{}...", &trimmed[..160]) } else { trimmed.to_string() };
                 results.push(SearchResult {
@@ -283,6 +358,7 @@ pub fn search_symbols(
     llm_used: bool,
     path_scope: Option<&str>,
     mode: SearchMode,
+    whole_word: bool,
 ) -> Result<(Vec<SearchResult>, Option<String>), rusqlite::Error> {
     let start_time = Instant::now();
 
@@ -298,11 +374,11 @@ pub fn search_symbols(
 
     let mut results = match mode {
         SearchMode::Symbol => search_symbol_names(db, &query_lower, &query_tokens, path_scope)?,
-        SearchMode::Text => search_file_contents(db, &query_lower, path_scope)?,
+        SearchMode::Text => search_file_contents(db, &query_lower, path_scope, whole_word)?,
         SearchMode::Both => {
             let mut symbol_results = search_symbol_names(db, &query_lower, &query_tokens, path_scope)?;
             if symbol_results.is_empty() {
-                symbol_results.extend(search_file_contents(db, &query_lower, path_scope)?);
+                symbol_results.extend(search_file_contents(db, &query_lower, path_scope, whole_word)?);
             }
             symbol_results
         }
@@ -340,12 +416,18 @@ pub fn search_symbols(
             SearchMode::Text => " Try mode: \"symbol\" or \"both\" to also search indexed symbol names.".to_string(),
             SearchMode::Both => String::new(),
         };
+        let whole_word_hint = if whole_word {
+            " whole_word: true is on — if you meant a substring match (e.g. inside a longer identifier), retry with whole_word: false."
+        } else {
+            ""
+        };
         Some(format!(
-            "No matches for \"{}\" in mode \"{}\"; {} indexed symbols in scope.{}",
+            "No matches for \"{}\" in mode \"{}\"; {} indexed symbols in scope.{}{}",
             keyword,
             match mode { SearchMode::Symbol => "symbol", SearchMode::Text => "text", SearchMode::Both => "both" },
             scoped_symbol_count,
             mode_hint,
+            whole_word_hint,
         ))
     } else {
         None

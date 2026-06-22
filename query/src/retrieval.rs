@@ -1,5 +1,4 @@
 use storage::Database;
-use rusqlite::params;
 use std::fs;
 use serde::{Serialize, Deserialize};
 
@@ -30,14 +29,35 @@ pub struct FileSnippetResult {
 }
 
 pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: bool) -> Result<Vec<SymbolSourceResult>, String> {
-    let mut stmt = db.conn.prepare(
-        "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment 
-         FROM symbols 
-         JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name = ?1 LIMIT 5"
-    ).map_err(|e| e.to_string())?;
-    
-    let mut rows = stmt.query(params![symbol]).map_err(|e| e.to_string())?;
+    read_symbol_source_scoped(db, symbol, include_dependencies, None)
+}
+
+/// Like `read_symbol_source`, but when `file_hint` is given, only matches a
+/// symbol defined in a file whose path contains that substring — used to
+/// disambiguate a name like "GET" that's defined in many files once the
+/// caller has picked one from `find_symbol_candidates`.
+pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependencies: bool, file_hint: Option<&str>) -> Result<Vec<SymbolSourceResult>, String> {
+    let (mut stmt, params_vec): (rusqlite::Statement, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(hint) = file_hint {
+        let stmt = db.conn.prepare(
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 5"
+        ).map_err(|e| e.to_string())?;
+        let pattern = format!("%{}%", hint);
+        (stmt, vec![Box::new(symbol.to_string()), Box::new(pattern)])
+    } else {
+        let stmt = db.conn.prepare(
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.name = ?1 LIMIT 5"
+        ).map_err(|e| e.to_string())?;
+        (stmt, vec![Box::new(symbol.to_string())])
+    };
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let mut rows = stmt.query(param_refs.as_slice()).map_err(|e| e.to_string())?;
     let mut results = Vec::new();
     
     while let Some(row) = rows.next().unwrap_or(None) {
@@ -110,14 +130,38 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
     Ok(results)
 }
 
-pub fn fetch_data_model_dependencies(db: &Database, _symbol_name: &str, file_id: i64, signature: Option<&str>) -> Vec<SymbolSourceResult> {
+/// Hard cap on how many "data model dependency" symbols a single call expands
+/// into full inlined source. Previously unbounded: a signature with many
+/// capitalized type words (common in TS generics, e.g. `Map<string, User>` /
+/// `User[]` repeated across params) would expand every one of them — and
+/// each expansion could itself pull up to 5 candidates (read_symbol_source's
+/// own LIMIT 5) since this entry point has no file scoping — silently
+/// inflating a single context/patch/impact-analysis call into dozens of
+/// inlined source bodies and the token cost that comes with it.
+const MAX_DEPENDENCY_EXPANSIONS: usize = 8;
+
+pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: i64, signature: Option<&str>) -> Vec<SymbolSourceResult> {
     let mut deps = Vec::new();
-    
+    let mut processed_words: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
     // Schema Auto-Expansion (Python & TS Types)
     if let Some(sig) = signature {
         let words: Vec<&str> = sig.split(|c: char| !c.is_alphabetic()).collect();
         for word in words {
-            if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" {
+            if deps.len() >= MAX_DEPENDENCY_EXPANSIONS {
+                break;
+            }
+            // Skip the symbol's own name: a capitalized function/handler name
+            // (e.g. a Next.js "GET" route export) would otherwise get treated
+            // as its own "data model dependency" and re-looked-up with no
+            // file scoping, silently resolving to a same-named symbol in a
+            // completely different file.
+            if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" || word == symbol_name {
+                continue;
+            }
+            // A generic type repeated across params (Map<string, User>, User[], User)
+            // would otherwise get expanded once per occurrence.
+            if !processed_words.insert(word) {
                 continue;
             }
             // Check if this word exists as a symbol
@@ -127,13 +171,20 @@ pub fn fetch_data_model_dependencies(db: &Database, _symbol_name: &str, file_id:
                     for src in &mut srcs { src.is_dependency = true; }
                     deps.extend(srcs);
                 }
-                
+
+                if deps.len() >= MAX_DEPENDENCY_EXPANSIONS {
+                    break;
+                }
+
                 // Follow inherits edges!
                 let mut inherits_stmt = db.conn.prepare(
                     "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND edges.kind = 'inherits'"
                 ).unwrap();
                 let mut inherits_rows = inherits_stmt.query(rusqlite::params![found_file_id]).unwrap();
                 while let Some(i_row) = inherits_rows.next().unwrap_or(None) {
+                    if deps.len() >= MAX_DEPENDENCY_EXPANSIONS {
+                        break;
+                    }
                     let i_name: String = i_row.get(0).unwrap();
                     if let Ok(mut srcs) = read_symbol_source(db, &i_name, false) {
                         for src in &mut srcs { src.is_dependency = true; }
@@ -143,13 +194,16 @@ pub fn fetch_data_model_dependencies(db: &Database, _symbol_name: &str, file_id:
             }
         }
     }
-    
+
     // Fallback: Also check if THIS file defines inherits or accepts_props edges directly
     let mut direct_edges_stmt = db.conn.prepare(
         "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND (edges.kind = 'inherits' OR edges.kind = 'accepts_props')"
     ).unwrap();
     let mut direct_rows = direct_edges_stmt.query(rusqlite::params![file_id]).unwrap();
     while let Some(row) = direct_rows.next().unwrap_or(None) {
+        if deps.len() >= MAX_DEPENDENCY_EXPANSIONS {
+            break;
+        }
         let name: String = row.get(0).unwrap();
         // Prevent dupes if it was already fetched via signature
         if !deps.iter().any(|d| d.symbol_name == name) {

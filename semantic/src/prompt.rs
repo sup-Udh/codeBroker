@@ -35,26 +35,31 @@ Keep your summary concise, highly technical, and focus on system architecture."
 
 pub fn build_patch_prompt(
     symbol_name: &str,
-    source_code: &str,
+    full_file_source: &str,
     context: &ContextObject,
     instruction: &str
 ) -> String {
     let json_context = serde_json::to_string_pretty(context).unwrap_or_default();
-    
+
     format!(
-        "You are an expert AI software architect and engineer. You are given the exact source code for a symbol, along with its graph dependencies.
-Your task is to generate a valid unified diff patch that applies the requested changes to the source code.
+        "You are an expert AI software architect and engineer. You are given the FULL source of the file containing a target symbol, along with its graph dependencies.
+Your task is to generate a valid unified diff patch that applies the requested changes.
 
 Target Symbol: {symbol_name}
+
+=== GROUNDING RULES (do not violate these) ===
+1. Only call functions, reference variables, or import modules that ALREADY appear in the FULL FILE SOURCE below or in the GRAPH DEPENDENCIES context. Do not invent helper functions, hooks, utilities, or APIs that you assume \"probably exist\" — if something doesn't appear in the provided source or context, do not call it.
+2. If the requested change genuinely requires a new identifier (a new local variable, a new parameter, a new constant), that is fine — but prefer names that don't collide with anything already in the file.
+3. Base line numbers and surrounding context in your diff hunks on the FULL FILE SOURCE exactly as given below, not on a guess of what the file \"usually\" looks like.
 
 === GRAPH DEPENDENCIES (Blast Radius) ===
 ```json
 {json_context}
 ```
 
-=== SOURCE CODE ===
+=== FULL FILE SOURCE ===
 ```
-{source_code}
+{full_file_source}
 ```
 
 === REQUESTED CHANGE ===

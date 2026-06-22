@@ -35,30 +35,59 @@ pub struct ContextObject {
 impl ContextObject {
     /// Assembles a rich, multi-dimensional context package for a specific symbol
     pub fn assemble(db: &Database, symbol_name: &str) -> Result<Option<Self>> {
-        
-        // 1. Fetch the primary target's core definition (Distance-0 Context)
-        let mut stmt = db.conn.prepare(
-            "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
-             FROM symbols
-             JOIN files ON symbols.file_id = files.id
-             WHERE symbols.name = ?1 LIMIT 1"
-        )?;
+        Self::assemble_scoped(db, symbol_name, None)
+    }
 
-        let target_info = stmt.query_row(rusqlite::params![symbol_name], |row| {
-            Ok((
-                row.get::<_, String>(0)?, // name
-                row.get::<_, String>(1)?, // kind
-                row.get::<_, String>(2)?, // path
-                row.get::<_, i64>(3)?,    // line_number
-                row.get::<_, i64>(4)?,    // file_id
-                row.get::<_, Option<String>>(5)?, // signature
-                row.get::<_, Option<String>>(6)?, // directive
-            ))
-        });
+    /// Like `assemble`, but when `file_hint` is given, only resolves a symbol
+    /// defined in a file whose path contains that substring. Callers should
+    /// use `query::engine::find_symbol_candidates` first to check whether a
+    /// name is ambiguous before relying on this to silently disambiguate —
+    /// this only narrows the SQL query, it doesn't itself report ambiguity.
+    pub fn assemble_scoped(db: &Database, symbol_name: &str, file_hint: Option<&str>) -> Result<Option<Self>> {
 
         if symbol_name.trim().is_empty() {
             return Ok(None);
         }
+
+        // 1. Fetch the primary target's core definition (Distance-0 Context)
+        let target_info = if let Some(hint) = file_hint {
+            let mut stmt = db.conn.prepare(
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
+            )?;
+            let pattern = format!("%{}%", hint);
+            stmt.query_row(rusqlite::params![symbol_name, pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+        } else {
+            let mut stmt = db.conn.prepare(
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
+                 FROM symbols
+                 JOIN files ON symbols.file_id = files.id
+                 WHERE symbols.name = ?1 LIMIT 1"
+            )?;
+            stmt.query_row(rusqlite::params![symbol_name], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, // name
+                    row.get::<_, String>(1)?, // kind
+                    row.get::<_, String>(2)?, // path
+                    row.get::<_, i64>(3)?,    // line_number
+                    row.get::<_, i64>(4)?,    // file_id
+                    row.get::<_, Option<String>>(5)?, // signature
+                    row.get::<_, Option<String>>(6)?, // directive
+                ))
+            })
+        };
 
         let (name, kind, path, line_number, file_id, signature, directive) = match target_info {
             Ok(info) => info,

@@ -574,12 +574,23 @@ pub struct CycleNode {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DependencyCycle {
     pub length: usize,
+    /// True when this cycle spans more than one distinct file (a real
+    /// cross-module import cycle). False means every node in the cycle lives
+    /// in the same file — almost always benign same-file mutual recursion,
+    /// not the architectural problem most callers asking about cycles care
+    /// about. Narrowing path_scope shrinks the graph down toward exactly the
+    /// same-file edges that always survive scoping, which is why cycle
+    /// results used to get noisier (not cleaner) at smaller scope — this
+    /// flag is what lets a caller filter that noise back out.
+    pub cross_file: bool,
     pub nodes: Vec<CycleNode>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DependencyCyclesResponse {
     pub cycles_found: usize,
+    pub cross_file_cycles_found: usize,
+    pub same_file_cycles_found: usize,
     pub cycles_returned: usize,
     pub truncated: bool,
     pub nodes_scanned: usize,
@@ -587,7 +598,7 @@ pub struct DependencyCyclesResponse {
     pub cycles: Vec<DependencyCycle>,
 }
 
-pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>) -> Result<DependencyCyclesResponse> {
+pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, include_same_file: bool) -> Result<DependencyCyclesResponse> {
     const MAX_CYCLES: usize = 500;
     let return_limit = limit.clamp(1, MAX_CYCLES);
     const MAX_NODES_PER_CYCLE: usize = 40;
@@ -697,15 +708,16 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>) 
     }
 
     let mut sym_stmt = db.conn.prepare(
-        "SELECT symbols.name, symbols.kind, files.path 
-         FROM symbols 
-         JOIN files ON symbols.file_id = files.id 
+        "SELECT symbols.name, symbols.kind, files.path
+         FROM symbols
+         JOIN files ON symbols.file_id = files.id
          WHERE symbols.id = ?1 LIMIT 1"
     )?;
 
     let cycles_found = unique_cycles.len();
-    let mut cycles = Vec::new();
-    for cycle_ids in unique_cycles.into_iter().take(return_limit) {
+    let mut cross_file_cycles: Vec<DependencyCycle> = Vec::new();
+    let mut same_file_cycles: Vec<DependencyCycle> = Vec::new();
+    for cycle_ids in unique_cycles.into_iter() {
         let mut cycle_nodes = Vec::new();
         for &id in cycle_ids.iter().take(MAX_NODES_PER_CYCLE) {
             if let Ok((name, kind, path)) = sym_stmt.query_row(rusqlite::params![id], |r| {
@@ -718,16 +730,42 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>) 
                 });
             }
         }
-        cycles.push(DependencyCycle {
+        let distinct_files: HashSet<&str> = cycle_nodes.iter().map(|n| n.file_path.as_str()).collect();
+        let cross_file = distinct_files.len() > 1;
+        let cycle = DependencyCycle {
             length: cycle_ids.len(),
+            cross_file,
             nodes: cycle_nodes,
-        });
+        };
+        if cross_file {
+            cross_file_cycles.push(cycle);
+        } else {
+            same_file_cycles.push(cycle);
+        }
     }
+
+    let cross_file_cycles_found = cross_file_cycles.len();
+    let same_file_cycles_found = same_file_cycles.len();
+
+    // Cross-file cycles are the higher-signal result, so they always come
+    // first; same-file ones are only included (and only count toward the
+    // limit) when the caller explicitly opts in.
+    let mut ordered = cross_file_cycles;
+    let considered_total = if include_same_file {
+        ordered.extend(same_file_cycles);
+        cycles_found
+    } else {
+        cross_file_cycles_found
+    };
+
+    let cycles: Vec<DependencyCycle> = ordered.into_iter().take(return_limit).collect();
 
     Ok(DependencyCyclesResponse {
         cycles_found,
+        cross_file_cycles_found,
+        same_file_cycles_found,
         cycles_returned: cycles.len(),
-        truncated: truncated || cycles_found > cycles.len(),
+        truncated: truncated || considered_total > cycles.len(),
         nodes_scanned,
         edges_scanned,
         cycles,
@@ -759,9 +797,12 @@ pub struct GraphSubtreeResponse {
     pub edges: Vec<SubtreeEdge>,
 }
 
-pub fn graph_subtree(db: &Database, root_symbol: &str, depth: usize) -> Result<GraphSubtreeResponse> {
+pub fn graph_subtree(db: &Database, root_symbol: &str, depth: usize, max_nodes: Option<usize>) -> Result<GraphSubtreeResponse> {
     let safe_depth = std::cmp::min(depth, 5);
-    let max_nodes = 500;
+    // Previously a fixed 500 with no escape hatch on hub symbols. Defaulting
+    // to 100 matches explore_graph's default, while still allowing a caller
+    // to raise it (capped at 500) when they actually want the wide view.
+    let max_nodes = max_nodes.unwrap_or(100).clamp(1, 500);
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
