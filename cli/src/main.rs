@@ -150,7 +150,8 @@ fn main() {
                     // C. If we have a parser for this language, process it!
                     if let Some(frontend) = matched_frontend {
                         
-                        let file_id = db.insert_file(&file_path).unwrap();
+                        let content_hash = storage::hash_content(source_code.as_bytes());
+                        let file_id = db.insert_file(&file_path, &content_hash).unwrap();
 
                         // D. The Universal Extraction (Zero language-specific code here!)
                         if let Some((metadata, symbols, imports)) = frontend.parse_and_extract(&source_code, &file_path) {

@@ -335,7 +335,11 @@ fn search_file_contents(
             };
             if is_match {
                 let trimmed = line.trim();
-                let preview = if trimmed.len() > 160 { format!("{}...", &trimmed[..160]) } else { trimmed.to_string() };
+                let preview = if trimmed.len() > 160 {
+                    format!("{}...", trimmed.chars().take(160).collect::<String>())
+                } else {
+                    trimmed.to_string()
+                };
                 results.push(SearchResult {
                     path: abs_path.clone(),
                     name: preview,

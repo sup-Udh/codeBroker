@@ -35,6 +35,19 @@ pub struct Database {
     pub project_root: String,
 }
 
+/// Hashes raw file content as it was indexed, so retrieval can detect that a
+/// file changed on disk since `start_byte`/`end_byte` were computed. Byte
+/// offsets are only valid against the exact content they were derived from —
+/// any edit (even appending a single character earlier in the file) shifts
+/// every later offset, and slicing the new content with old offsets produces
+/// a plausible-looking but semantically wrong substring instead of an error.
+pub fn hash_content(content: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 pub struct CodeBrokerStats {
     pub files_indexed: i64,
     pub summaries_generated: i64,
@@ -88,15 +101,19 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN signature TEXT;", []);
-        
+        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT;", []);
+
         Ok(())
     }
 
-    /// Inserts a file and returns its new SQLite ID
-    pub fn insert_file(&self, path: &str) -> Result<i64> {
+    /// Inserts a file and returns its new SQLite ID. `content_hash` (from
+    /// `hash_content`) must be computed from the exact bytes the caller is
+    /// about to extract `start_byte`/`end_byte` offsets from, so later reads
+    /// can detect drift between the index and the file on disk.
+    pub fn insert_file(&self, path: &str, content_hash: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO files (path) VALUES (?1)",
-            params![path],
+            "INSERT INTO files (path, content_hash) VALUES (?1, ?2)",
+            params![path, content_hash],
         )?;
         Ok(self.conn.last_insert_rowid())
     }

@@ -39,7 +39,7 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
 pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependencies: bool, file_hint: Option<&str>) -> Result<Vec<SymbolSourceResult>, String> {
     let (mut stmt, params_vec): (rusqlite::Statement, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(hint) = file_hint {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 5"
@@ -48,7 +48,7 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
         (stmt, vec![Box::new(symbol.to_string()), Box::new(pattern)])
     } else {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 LIMIT 5"
@@ -71,28 +71,47 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
         let directive: Option<String> = row.get(6).unwrap_or(None);
         let route_path: Option<String> = row.get(7).unwrap_or(None);
         let route_segment: Option<String> = row.get(8).unwrap_or(None);
-        
+        let indexed_content_hash: Option<String> = row.get(9).unwrap_or(None);
+
         let mut source = String::new();
+        let mut stale = false;
         if let Ok(content) = fs::read(&abs_path) {
-            let start = start_byte as usize;
-            let end = end_byte as usize;
-            if start < end && end <= content.len() {
-                source = String::from_utf8_lossy(&content[start..end]).to_string();
-            } else {
-                // Fallback to lines if bytes are messed up
-                let text = String::from_utf8_lossy(&content);
-                let lines: Vec<&str> = text.lines().collect();
-                let s_idx = (start_line.saturating_sub(1)).max(0) as usize;
-                let e_idx = end_line.min(lines.len() as i64) as usize;
-                if s_idx < lines.len() {
-                    source = lines[s_idx..e_idx].join("\n");
+            // The file may have been edited since `start_byte`/`end_byte` were
+            // computed. Those offsets are only meaningful against the exact
+            // content they were derived from — applying them to changed
+            // content silently yields a misaligned (and often mid-token)
+            // substring instead of an error, so check first.
+            if let Some(indexed_hash) = &indexed_content_hash {
+                if *indexed_hash != storage::hash_content(&content) {
+                    stale = true;
+                }
+            }
+
+            if !stale {
+                let start = start_byte as usize;
+                let end = end_byte as usize;
+                if start < end && end <= content.len() {
+                    source = String::from_utf8_lossy(&content[start..end]).to_string();
+                } else {
+                    // Fallback to lines if bytes are messed up
+                    let text = String::from_utf8_lossy(&content);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let s_idx = (start_line.saturating_sub(1)).max(0) as usize;
+                    let e_idx = end_line.min(lines.len() as i64) as usize;
+                    if s_idx < lines.len() {
+                        source = lines[s_idx..e_idx].join("\n");
+                    }
                 }
             }
         }
-        
+
         let mut source_unavailable = None;
         let mut reason = None;
-        if source.is_empty() {
+        if stale {
+            source_unavailable = Some(true);
+            reason = Some("Index is stale: this file changed on disk since it was last indexed, so the stored byte offsets no longer line up with its content. Re-run reindex_workspace (or `codebroker reindex-incremental` on this file) before trusting symbol boundaries.".to_string());
+            source = "<ERROR: Stale index. This file was modified after indexing; the stored start/end byte offsets no longer match the file on disk and would return a corrupted snippet. Reindex the workspace, then retry.>".to_string();
+        } else if source.is_empty() {
             source_unavailable = Some(true);
             reason = Some("Failed to extract code snippet using byte bounds. Please use native file Read.".to_string());
             source = "<ERROR: Source extraction failed. The file was read successfully but the requested byte bounds were invalid. Please fall back to the native Read tool using the file path provided.>".to_string();
@@ -241,22 +260,38 @@ pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Resu
 pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&str>) -> Result<String, String> {
     let abs_file_path = db.resolve_path(file_path);
     let content = fs::read(&abs_file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-    
+
     // Find file_id by resolving paths to absolute and comparing
-    let mut files_stmt = db.conn.prepare("SELECT id, path FROM files").map_err(|e| e.to_string())?;
+    let mut files_stmt = db.conn.prepare("SELECT id, path, content_hash FROM files").map_err(|e| e.to_string())?;
     let mut files_rows = files_stmt.query([]).map_err(|e| e.to_string())?;
     let mut file_id = 0;
+    let mut indexed_content_hash: Option<String> = None;
     while let Some(row) = files_rows.next().unwrap_or(None) {
         let id: i64 = row.get(0).unwrap();
         let path: String = row.get(1).unwrap();
         if db.resolve_path(&path) == abs_file_path {
             file_id = id;
+            indexed_content_hash = row.get(2).unwrap_or(None);
             break;
         }
     }
-    
+
     if file_id == 0 {
         return Err(format!("File '{}' not found in index.", file_path));
+    }
+
+    // The skeleton is built by walking stored start_byte/end_byte offsets
+    // against `content` read just above. If the file changed since indexing,
+    // those offsets no longer line up with this content: slicing on them
+    // doesn't error, it just glues unrelated fragments together (the tail of
+    // one symbol's old range bleeding into the next symbol's new position).
+    if let Some(indexed_hash) = &indexed_content_hash {
+        if *indexed_hash != storage::hash_content(&content) {
+            return Err(format!(
+                "Index is stale for '{}': this file changed on disk since it was last indexed, so stored byte offsets no longer match its content. Re-run reindex_workspace (or `codebroker reindex-incremental` on this file) before requesting a skeleton.",
+                file_path
+            ));
+        }
     }
     
     let mut target_start = 0;

@@ -75,7 +75,8 @@ pub fn reindex_paths(db: &Database, project_root: &str, changed_paths: &[String]
             }
         };
 
-        let file_id = db.insert_file(&stored_path).map_err(|e| e.to_string())?;
+        let content_hash = storage::hash_content(source_code.as_bytes());
+        let file_id = db.insert_file(&stored_path, &content_hash).map_err(|e| e.to_string())?;
         touched_file_ids.push(file_id);
         stats.files_processed += 1;
 
