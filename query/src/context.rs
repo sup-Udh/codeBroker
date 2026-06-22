@@ -30,6 +30,13 @@ pub struct ContextObject {
     /// any analysis built on top of this context (e.g. impact_analysis) is a
     /// source-only guess, not a real graph traversal.
     pub graph_indexed: bool,
+
+    /// True when `defining_file` has changed on disk since it was last
+    /// indexed (its content no longer matches the hash recorded at index
+    /// time). `line_number` and any byte-offset-derived data for this symbol
+    /// may be wrong when this is true — re-run reindex_workspace (or
+    /// `codebroker reindex-incremental` on this file) before trusting them.
+    pub stale: bool,
 }
 
 impl ContextObject {
@@ -52,7 +59,7 @@ impl ContextObject {
         // 1. Fetch the primary target's core definition (Distance-0 Context)
         let target_info = if let Some(hint) = file_hint {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
@@ -67,11 +74,12 @@ impl ContextObject {
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
         } else {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 LIMIT 1"
@@ -85,23 +93,35 @@ impl ContextObject {
                     row.get::<_, i64>(4)?,    // file_id
                     row.get::<_, Option<String>>(5)?, // signature
                     row.get::<_, Option<String>>(6)?, // directive
+                    row.get::<_, Option<String>>(7)?, // content_hash
                 ))
             })
         };
 
-        let (name, kind, path, line_number, file_id, signature, directive) = match target_info {
+        let (name, kind, path, line_number, file_id, signature, directive, indexed_content_hash) = match target_info {
             Ok(info) => info,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Fallback: check if the 'symbol_name' is actually a file path
-                let mut file_stmt = db.conn.prepare("SELECT id, path, directive FROM files WHERE path LIKE ?1 LIMIT 1")?;
+                let mut file_stmt = db.conn.prepare("SELECT id, path, directive, content_hash FROM files WHERE path LIKE ?1 LIMIT 1")?;
                 let file_search = format!("%{}%", symbol_name);
-                if let Ok((f_id, f_path, f_dir)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?))) {
-                    (symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir)
+                if let Ok((f_id, f_path, f_dir, f_hash)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))) {
+                    (symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir, f_hash)
                 } else {
                     return Ok(None);
                 }
             },
             Err(e) => return Err(e),
+        };
+
+        // A file edited since indexing shifts every byte offset (and often
+        // line numbers) for symbols defined in it — surface that instead of
+        // letting a caller silently trust a `line_number` that no longer
+        // points at this symbol.
+        let stale = match &indexed_content_hash {
+            Some(stored_hash) => std::fs::read(db.resolve_path(&path))
+                .map(|content| storage::hash_content(&content) != *stored_hash)
+                .unwrap_or(false),
+            None => false,
         };
 
         // 2. Fetch the Blast Radius / Reverse Dependencies (Distance-1 Context)
@@ -305,6 +325,7 @@ impl ContextObject {
             callers,
             callees,
             graph_indexed: total_edges > 0,
+            stale,
         }))
     }
 }

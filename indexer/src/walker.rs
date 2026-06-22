@@ -1,13 +1,8 @@
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use std::path::Path;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
-use std::fs;
 
 pub fn collect_files(root_dir: &str) -> Vec<String> {
     let mut valid_files = Vec::new();
-    let mut seen_hashes = HashSet::new();
 
     let mut overrides = OverrideBuilder::new(root_dir);
     // Ignore common build output, dependency, and vendor directories.
@@ -40,21 +35,9 @@ pub fn collect_files(root_dir: &str) -> Vec<String> {
         if let Ok(entry) = result {
             let path = entry.path();
 
-            if path.is_file() {
-                if is_supported_file(path) {
-                    // Deduplicate by content hash
-                    if let Ok(content) = fs::read(path) {
-                        let mut hasher = DefaultHasher::new();
-                        content.hash(&mut hasher);
-                        let file_hash = hasher.finish();
-
-                        if !seen_hashes.contains(&file_hash) {
-                            seen_hashes.insert(file_hash);
-                            if let Some(path_str) = path.to_str() {
-                                valid_files.push(path_str.to_string());
-                            }
-                        }
-                    }
+            if path.is_file() && is_supported_file(path) {
+                if let Some(path_str) = path.to_str() {
+                    valid_files.push(path_str.to_string());
                 }
             }
         }

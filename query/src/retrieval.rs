@@ -236,7 +236,36 @@ pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: 
     deps
 }
 
+/// Turns "Is a directory (os error 21)" into an actionable message naming
+/// the route/index file the caller probably meant. Agents frequently pass a
+/// route's directory (e.g. a Next.js "app/api/rooms" segment) instead of the
+/// file inside it, since that's how the route is referred to conversationally.
+fn directory_hint_error(path: &std::path::Path) -> String {
+    let candidates: Vec<String> = fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        format!("'{}' is a directory, not a file.", path.display())
+    } else {
+        format!(
+            "'{}' is a directory, not a file. Files in it: {}. Pass one of these as the file path.",
+            path.display(),
+            candidates.join(", ")
+        )
+    }
+}
+
 pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Result<FileSnippetResult, String> {
+    let path_obj = std::path::Path::new(path);
+    if path_obj.is_dir() {
+        return Err(directory_hint_error(path_obj));
+    }
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
     
@@ -259,6 +288,10 @@ pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Resu
 
 pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&str>) -> Result<String, String> {
     let abs_file_path = db.resolve_path(file_path);
+    let abs_path_obj = std::path::Path::new(&abs_file_path);
+    if abs_path_obj.is_dir() {
+        return Err(directory_hint_error(abs_path_obj));
+    }
     let content = fs::read(&abs_file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     // Find file_id by resolving paths to absolute and comparing

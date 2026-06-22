@@ -64,6 +64,19 @@ fn resolve_db_path() -> String {
     resolve_workspace().db_path
 }
 
+/// Reads the path-disambiguation hint for a symbol lookup. Accepts both
+/// `file_path` (this tool's documented param name) and `path_scope` (the name
+/// every scoping param uses on search_codebase/find_symbol/impact_analysis/
+/// architectural_hotspots/dependency_cycles/find_duplicate_logic) so a caller
+/// that reasonably guesses the wrong one based on the rest of the tool
+/// surface still gets it applied, instead of the hint being silently dropped
+/// and every candidate coming back unfiltered.
+fn get_file_hint<'a>(arguments: &'a serde_json::Map<String, serde_json::Value>) -> Option<&'a str> {
+    arguments.get("file_path")
+        .or_else(|| arguments.get("path_scope"))
+        .and_then(|s| s.as_str())
+}
+
 /// Pre-flight ambiguity check for tools that take a bare symbol name and
 /// would otherwise silently pick whichever DB row comes back first when a
 /// common name (e.g. "GET", a Next.js route handler exported from dozens of
@@ -272,7 +285,7 @@ fn main() {
                                 "tools": [
                                     {
                                         "name": "get_context",
-                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal. If 'symbol' is ambiguous (defined in multiple files, e.g. a Next.js route handler named 'GET'), this returns a candidate list instead of guessing — pass 'file_path' to pick one.",
+                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal. If 'symbol' is ambiguous (defined in multiple files, e.g. a Next.js route handler named 'GET'), this returns a candidate list instead of guessing — pass 'file_path' to pick one. Set include_source: true to bundle the symbol's own source body (same data read_symbol_source returns) into this same response, for the common 'show me this function and what touches it' case in one call instead of two.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -282,7 +295,11 @@ fn main() {
                                                 },
                                                 "file_path": {
                                                     "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions."
+                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias."
+                                                },
+                                                "include_source": {
+                                                    "type": "boolean",
+                                                    "description": "Optional, default false. When true, bundles the symbol's own source code into the response under a 'source' field, equivalent to also calling read_symbol_source."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -290,7 +307,7 @@ fn main() {
                                     },
                                     {
                                         "name": "impact_analysis",
-                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. If you only need the raw list of dependents/dependencies, call get_context or explore_graph instead; they are instant and free of AI latency. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
+                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. Set format: \"structured\" to skip the LLM call and get that same raw dependency data (callers/callees/signature) back as instant JSON instead, with no AI latency or token overhead — equivalent to calling get_context separately, just without the second round trip. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -300,7 +317,12 @@ fn main() {
                                                 },
                                                 "file_path": {
                                                     "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions."
+                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias."
+                                                },
+                                                "format": {
+                                                    "type": "string",
+                                                    "enum": ["prose", "structured"],
+                                                    "description": "Optional, default 'prose'. 'prose': AI-generated risk explanation (default, ~5-10s). 'structured' (alias: 'json'): skip the LLM call, return get_context's raw dependency JSON instantly."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -399,7 +421,7 @@ fn main() {
                                                 },
                                                 "file_path": {
                                                     "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches."
+                                                    "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches. 'path_scope' is also accepted as an alias."
                                                 }
                                             }
                                         }
@@ -475,7 +497,7 @@ fn main() {
                                                 "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names to patch in one call, e.g. a manifest + a background script + a content script that all need the same kind of change." },
                                                 "instruction": { "type": "string", "description": "Instructions for what change to make. Applied identically to every symbol in 'symbols'." },
                                                 "apply": { "type": "boolean", "description": "Default false: only return the diff text for review (preview/dry-run). Set true to write each diff to disk immediately." },
-                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches." }
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches. 'path_scope' is also accepted as an alias." }
                                             },
                                             "required": ["instruction"]
                                         }
@@ -487,7 +509,7 @@ fn main() {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string" },
-                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions." }
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias." }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -499,7 +521,7 @@ fn main() {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string" },
-                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions." }
+                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias." }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -627,7 +649,11 @@ fn main() {
                             match tool_name {
                             "get_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+                                let file_hint = get_file_hint(&arguments);
+                                // Bundles the symbol's own source body inline on request, so the
+                                // common "show me this function and what touches it" case is one
+                                // call instead of get_context + a separate read_symbol_source.
+                                let include_source = arguments.get("include_source").and_then(|s| s.as_bool()).unwrap_or(false);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
@@ -636,7 +662,16 @@ fn main() {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             match query::context::ContextObject::assemble_scoped(&db, symbol, file_hint) {
                                                 Ok(Some(context)) => {
-                                                    serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                    if include_source {
+                                                        let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
+                                                        let mut value = serde_json::to_value(&context).unwrap_or_default();
+                                                        if let Some(obj) = value.as_object_mut() {
+                                                            obj.insert("source".to_string(), serde_json::to_value(&source).unwrap_or_default());
+                                                        }
+                                                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                    } else {
+                                                        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                    }
                                                 }
                                                 Ok(None) => format!("Symbol '{}' not found in database.", symbol),
                                                 Err(e) => format!("Error assembling context: {}", e),
@@ -648,32 +683,53 @@ fn main() {
                             }
                             "impact_analysis" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
-                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
-                                if hf_token.is_empty() {
-                                    "Error: HF_API_TOKEN environment variable is not set.".to_string()
-                                } else {
+                                let file_hint = get_file_hint(&arguments);
+                                // "structured" skips the LLM call entirely and returns the same
+                                // graph data get_context exposes (callers/callees/signature) as
+                                // plain JSON — for callers that just want the dependency list and
+                                // would otherwise pay ~3x the tokens re-reading it out of markdown
+                                // prose. Default stays "prose": the AI-generated risk explanation
+                                // is this tool's actual value-add over get_context.
+                                let format = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("prose");
+                                if format == "structured" || format == "json" {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
-                                            // Same ambiguity gate as get_context/get_implementation: don't
-                                            // burn an AI call analyzing the wrong file's symbol when the
-                                            // name matches multiple definitions.
                                             if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
                                                 amb
                                             } else {
-                                                estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                                let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
-                                                let generator = semantic::generator::SummaryGenerator::new(&db, provider);
-                                                match generator.generate_scoped(symbol, file_hint) {
-                                                    Ok((summary, hit)) => {
-                                                        cache_hit = hit;
-                                                        summary
-                                                    },
-                                                    Err(e) => format!("Error generating impact analysis: {}", e),
-                                                }
+                                                let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                                serde_json::to_string_pretty(&context).unwrap_or_default()
                                             }
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
+                                    }
+                                } else {
+                                    let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                    if hf_token.is_empty() {
+                                        "Error: HF_API_TOKEN environment variable is not set. Pass format: \"structured\" to get the raw dependency data without an LLM call.".to_string()
+                                    } else {
+                                        match storage::Database::new(&db_path) {
+                                            Ok(db) => {
+                                                // Same ambiguity gate as get_context/get_implementation: don't
+                                                // burn an AI call analyzing the wrong file's symbol when the
+                                                // name matches multiple definitions.
+                                                if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                                    amb
+                                                } else {
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                                    let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                                    let generator = semantic::generator::SummaryGenerator::new(&db, provider);
+                                                    match generator.generate_scoped(symbol, file_hint) {
+                                                        Ok((summary, hit)) => {
+                                                            cache_hit = hit;
+                                                            summary
+                                                        },
+                                                        Err(e) => format!("Error generating impact analysis: {}", e),
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => "Error connecting to db".to_string(),
+                                        }
                                     }
                                 }
                             }
@@ -821,7 +877,7 @@ fn main() {
                             }
                             "read_symbol_source" => {
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+                                let file_hint = get_file_hint(&arguments);
 
                                 let mut targets = Vec::new();
                                 if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
@@ -1076,7 +1132,7 @@ fn main() {
                                     }
                                 }
                                 let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+                                let file_hint = get_file_hint(&arguments);
                                 // dry_run by default: a generated diff is only a preview until the
                                 // caller explicitly opts into writing it to disk.
                                 let apply = arguments.get("apply").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -1153,7 +1209,7 @@ fn main() {
                             }
                             "get_implementation" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+                                let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
@@ -1173,7 +1229,7 @@ fn main() {
                             }
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = arguments.get("file_path").and_then(|s| s.as_str());
+                                let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
