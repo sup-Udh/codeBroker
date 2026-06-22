@@ -27,6 +27,13 @@ enum Commands {
     Metrics,
     Analytics,
     Dashboard,
+    /// Re-parses only the given files and re-links their edges, instead of a
+    /// full repository rebuild. Faster for small edits; see indexer::reindex
+    /// for what it intentionally skips relative to a full Init.
+    ReindexIncremental {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Instantly hooks up Claude Desktop and Antigravity to the current directory
     Bind
 }
@@ -538,6 +545,23 @@ fn main() {
                 println!("Estimated Cost Savings: ${:.2}", total_cost_saved_cents / 100.0);
             } else {
                 println!("Could not connect to codebroker.db");
+            }
+        }
+        Commands::ReindexIncremental { paths } => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");
+            let _ = db.init_schema();
+            let project_root = std::env::current_dir().unwrap_or_default().to_string_lossy().to_string();
+            match indexer::reindex::reindex_paths(&db, &project_root, paths) {
+                Ok(stats) => {
+                    println!(
+                        "Incrementally reindexed {} file(s). Symbols: {}, Edges: {}.",
+                        stats.files_processed, stats.symbols_inserted, stats.edges_created
+                    );
+                    if !stats.skipped.is_empty() {
+                        println!("Skipped (unreadable or unsupported): {:?}", stats.skipped);
+                    }
+                }
+                Err(e) => println!("Error during incremental reindex: {}", e),
             }
         }
         Commands::Analytics => {

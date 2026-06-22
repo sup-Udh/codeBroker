@@ -64,6 +64,42 @@ fn resolve_db_path() -> String {
     resolve_workspace().db_path
 }
 
+/// Applies an LLM-generated unified diff to `file_path` using the system `patch`
+/// binary, passing the target file explicitly as the "originalfile" argument so
+/// the patch lands on the right file regardless of whatever path headers the
+/// LLM put in the diff text. Returns Err (no changes made) if `patch` rejects
+/// the diff as malformed/non-applying — the caller still has the raw `diff`
+/// text to apply manually in that case.
+fn apply_unified_diff(file_path: &str, diff_text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("codebroker_patch_{}_{}.diff", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+
+    {
+        let mut f = std::fs::File::create(&tmp_path).map_err(|e| format!("Failed to write temp diff file: {}", e))?;
+        f.write_all(diff_text.as_bytes()).map_err(|e| format!("Failed to write temp diff file: {}", e))?;
+    }
+
+    let status = std::process::Command::new("patch")
+        .arg("--no-backup-if-mismatch")
+        .arg("-p0")
+        .arg(file_path)
+        .arg("-i")
+        .arg(&tmp_path)
+        .status();
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "`patch` exited with status {}. The generated diff likely doesn't apply cleanly to the current file content — review the `diff` field and apply manually.",
+            s
+        )),
+        Err(e) => Err(format!("Failed to invoke `patch`: {}. Is GNU patch installed?", e)),
+    }
+}
+
 /// Runs `codebroker init` rooted at `project_dir` (via current_dir), rather than
 /// inheriting the MCP server process's own CWD. Previously the auto-init hook
 /// spawned the indexer without pinning its working directory, so it could index
@@ -85,6 +121,30 @@ fn run_index(project_dir: &str) -> Result<String, String> {
         Ok(format!("Indexing complete for workspace: {}", project_dir))
     } else {
         Err(format!("Indexer exited with non-zero status ({}) while indexing {}", status, project_dir))
+    }
+}
+
+/// Runs `codebroker reindex-incremental <changed_paths...>` rooted at `project_dir`,
+/// re-parsing only the given files instead of paying for a full repository
+/// rebuild. See indexer::reindex::reindex_paths for what this intentionally
+/// trades away (alias/route/prop-type linking) in exchange for speed.
+fn run_incremental_index(project_dir: &str, changed_paths: &[String]) -> Result<String, String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let parent = current_exe.parent().ok_or_else(|| "Could not resolve codebroker-mcp binary directory".to_string())?;
+    let cli_path = parent.join("codebroker");
+
+    let mut cmd = std::process::Command::new(&cli_path);
+    cmd.arg("reindex-incremental").current_dir(project_dir);
+    for p in changed_paths {
+        cmd.arg(p);
+    }
+
+    let status = cmd.status().map_err(|e| format!("Failed to spawn incremental indexer process in {}: {}", project_dir, e))?;
+
+    if status.success() {
+        Ok(format!("Incremental reindex complete for {} file(s) in workspace: {}", changed_paths.len(), project_dir))
+    } else {
+        Err(format!("Incremental indexer exited with non-zero status ({}) while indexing {} file(s) in {}", status, changed_paths.len(), project_dir))
     }
 }
 
@@ -165,7 +225,7 @@ fn main() {
                                 "tools": [
                                     {
                                         "name": "get_context",
-                                        "description": "Returns the exact architectural graph dependencies and blast radius dependents for a given code symbol.",
+                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -179,7 +239,7 @@ fn main() {
                                     },
                                     {
                                         "name": "impact_analysis",
-                                        "description": "Returns a deep, AI-generated semantic architectural summary of a code symbol, utilizing Qwen2.5-Coder to explain the blast radius and context.",
+                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. If you only need the raw list of dependents/dependencies, call get_context or explore_graph instead; they are instant and free of AI latency.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -193,13 +253,22 @@ fn main() {
                                     },
                                     {
                                         "name": "search_codebase",
-                                        "description": "Discovery tool to find where a keyword or concept is mentioned in symbol names.",
+                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "keyword": {
                                                     "type": "string",
                                                     "description": "The concept or name to search for (e.g. 'AuthService')."
+                                                },
+                                                "mode": {
+                                                    "type": "string",
+                                                    "enum": ["symbol", "text", "both"],
+                                                    "description": "Optional. 'symbol' (default): match indexed symbol/file names only, fast. 'text': grep raw file content for the literal keyword (catches string literals/comments, slower). 'both': try symbol matching first, fall back to text search if that finds nothing."
+                                                },
+                                                "path_scope": {
+                                                    "type": "string",
+                                                    "description": "Optional. Restrict results to files whose path contains this substring (e.g. 'src/auth' or 'mcp/'). Narrowing scope reduces result size and token cost."
                                                 }
                                             },
                                             "required": ["keyword"]
@@ -207,7 +276,7 @@ fn main() {
                                     },
                                     {
                                         "name": "find_symbol",
-                                        "description": "Exact lookup tool to find the definition file, line number, and kind of a specific symbol.",
+                                        "description": "Exact lookup tool to find the definition file, line number, and kind of a specific symbol. Response always includes a boolean 'found' field you can check without reading the matches array.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -217,7 +286,11 @@ fn main() {
                                                 },
                                                 "context_lines": {
                                                     "type": "number",
-                                                    "description": "Optional. Number of lines of context to fetch above and below the symbol. Defaults to 3."
+                                                    "description": "Optional. Number of lines of context to fetch above and below the symbol. Defaults to 3. Pass 0 for 'existence-only' mode: skips reading source entirely and returns just found/path/line/kind — use this for a yes/no location check when you don't need the snippet."
+                                                },
+                                                "path_scope": {
+                                                    "type": "string",
+                                                    "description": "Optional. Restrict matches to files whose path contains this substring. Narrowing scope reduces result size and token cost."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -225,7 +298,7 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview",
-                                        "description": "Returns a raw topological map of the local repository. Use this to understand the high-level architecture.",
+                                        "description": "Raw, deterministic, <1s. Returns a topological map of the repository (file/symbol/edge counts, languages, per-directory file AND symbol density). Use this for navigation decisions — e.g. a directory with many files but near-zero symbols (assets, generated output) isn't worth a follow-up search_codebase/find_symbol call. Prefer this over project_overview_ai unless you specifically need prose.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
@@ -233,7 +306,7 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview_ai",
-                                        "description": "Returns an AI-generated architectural summary of the entire repository. Use this to explain what the project does.",
+                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able by repo topology hash. Returns narrative prose explaining what the project does and how subsystems relate. Use only when you need an explanation in words, not raw metrics — call project_overview first for the fast, free version, and only escalate to this one if you need the narrative.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
@@ -241,16 +314,21 @@ fn main() {
                                     },
                                     {
                                         "name": "repository_stats",
-                                        "description": "Returns raw JSON counts of files, symbols, edges, and languages in the repository.",
+                                        "description": "Raw, deterministic, <1s. Returns counts of files, symbols, edges, and languages in the repository, optionally scoped to a path. Call this before search_codebase/find_symbol on a suspect subdirectory to check whether it's worth querying at all (e.g. 0 symbols indexed there) without inferring it from project_overview's directory list.",
                                         "inputSchema": {
                                             "type": "object",
-                                            "properties": {},
+                                            "properties": {
+                                                "path_scope": {
+                                                    "type": "string",
+                                                    "description": "Optional. Restrict counts to files whose path contains this substring (e.g. 'src/auth')."
+                                                }
+                                            },
                                             "required": []
                                         }
                                     },
                                     {
                                         "name": "read_symbol_source",
-                                        "description": "Read exact source code for one or more symbols without returning the entire file.",
+                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -261,6 +339,14 @@ fn main() {
                                                     "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)." 
                                                 }
                                             }
+                                        }
+                                    },
+                                    {
+                                        "name": "get_workspace",
+                                        "description": "Returns the currently active CodeBroker workspace: its project root, database path, and whether that database has been indexed yet. Call this instead of inferring the active workspace from project_overview's workspace_root field.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {}
                                         }
                                     },
                                     {
@@ -276,11 +362,12 @@ fn main() {
                                     },
                                     {
                                         "name": "reindex_workspace",
-                                        "description": "Force a full re-index of the active (or given) workspace, rebuilding the symbol table and dependency graph edges from scratch. Use this whenever repository_stats/project_overview reports 0 edges, or after making large changes to the codebase.",
+                                        "description": "Re-index the active (or given) workspace. With no 'changed_paths', forces a full rebuild of the symbol table and dependency graph edges from scratch — use this whenever repository_stats/project_overview reports 0 edges, or after large/structural changes. With 'changed_paths', re-parses only those files instead (much cheaper after a small edit like a single-function change) — but it intentionally skips import-alias/route/prop-type re-linking, so files OTHER than the changed ones that referenced a renamed symbol keep a stale edge until they're reindexed too. Fall back to a full reindex (omit changed_paths) if you need those re-linked.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "absolute_path": { "type": "string", "description": "Optional. Absolute path to re-index. Defaults to the currently active workspace." }
+                                                "absolute_path": { "type": "string", "description": "Optional. Absolute path to re-index. Defaults to the currently active workspace." },
+                                                "changed_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional. Specific file paths (absolute or relative to the workspace root) to incrementally re-parse instead of doing a full rebuild." }
                                             }
                                         }
                                     },
@@ -317,19 +404,21 @@ fn main() {
                                     },
                                     {
                                         "name": "generate_patch",
-                                        "description": "Generates a unified diff patch to modify a symbol, using CodeBroker's onboard AI and semantic context.",
+                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. Each symbol is patched independently (one diff per symbol, not a single cross-file diff) and returned in a `results` array. By default this only returns the diff text for review (dry_run behavior); pass apply: true to have CodeBroker write the diff to disk immediately via `patch`. Check each result's `applied`/`apply_error` field when apply is true.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string", "description": "The exact name of the symbol to modify." },
-                                                "instruction": { "type": "string", "description": "Instructions for what change to make." }
+                                                "symbol": { "type": "string", "description": "The exact name of a single symbol to modify. Use 'symbols' instead for multiple." },
+                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names to patch in one call, e.g. a manifest + a background script + a content script that all need the same kind of change." },
+                                                "instruction": { "type": "string", "description": "Instructions for what change to make. Applied identically to every symbol in 'symbols'." },
+                                                "apply": { "type": "boolean", "description": "Default false: only return the diff text for review (preview/dry-run). Set true to write each diff to disk immediately." }
                                             },
-                                            "required": ["symbol", "instruction"]
+                                            "required": ["instruction"]
                                         }
                                     },
                                     {
                                         "name": "get_implementation",
-                                        "description": "Return everything necessary to understand how a symbol is implemented.",
+                                        "description": "Equivalent to calling read_symbol_source + get_context together in one round trip: returns the symbol's own source PLUS its forward/reverse graph dependencies, bundled as {symbol_source, context}. Use this (not read_symbol_source) when you need to understand how a symbol works in relation to its callers/callees, not just read its body.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -340,7 +429,7 @@ fn main() {
                                     },
                                     {
                                         "name": "get_edit_context",
-                                        "description": "Prepare future code-editing workflows with target implementation and context.",
+                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, suggested_edit_boundaries}. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -373,13 +462,13 @@ fn main() {
                                     },
                                     {
                                         "name": "explore_graph",
-                                        "description": "Explore the code graph from a symbol using BFS traversal.",
+                                        "description": "General-purpose BFS traversal of the code graph from a symbol. This is the one tool to reach for for radius/neighborhood questions: get_context is just depth=1/direction='both' with no knobs, and graph_subtree is just direction='undirected' with a fixed max_nodes=500 — prefer explore_graph directly over either unless you specifically want their simpler fixed-shape output. Only shortest_path is a genuinely different algorithm (two named endpoints, not a radius) and stays separate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string" },
                                                 "depth": { "type": "number", "description": "Traversal depth. Max 5." },
-                                                "direction": { "type": "string", "description": "Incoming, Outgoing, or Both" },
+                                                "direction": { "type": "string", "enum": ["incoming", "outgoing", "both", "undirected"], "description": "'incoming': callers/dependents only. 'outgoing': dependencies only. 'both' (default): both directions, edges reported with true direction. 'undirected': same node set as 'both' (use this to replace graph_subtree)." },
                                                 "max_nodes": { "type": "number", "description": "Cap on returned nodes (1-200). Default 100. Lower this for hotspot symbols with large fan-in/out to avoid oversized responses." }
                                             },
                                             "required": ["symbol", "depth", "direction"]
@@ -387,7 +476,7 @@ fn main() {
                                     },
                                     {
                                         "name": "shortest_path",
-                                        "description": "Find the shortest relationship path between two symbols in the repository graph.",
+                                        "description": "Find the shortest relationship path between two NAMED symbols in the repository graph. Distinct from explore_graph/graph_subtree/get_context, which all explore a radius around a single symbol rather than connecting two specific endpoints.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -403,7 +492,8 @@ fn main() {
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "limit": { "type": "number", "description": "Max number of hotspots to return. Default 20." }
+                                                "limit": { "type": "number", "description": "Max number of hotspots to return. Default 20." },
+                                                "path_scope": { "type": "string", "description": "Optional. Restrict scoring to symbols whose file path contains this substring (e.g. 'src/auth'). Use this on a large repo to avoid repo-wide noise when you only care about one subsystem." }
                                             }
                                         }
                                     },
@@ -413,7 +503,8 @@ fn main() {
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "limit": { "type": "number", "description": "Max number of cycles to return in detail (1-500). Default 25. `cycles_found` in the response always reports the true total." }
+                                                "limit": { "type": "number", "description": "Max number of cycles to return in detail (1-500). Default 25. `cycles_found` in the response always reports the true total." },
+                                                "path_scope": { "type": "string", "description": "Optional. Restrict the scanned edge set to symbols whose file path contains this substring." }
                                             }
                                         }
                                     },
@@ -423,13 +514,14 @@ fn main() {
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "min_length": { "type": "number", "description": "Minimum normalized source length (characters) to consider. Default 80. Lower values surface more, noisier matches." }
+                                                "min_length": { "type": "number", "description": "Minimum normalized source length (characters) to consider. Default 80. Lower values surface more, noisier matches." },
+                                                "path_scope": { "type": "string", "description": "Optional. Restrict the scan to symbols whose file path contains this substring." }
                                             }
                                         }
                                     },
                                     {
                                         "name": "graph_subtree",
-                                        "description": "Extract the undirected neighborhood dependency subtree originating from a root symbol.",
+                                        "description": "DEPRECATED alias, kept for backward compatibility: equivalent to explore_graph(root_symbol, depth, direction: 'undirected', max_nodes: 500), with a fixed max_nodes and a response shape that reports per-node depth and string-named edges instead of ids. Prefer calling explore_graph directly with direction: 'undirected'.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -506,7 +598,10 @@ fn main() {
                             }
                             "search_codebase" => {
                                 let keyword = arguments.get("keyword").and_then(|s| s.as_str()).unwrap_or("");
-                                
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let mode_str = arguments.get("mode").and_then(|s| s.as_str()).unwrap_or("symbol");
+                                let mode = query::engine::SearchMode::from(mode_str);
+
                                 let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
                                 let mut llm_used = false;
                                 let semantic_tokens = if !hf_token.is_empty() {
@@ -529,12 +624,15 @@ fn main() {
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used) {
-                                            Ok(results) => {
-                                                let payload = serde_json::json!({
+                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used, path_scope, mode) {
+                                            Ok((results, reason)) => {
+                                                let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
                                                     "results": results
                                                 });
+                                                if let Some(r) = reason {
+                                                    payload["reason"] = serde_json::Value::String(r);
+                                                }
                                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                                             },
                                             Err(e) => serde_json::json!({"success": false, "error": format!("Error searching: {}", e)}).to_string(),
@@ -546,21 +644,32 @@ fn main() {
                             "find_symbol" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let context_lines = arguments.get("context_lines").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
-                                        match query::engine::find_symbol(&db, symbol, context_lines) {
+                                        match query::engine::find_symbol(&db, symbol, context_lines, path_scope) {
                                             Ok(results) => {
-                                                if results.is_empty() {
-                                                    format!("Symbol '{}' not found in workspace '{}'.", symbol, db.project_root)
-                                                } else {
-                                                    let mut s = format!("Workspace: {}\nMatches for '{}':\n", db.project_root, symbol);
-                                                    for (path, kind, line, preview, score) in results {
-                                                        s.push_str(&format!("- [{}] at {}:{} (Score: {})\n```rust\n{}\n```\n\n", kind, path, line, score, preview));
+                                                let matches: Vec<serde_json::Value> = results.iter().map(|(path, kind, line, preview, score)| {
+                                                    let mut m = serde_json::json!({
+                                                        "path": path,
+                                                        "kind": kind,
+                                                        "line": line,
+                                                        "score": score,
+                                                    });
+                                                    if context_lines > 0 {
+                                                        m["preview"] = serde_json::Value::String(preview.clone());
                                                     }
-                                                    s
-                                                }
+                                                    m
+                                                }).collect();
+                                                let payload = serde_json::json!({
+                                                    "workspace_root": db.project_root,
+                                                    "query": symbol,
+                                                    "found": !matches.is_empty(),
+                                                    "matches": matches,
+                                                });
+                                                serde_json::to_string_pretty(&payload).unwrap_or_default()
                                             }
                                             Err(e) => serde_json::json!({"success": false, "error": format!("Error finding symbol: {}", e)}).to_string(),
                                         }
@@ -585,12 +694,14 @@ fn main() {
                                 }
                             }
                             "repository_stats" => {
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::engine::build_project_overview(&db) {
+                                        match query::engine::build_project_overview_scoped(&db, path_scope) {
                                             Ok(overview) => {
                                                 let stats = serde_json::json!({
+                                                    "path_scope": path_scope,
                                                     "files": overview.files,
                                                     "symbols": overview.symbols,
                                                     "edges": overview.edges,
@@ -669,6 +780,14 @@ fn main() {
                                     }
                                 }
                             }
+                            "get_workspace" => {
+                                let resolved = resolve_workspace();
+                                serde_json::json!({
+                                    "project_root": resolved.project_root,
+                                    "db_path": resolved.db_path,
+                                    "indexed": resolved.exists,
+                                }).to_string()
+                            }
                             "set_workspace" => {
                                 let path = arguments.get("absolute_path").and_then(|s| s.as_str()).unwrap_or("");
                                 if path.is_empty() {
@@ -699,6 +818,10 @@ fn main() {
                             }
                             "reindex_workspace" => {
                                 let target = arguments.get("absolute_path").and_then(|s| s.as_str());
+                                let changed_paths: Vec<String> = arguments.get("changed_paths")
+                                    .and_then(|a| a.as_array())
+                                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                                    .unwrap_or_default();
                                 let project_dir = match target {
                                     Some(p) if !p.is_empty() => p.to_string(),
                                     _ => resolve_workspace().project_root,
@@ -706,7 +829,12 @@ fn main() {
                                 if !std::path::Path::new(&project_dir).exists() {
                                     format!("Error: Path '{}' does not exist.", project_dir)
                                 } else {
-                                    match run_index(&project_dir) {
+                                    let index_result = if changed_paths.is_empty() {
+                                        run_index(&project_dir)
+                                    } else {
+                                        run_incremental_index(&project_dir, &changed_paths)
+                                    };
+                                    match index_result {
                                         Ok(_) => {
                                             let reindexed_db_path = format!("{}/.codebroker/codebroker.db", project_dir);
                                             match storage::Database::new(&reindexed_db_path) {
@@ -774,10 +902,11 @@ fn main() {
                             }
                             "architectural_hotspots" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(20) as usize;
-                                
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::architectural_hotspots(&db, limit) {
+                                        match query::graph::architectural_hotspots(&db, limit, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.top_hotspots.len() * 50; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
@@ -790,9 +919,10 @@ fn main() {
                             }
                             "dependency_cycles" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(25) as usize;
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::dependency_cycles(&db, limit) {
+                                        match query::graph::dependency_cycles(&db, limit, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
@@ -805,9 +935,10 @@ fn main() {
                             }
                             "find_duplicate_logic" => {
                                 let min_length = arguments.get("min_length").and_then(|n| n.as_u64()).unwrap_or(80) as usize;
+                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::duplicates::find_duplicate_logic(&db, min_length) {
+                                        match query::duplicates::find_duplicate_logic(&db, min_length, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.groups.len() * 60; // rough estimation
                                                 serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing duplicate logic report".to_string())
@@ -836,22 +967,64 @@ fn main() {
                                 }
                             }
                             "generate_patch" => {
-                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
-                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
-                                if hf_token.is_empty() {
-                                    "Error: HF_API_TOKEN environment variable is not set.".to_string()
-                                } else {
-                                    match storage::Database::new(&db_path) {
-                                        Ok(db) => {
-                                            let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
-                                            let patch_gen = semantic::generator::PatchGenerator::new(&db, provider);
-                                            match patch_gen.generate_patch(symbol, instruction) {
-                                                Ok(patch) => patch,
-                                                Err(e) => format!("Error generating patch: {}", e),
-                                            }
+                                let mut symbols: Vec<String> = Vec::new();
+                                if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
+                                    if !s.is_empty() {
+                                        symbols.push(s.to_string());
+                                    }
+                                }
+                                if let Some(arr) = arguments.get("symbols").and_then(|a| a.as_array()) {
+                                    for v in arr {
+                                        if let Some(s) = v.as_str() {
+                                            symbols.push(s.to_string());
                                         }
-                                        Err(_) => "Error connecting to db".to_string(),
+                                    }
+                                }
+                                let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
+                                // dry_run by default: a generated diff is only a preview until the
+                                // caller explicitly opts into writing it to disk.
+                                let apply = arguments.get("apply").and_then(|b| b.as_bool()).unwrap_or(false);
+
+                                if symbols.is_empty() {
+                                    "Error: Must provide 'symbol' or 'symbols'".to_string()
+                                } else {
+                                    let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+                                    if hf_token.is_empty() {
+                                        "Error: HF_API_TOKEN environment variable is not set.".to_string()
+                                    } else {
+                                        match storage::Database::new(&db_path) {
+                                            Ok(db) => {
+                                                let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
+                                                let patch_gen = semantic::generator::PatchGenerator::new(&db, provider);
+                                                let mut results = Vec::new();
+                                                for symbol in &symbols {
+                                                    match patch_gen.generate_patch(symbol, instruction) {
+                                                        Ok(diff) => {
+                                                            let mut entry = serde_json::json!({
+                                                                "symbol": symbol,
+                                                                "diff": diff,
+                                                                "applied": false,
+                                                            });
+                                                            if apply {
+                                                                match patch_gen.resolve_file_path(symbol) {
+                                                                    Ok(file_path) => match apply_unified_diff(&file_path, &diff) {
+                                                                        Ok(_) => { entry["applied"] = serde_json::Value::Bool(true); }
+                                                                        Err(e) => { entry["apply_error"] = serde_json::Value::String(e); }
+                                                                    },
+                                                                    Err(e) => { entry["apply_error"] = serde_json::Value::String(e); }
+                                                                }
+                                                            }
+                                                            results.push(entry);
+                                                        }
+                                                        Err(e) => {
+                                                            results.push(serde_json::json!({ "symbol": symbol, "error": e }));
+                                                        }
+                                                    }
+                                                }
+                                                serde_json::json!({ "apply": apply, "results": results }).to_string()
+                                            }
+                                            Err(_) => "Error connecting to db".to_string(),
+                                        }
                                     }
                                 }
                             }

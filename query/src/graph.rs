@@ -9,6 +9,10 @@ pub enum GraphDirection {
     Incoming,
     Outgoing,
     Both,
+    /// Same traversal as `Both` (visits the same node set via both incoming and
+    /// outgoing edges) — provided so `explore_graph` can fully replace
+    /// `graph_subtree`, whose only documented difference was "undirected".
+    Undirected,
 }
 
 impl Default for GraphDirection {
@@ -22,6 +26,7 @@ impl From<&str> for GraphDirection {
         match s.to_lowercase().as_str() {
             "incoming" => GraphDirection::Incoming,
             "outgoing" => GraphDirection::Outgoing,
+            "undirected" => GraphDirection::Undirected,
             _ => GraphDirection::Both,
         }
     }
@@ -142,8 +147,8 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
             continue;
         }
 
-        let is_outgoing = matches!(direction, GraphDirection::Outgoing | GraphDirection::Both);
-        let is_incoming = matches!(direction, GraphDirection::Incoming | GraphDirection::Both);
+        let is_outgoing = matches!(direction, GraphDirection::Outgoing | GraphDirection::Both | GraphDirection::Undirected);
+        let is_incoming = matches!(direction, GraphDirection::Incoming | GraphDirection::Both | GraphDirection::Undirected);
 
         // Process Outgoing dependencies
         if is_outgoing {
@@ -457,15 +462,15 @@ pub struct HotspotResponse {
     pub top_hotspots: Vec<HotspotNode>,
 }
 
-pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResponse> {
+pub fn architectural_hotspots(db: &Database, limit: usize, path_scope: Option<&str>) -> Result<HotspotResponse> {
     let mut incoming_map = std::collections::HashMap::new();
     let mut in_stmt = db.conn.prepare(
-        "SELECT edges.target_symbol_id, COUNT(symbols.id) 
-         FROM edges 
-         JOIN symbols ON edges.source_file_id = symbols.file_id 
+        "SELECT edges.target_symbol_id, COUNT(symbols.id)
+         FROM edges
+         JOIN symbols ON edges.source_file_id = symbols.file_id
          GROUP BY edges.target_symbol_id"
     )?;
-    
+
     let mut in_rows = in_stmt.query([])?;
     while let Some(row) = in_rows.next()? {
         let sym_id: i64 = row.get(0)?;
@@ -475,12 +480,12 @@ pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResp
 
     let mut outgoing_map = std::collections::HashMap::new();
     let mut out_stmt = db.conn.prepare(
-        "SELECT symbols.id, COUNT(edges.id) 
-         FROM symbols 
-         JOIN edges ON symbols.file_id = edges.source_file_id 
+        "SELECT symbols.id, COUNT(edges.id)
+         FROM symbols
+         JOIN edges ON symbols.file_id = edges.source_file_id
          GROUP BY symbols.id"
     )?;
-    
+
     let mut out_rows = out_stmt.query([])?;
     while let Some(row) = out_rows.next()? {
         let sym_id: i64 = row.get(0)?;
@@ -490,17 +495,22 @@ pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResp
 
     let mut nodes = Vec::new();
     let mut sym_stmt = db.conn.prepare(
-        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
-         FROM symbols 
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path
+         FROM symbols
          JOIN files ON symbols.file_id = files.id"
     )?;
-    
+
     let mut sym_rows = sym_stmt.query([])?;
     while let Some(row) = sym_rows.next()? {
         let sym_id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
         let kind: String = row.get(2)?;
         let path: String = row.get(3)?;
+        if let Some(scope) = path_scope {
+            if !path.contains(scope) {
+                continue;
+            }
+        }
 
         let incoming = *incoming_map.get(&sym_id).unwrap_or(&0);
         let outgoing = *outgoing_map.get(&sym_id).unwrap_or(&0);
@@ -534,7 +544,16 @@ pub fn architectural_hotspots(db: &Database, limit: usize) -> Result<HotspotResp
     });
 
     let total_symbols = nodes.len();
-    let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+    let total_edges: i64 = if let Some(scope) = path_scope {
+        let pattern = format!("%{}%", scope);
+        db.conn.query_row(
+            "SELECT COUNT(*) FROM edges JOIN files ON edges.source_file_id = files.id WHERE files.path LIKE ?1",
+            rusqlite::params![pattern],
+            |r| r.get(0),
+        ).unwrap_or(0)
+    } else {
+        db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0)
+    };
 
     nodes.truncate(limit);
 
@@ -568,23 +587,30 @@ pub struct DependencyCyclesResponse {
     pub cycles: Vec<DependencyCycle>,
 }
 
-pub fn dependency_cycles(db: &Database, limit: usize) -> Result<DependencyCyclesResponse> {
+pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>) -> Result<DependencyCyclesResponse> {
     const MAX_CYCLES: usize = 500;
     let return_limit = limit.clamp(1, MAX_CYCLES);
     const MAX_NODES_PER_CYCLE: usize = 40;
 
     let mut adj: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
     let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, edges.target_symbol_id 
-         FROM symbols 
-         JOIN edges ON symbols.file_id = edges.source_file_id"
+        "SELECT symbols.id, edges.target_symbol_id, files.path
+         FROM symbols
+         JOIN edges ON symbols.file_id = edges.source_file_id
+         JOIN files ON symbols.file_id = files.id"
     )?;
-    
+
     let mut rows = stmt.query([])?;
     let mut edges_scanned = 0;
     while let Some(row) = rows.next()? {
         let source_id: i64 = row.get(0)?;
         let target_id: i64 = row.get(1)?;
+        let path: String = row.get(2)?;
+        if let Some(scope) = path_scope {
+            if !path.contains(scope) {
+                continue;
+            }
+        }
         adj.entry(source_id).or_default().push(target_id);
         edges_scanned += 1;
     }

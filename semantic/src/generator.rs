@@ -187,4 +187,23 @@ impl<'a> PatchGenerator<'a> {
 
         Ok(patch)
     }
+
+    /// Resolves the absolute file path a symbol lives in, so callers (e.g. the
+    /// `apply: true` path in generate_patch) know which file to run the diff
+    /// against without re-deriving it from generate_patch's internals.
+    pub fn resolve_file_path(&self, symbol_name: &str) -> Result<String, String> {
+        let file_id: i64 = self.db.conn.query_row(
+            "SELECT file_id FROM symbols WHERE name = ?1 LIMIT 1",
+            [symbol_name],
+            |row| row.get(0),
+        ).map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?;
+
+        let file_path: String = self.db.conn.query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            [file_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+
+        Ok(self.db.resolve_path(&file_path))
+    }
 }

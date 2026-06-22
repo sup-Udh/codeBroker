@@ -152,6 +152,32 @@ impl Database {
         Ok(results)
     }
 
+    /// Incremental reindex helper: finds the row id of an already-indexed file
+    /// by its stored (relative) path, so a re-parse can clear its stale data
+    /// first instead of accumulating duplicate symbols/edges.
+    pub fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>> {
+        let result = self.conn.query_row("SELECT id FROM files WHERE path = ?1", params![path], |row| row.get(0));
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Incremental reindex helper: clears all symbols, edges, and raw_imports
+    /// tied to a file before re-parsing it. Must run before re-inserting fresh
+    /// rows for the same file — `init_schema` never enables `PRAGMA
+    /// foreign_keys`, so the `ON DELETE CASCADE` declared in the schema is
+    /// inert and stale rows would otherwise dangle or double up on re-link.
+    pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM edges WHERE target_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
+        self.conn.execute("DELETE FROM edges WHERE source_file_id = ?1", params![file_id])?;
+        self.conn.execute("DELETE FROM raw_imports WHERE file_id = ?1", params![file_id])?;
+        self.conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+        self.conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+        Ok(())
+    }
+
     /// Pass 2 Helper: Tries to find a physical symbol matching the import name
     pub fn find_symbol_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE LOWER(name) = LOWER(?1) LIMIT 1")?;

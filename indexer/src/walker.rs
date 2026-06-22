@@ -10,13 +10,24 @@ pub fn collect_files(root_dir: &str) -> Vec<String> {
     let mut seen_hashes = HashSet::new();
 
     let mut overrides = OverrideBuilder::new(root_dir);
-    // Ignore common build output and dependency directories
+    // Ignore common build output, dependency, and vendor directories.
+    // `target/` in particular can be multiple GB on a Rust workspace and
+    // contains no source symbols worth indexing.
     let _ = overrides.add("!**/node_modules/**");
     let _ = overrides.add("!**/dist/**");
     let _ = overrides.add("!**/build/**");
     let _ = overrides.add("!**/.next/**");
     let _ = overrides.add("!**/out/**");
     let _ = overrides.add("!**/.codebroker/**");
+    let _ = overrides.add("!**/target/**");
+    let _ = overrides.add("!**/vendor/**");
+    let _ = overrides.add("!**/.venv/**");
+    let _ = overrides.add("!**/venv/**");
+    let _ = overrides.add("!**/__pycache__/**");
+    let _ = overrides.add("!**/.pytest_cache/**");
+    let _ = overrides.add("!**/.git/**");
+    let _ = overrides.add("!**/.vexp/**");
+    let _ = overrides.add("!**/.vexp_backup/**");
 
     let mut builder = WalkBuilder::new(root_dir);
     if let Ok(ov) = overrides.build() {

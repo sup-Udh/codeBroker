@@ -42,7 +42,7 @@ fn normalize(source: &str) -> String {
 /// bodies whose normalized source text is byte-identical but which live in
 /// different files. `min_normalized_len` filters out trivial bodies (e.g.
 /// one-line getters) that would otherwise produce noisy false positives.
-pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize) -> Result<DuplicateLogicReport, String> {
+pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope: Option<&str>) -> Result<DuplicateLogicReport, String> {
     let mut stmt = db.conn.prepare(
         "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte
          FROM symbols
@@ -64,6 +64,12 @@ pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize) -> Result<
         let end_line: i64 = row.get(4).unwrap_or(0);
         let start_byte: i64 = row.get(5).unwrap_or(0);
         let end_byte: i64 = row.get(6).unwrap_or(0);
+
+        if let Some(scope) = path_scope {
+            if !rel_path.contains(scope) {
+                continue;
+            }
+        }
 
         if end_byte <= start_byte {
             continue;
