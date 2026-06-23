@@ -3,6 +3,56 @@ use parser::frontend;
 use std::fs;
 use rusqlite::params;
 
+/// Resolves a call/method-call raw_import into a graph edge without the
+/// case-insensitive global bare-name matching the import linker uses. That
+/// matching fabricated phantom edges for short, repeated handler names: a
+/// member call `query.delete()` would link to an exported `DELETE`, and
+/// `someObject.get()` to a `GET` route, purely on a case-folded name collision.
+///
+/// Rules:
+/// - Free calls (`foo()`, edge_kind "calls"): try an exact, case-sensitive,
+///   same-file definition first (the common local-helper case), then a single
+///   exact, case-sensitive global match.
+/// - Member calls (`obj.foo()`, edge_kind "method_call"): only a same-file
+///   exact match — never a global one, since without type resolution we can't
+///   know which object `foo` belongs to, and a global guess is always a guess.
+/// - Self-referential edges (target symbol defined in the calling file and
+///   matched globally) are skipped to avoid `X -> X` self-loops.
+fn resolve_call_edge(
+    db: &storage::Database,
+    source_file_id: i64,
+    name: &str,
+    edge_kind: &str,
+    edges_created: &mut i64,
+) {
+    if name.is_empty() {
+        return;
+    }
+
+    if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, name) {
+        if db.insert_edge(source_file_id, local_id, edge_kind).is_ok() {
+            *edges_created += 1;
+        }
+        return;
+    }
+
+    // Member access never falls back to a global match.
+    if edge_kind == "method_call" {
+        return;
+    }
+
+    if let Ok(Some((target_id, target_file_id))) = db.find_symbol_exact_with_file(name) {
+        // A same-file match would have been caught above; reaching here with
+        // target_file_id == source_file_id can only be a self-reference.
+        if target_file_id == source_file_id {
+            return;
+        }
+        if db.insert_edge(source_file_id, target_id, edge_kind).is_ok() {
+            *edges_created += 1;
+        }
+    }
+}
+
 // 1. Define the CLI arguments
 #[derive(Parser)]
 #[command(name = "codebroker")]
@@ -260,6 +310,16 @@ fn main() {
                             }
                         }
                     }
+                    continue;
+                }
+
+                // Call edges are resolved case-sensitively and without the
+                // global bare-name fallback that the import path uses below,
+                // because that fallback fabricated phantom relationships for
+                // common handler names (e.g. a member call `query.delete()`
+                // linking to an exported `DELETE` route). See resolve_call_edge.
+                if edge_kind == "calls" || edge_kind == "method_call" {
+                    resolve_call_edge(&db, source_file_id, &import_name, &edge_kind, &mut edges_created);
                     continue;
                 }
 
@@ -1016,3 +1076,78 @@ Treat native tools as the repository's implementation layer."#;
         }
         }
     }
+
+#[cfg(test)]
+mod call_edge_tests {
+    use super::*;
+
+    fn sym(name: &str) -> graph::SymbolNode {
+        graph::SymbolNode {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            prop_type: None,
+            start_line: 1,
+            end_line: 1,
+            start_byte: 0,
+            end_byte: 0,
+            signature: None,
+        }
+    }
+
+    fn count_edges(db: &storage::Database) -> i64 {
+        db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    // #2 — call_resolution_fixture: a member call `someObject.get()` (tagged
+    // method_call) in file B must NOT create an edge to an exported `GET` in
+    // file A. Bare/case-folded name matching used to fabricate exactly this.
+    #[test]
+    fn method_call_does_not_link_to_same_named_toplevel_symbol() {
+        let db = storage::Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let file_a = db.insert_file("a.ts", "h").unwrap(); // defines GET
+        db.insert_symbol(file_a, &sym("GET")).unwrap();
+        let file_b = db.insert_file("b.ts", "h").unwrap(); // calls someObject.get()
+
+        let mut created = 0i64;
+        // member access -> method_call, name "get"
+        resolve_call_edge(&db, file_b, "get", "method_call", &mut created);
+        // member access with exact-case name "GET"
+        resolve_call_edge(&db, file_b, "GET", "method_call", &mut created);
+
+        assert_eq!(created, 0, "member calls must not link to a top-level symbol");
+        assert_eq!(count_edges(&db), 0);
+    }
+
+    #[test]
+    fn free_call_resolution_is_case_sensitive() {
+        let db = storage::Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let file_a = db.insert_file("a.ts", "h").unwrap();
+        db.insert_symbol(file_a, &sym("GET")).unwrap();
+        let file_b = db.insert_file("b.ts", "h").unwrap();
+
+        let mut created = 0i64;
+        // lowercase free call `get()` must NOT match `GET` (case-sensitive).
+        resolve_call_edge(&db, file_b, "get", "calls", &mut created);
+        assert_eq!(created, 0, "case-folded match must not happen");
+        assert_eq!(count_edges(&db), 0);
+
+        // exact-case free call `GET()` from another file DOES link.
+        resolve_call_edge(&db, file_b, "GET", "calls", &mut created);
+        assert_eq!(created, 1, "exact-case free call should resolve");
+        assert_eq!(count_edges(&db), 1);
+    }
+
+    #[test]
+    fn free_call_links_to_same_file_helper() {
+        let db = storage::Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let file_a = db.insert_file("a.ts", "h").unwrap();
+        db.insert_symbol(file_a, &sym("helper")).unwrap();
+
+        let mut created = 0i64;
+        resolve_call_edge(&db, file_a, "helper", "calls", &mut created);
+        assert_eq!(created, 1, "same-file helper call should resolve locally");
+    }
+}

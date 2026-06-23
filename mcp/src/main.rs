@@ -77,6 +77,72 @@ fn get_file_hint<'a>(arguments: &'a serde_json::Map<String, serde_json::Value>) 
         .and_then(|s| s.as_str())
 }
 
+/// Adds an approximate `response_size_hint` field to a JSON object response,
+/// so a calling agent can decide whether to drill deeper or stop without
+/// guessing from raw JSON length. Deliberately cheap (char_count / 4, the
+/// same heuristic `TokenAccounting::estimate_tokens` already uses for the
+/// delivered_token_count analytics field) — not a real tokenizer, just an
+/// order-of-magnitude estimate. Computed from the response as it stands
+/// before this field is added, so the hint doesn't include its own size.
+fn add_response_size_hint(value: &mut serde_json::Value) {
+    let char_count = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+    let approx_tokens = analytics::accounting::TokenAccounting::estimate_tokens(char_count);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("response_size_hint".to_string(), serde_json::json!({
+            "char_count": char_count,
+            "approx_tokens": approx_tokens
+        }));
+    }
+}
+
+#[cfg(test)]
+mod response_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn add_response_size_hint_is_additive_and_keeps_existing_fields() {
+        let mut value = serde_json::json!({"results": ["a", "b", "c"]});
+        add_response_size_hint(&mut value);
+
+        // Existing field untouched — this must only ever add, never rename/remove.
+        assert_eq!(value["results"], serde_json::json!(["a", "b", "c"]));
+
+        let hint = &value["response_size_hint"];
+        assert!(hint["char_count"].as_u64().unwrap() > 0);
+        // approx_tokens is the cheap char_count/4 heuristic, not a real tokenizer.
+        let char_count = hint["char_count"].as_u64().unwrap();
+        let approx_tokens = hint["approx_tokens"].as_u64().unwrap();
+        assert_eq!(approx_tokens, char_count / 4);
+    }
+
+    #[test]
+    fn add_response_size_hint_grows_with_payload_size() {
+        let mut small = serde_json::json!({"results": ["a"]});
+        let mut large = serde_json::json!({"results": ["a", "b", "c", "d", "e", "f", "g", "h"]});
+        add_response_size_hint(&mut small);
+        add_response_size_hint(&mut large);
+        assert!(
+            large["response_size_hint"]["approx_tokens"].as_u64().unwrap()
+                > small["response_size_hint"]["approx_tokens"].as_u64().unwrap()
+        );
+    }
+
+    #[test]
+    fn get_file_hint_prefers_file_path_but_falls_back_to_path_scope() {
+        let mut args = serde_json::Map::new();
+        args.insert("file_path".to_string(), serde_json::json!("src/auth.ts"));
+        args.insert("path_scope".to_string(), serde_json::json!("src/other.ts"));
+        assert_eq!(get_file_hint(&args), Some("src/auth.ts"));
+
+        let mut alias_only = serde_json::Map::new();
+        alias_only.insert("path_scope".to_string(), serde_json::json!("src/rooms/route.ts"));
+        assert_eq!(get_file_hint(&alias_only), Some("src/rooms/route.ts"));
+
+        let empty = serde_json::Map::new();
+        assert_eq!(get_file_hint(&empty), None);
+    }
+}
+
 /// Pre-flight ambiguity check for tools that take a bare symbol name and
 /// would otherwise silently pick whichever DB row comes back first when a
 /// common name (e.g. "GET", a Next.js route handler exported from dozens of
@@ -330,7 +396,7 @@ fn main() {
                                     },
                                     {
                                         "name": "search_codebase",
-                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. Text-mode matching is substring-based by default, which WILL match short keywords inside longer identifiers (e.g. searching 'PORT' matches inside 'export'/'import') — set whole_word: true to require non-identifier boundaries around the match if that's not what you want. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip.",
+                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. Text-mode matching is substring-based by default, which WILL match short keywords inside longer identifiers (e.g. searching 'PORT' matches inside 'export'/'import') — set whole_word: true to require non-identifier boundaries around the match if that's not what you want. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip. If you already suspect an exact/near-exact name and a generic query like 'room' is returning a flat list mixing one relevant hit with many unrelated Medium/Low matches (e.g. 10 components named *Room*), set min_confidence: \"high\" to skip the manual filtering pass — this shrinks result count, it does not change ranking. Response includes a 'response_size_hint' field ({char_count, approx_tokens}, approx_tokens = char_count/4 — a cheap estimate, not a real token count) so you can gauge response size without guessing from raw JSON length.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -350,6 +416,11 @@ fn main() {
                                                 "path_scope": {
                                                     "type": "string",
                                                     "description": "Optional. Restrict results to files whose path contains this substring (e.g. 'src/auth' or 'mcp/'). Narrowing scope reduces result size and token cost."
+                                                },
+                                                "min_confidence": {
+                                                    "type": "string",
+                                                    "enum": ["high", "medium", "low"],
+                                                    "description": "Optional, default unset (no filtering — all matches returned, unchanged from before this param existed). Drops every result below the given confidence tier (e.g. 'high' keeps only Exact/Prefix matches, dropping Medium/Low noise). Use this when you already suspect an exact name and just want to skip reading past weaker matches."
                                                 }
                                             },
                                             "required": ["keyword"]
@@ -357,7 +428,7 @@ fn main() {
                                     },
                                     {
                                         "name": "find_symbol",
-                                        "description": "Exact lookup tool to find the definition file, line number, and kind of a specific symbol. Response always includes a boolean 'found' field you can check without reading the matches array.",
+                                        "description": "Lookup tool to find the definition file, line number, and kind of a symbol. Response includes a boolean 'found' field, plus results split into 'exact_matches' (the symbol's name equals your query, case-insensitive) and 'fuzzy_matches' (prefix/substring/typo hits) so you don't have to disambiguate by score — 'matches' is also present (all results, with score) for completeness. For a common name like 'GET' that matches many route files, previews are suppressed and 'compact': true is set with a 'hint' to narrow via path_scope; passing path_scope re-enables previews for the scoped subset. Honors context_lines (0 = no previews).",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -379,7 +450,7 @@ fn main() {
                                     },
                                     {
                                         "name": "project_overview",
-                                        "description": "Raw, deterministic, <1s. Returns a topological map of the repository (file/symbol/edge counts, languages, per-directory file AND symbol density). Use this for navigation decisions — e.g. a directory with many files but near-zero symbols (assets, generated output) isn't worth a follow-up search_codebase/find_symbol call. Prefer this over project_overview_ai unless you specifically need prose.",
+                                        "description": "Raw, deterministic, <1s. Returns a topological map of the repository (file/symbol/edge counts, languages, per-directory file AND symbol density). Use this for navigation decisions — e.g. a directory with many files but near-zero symbols (assets, generated output) isn't worth a follow-up search_codebase/find_symbol call. Prefer this over project_overview_ai unless you specifically need prose. Response includes a 'response_size_hint' field ({char_count, approx_tokens}, approx_tokens = char_count/4 — a cheap estimate, not a real token count) so you can gauge response size without guessing from raw JSON length.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
@@ -409,12 +480,12 @@ fn main() {
                                     },
                                     {
                                         "name": "read_symbol_source",
-                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in. If any name is ambiguous (defined in multiple files), returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
+                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in. Batches: pass symbols: [\"GET\", \"POST\"] to fetch multiple symbols in ONE call — if you're about to make 2+ sequential read_symbol_source calls against the same file_path (e.g. fetching GET then POST from the same route file), batch them instead; it's the same total data for one round trip instead of several. Use the single 'symbol' field only when you genuinely want just one. If any name is ambiguous (defined in multiple files), returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": { "type": "string", "description": "Single symbol name" },
-                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names (for batch fetching)" },
+                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Preferred. Array of symbol names for batch fetching, e.g. [\"GET\", \"POST\"] — one call instead of one per symbol." },
+                                                "symbol": { "type": "string", "description": "Single symbol name. Use 'symbols' instead if you need more than one from the same lookup." },
                                                 "include_dependencies": {
                                                     "type": "boolean",
                                                     "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)."
@@ -489,7 +560,7 @@ fn main() {
                                     },
                                     {
                                         "name": "generate_patch",
-                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added lines that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry. By default this only returns diff text for review (dry_run); pass apply: true to have CodeBroker write it to disk via `patch`.",
+                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. Each result's `diff` is a RAW unified diff with any Markdown code fences stripped — it pipes straight into `git apply`/`patch` with no further processing; a fenced `rendered_diff` is also included for display only. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added CODE lines (comments and string literals are ignored, so prose words won't be flagged) that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry. By default this only returns diff text for review (dry_run); pass apply: true to have CodeBroker write it to disk via `patch`.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -516,7 +587,7 @@ fn main() {
                                     },
                                     {
                                         "name": "get_edit_context",
-                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, suggested_edit_boundaries}. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
+                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, same_file_callers, suggested_edit_boundaries, response_size_hint}. IMPORTANT: reverse_dependencies is cross-file ONLY (it's backed by import edges, and a file never imports its own symbols) — an empty reverse_dependencies does NOT mean a symbol is unused. Check same_file_callers too: a private helper called only by a sibling function below it in the same file will show reverse_dependencies: [] and same_file_callers: [\"callerName\"], and is NOT dead code. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate. response_size_hint is {char_count, approx_tokens} (approx_tokens = char_count/4, a cheap estimate not a real token count) so you can gauge response size without guessing from raw JSON length.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -739,6 +810,7 @@ fn main() {
                                 let mode_str = arguments.get("mode").and_then(|s| s.as_str()).unwrap_or("symbol");
                                 let mode = query::engine::SearchMode::from(mode_str);
                                 let whole_word = arguments.get("whole_word").and_then(|b| b.as_bool()).unwrap_or(false);
+                                let min_confidence = arguments.get("min_confidence").and_then(|s| s.as_str());
 
                                 let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
                                 let mut llm_used = false;
@@ -762,7 +834,7 @@ fn main() {
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used, path_scope, mode, whole_word) {
+                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, llm_used, path_scope, mode, whole_word, min_confidence) {
                                             Ok((results, reason)) => {
                                                 let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
@@ -771,6 +843,7 @@ fn main() {
                                                 if let Some(r) = reason {
                                                     payload["reason"] = serde_json::Value::String(r);
                                                 }
+                                                add_response_size_hint(&mut payload);
                                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                                             },
                                             Err(e) => serde_json::json!({"success": false, "error": format!("Error searching: {}", e)}).to_string(),
@@ -789,24 +862,63 @@ fn main() {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
                                         match query::engine::find_symbol(&db, symbol, context_lines, path_scope) {
                                             Ok(results) => {
-                                                let matches: Vec<serde_json::Value> = results.iter().map(|(path, kind, line, preview, score)| {
+                                                // Disambiguation (#4): a common name like "GET" matches
+                                                // many route files. Past a threshold, suppress the
+                                                // per-match source previews and return a compact
+                                                // candidate list instead — the caller is meant to narrow
+                                                // with path_scope, not read 9+ full previews. A narrowed
+                                                // path_scope opts back into previews.
+                                                const PREVIEW_SUPPRESSION_THRESHOLD: usize = 5;
+                                                let compact = results.len() > PREVIEW_SUPPRESSION_THRESHOLD && path_scope.is_none();
+                                                let show_preview = context_lines > 0 && !compact;
+
+                                                let query_lower = symbol.to_lowercase();
+                                                let to_entry = |name: &str, path: &str, kind: &str, line: &i64, preview: &str| {
                                                     let mut m = serde_json::json!({
+                                                        "name": name,
                                                         "path": path,
                                                         "kind": kind,
                                                         "line": line,
-                                                        "score": score,
                                                     });
-                                                    if context_lines > 0 {
-                                                        m["preview"] = serde_json::Value::String(preview.clone());
+                                                    if show_preview {
+                                                        m["preview"] = serde_json::Value::String(preview.to_string());
                                                     }
                                                     m
-                                                }).collect();
-                                                let payload = serde_json::json!({
+                                                };
+
+                                                let mut matches = Vec::new();
+                                                let mut exact_matches = Vec::new();
+                                                let mut fuzzy_matches = Vec::new();
+                                                for (name, path, kind, line, preview, score) in results.iter() {
+                                                    // Exact/fuzzy split (#3): exact == the symbol's own
+                                                    // name equals the query (case-insensitive). Everything
+                                                    // else (prefix/substring/levenshtein hits) is fuzzy.
+                                                    let entry = to_entry(name, path, kind, line, preview);
+                                                    let mut full = entry.clone();
+                                                    full["score"] = serde_json::json!(score);
+                                                    matches.push(full);
+                                                    if name.to_lowercase() == query_lower {
+                                                        exact_matches.push(entry);
+                                                    } else {
+                                                        fuzzy_matches.push(entry);
+                                                    }
+                                                }
+
+                                                let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
                                                     "query": symbol,
                                                     "found": !matches.is_empty(),
+                                                    "exact_matches": exact_matches,
+                                                    "fuzzy_matches": fuzzy_matches,
                                                     "matches": matches,
                                                 });
+                                                if compact {
+                                                    payload["compact"] = serde_json::Value::Bool(true);
+                                                    payload["hint"] = serde_json::Value::String(format!(
+                                                        "{} matches for \"{}\" — previews suppressed. Narrow with path_scope (e.g. a directory or file substring) to get source previews for a specific match.",
+                                                        results.len(), symbol
+                                                    ));
+                                                }
                                                 serde_json::to_string_pretty(&payload).unwrap_or_default()
                                             }
                                             Err(e) => serde_json::json!({"success": false, "error": format!("Error finding symbol: {}", e)}).to_string(),
@@ -823,6 +935,7 @@ fn main() {
                                             Ok(overview) => {
                                                 let mut output = serde_json::to_value(&overview).unwrap();
                                                 output["workspace_root"] = serde_json::Value::String(db.project_root.clone());
+                                                add_response_size_hint(&mut output);
                                                 serde_json::to_string_pretty(&output).unwrap_or_default()
                                             },
                                             Err(e) => format!("Error building overview: {}", e),
@@ -1163,6 +1276,7 @@ fn main() {
                                                             let mut entry = serde_json::json!({
                                                                 "symbol": symbol,
                                                                 "diff": output.diff,
+                                                                "rendered_diff": output.rendered_diff,
                                                                 "introduced_identifiers": output.introduced_identifiers,
                                                                 "applied": false,
                                                             });
@@ -1237,12 +1351,14 @@ fn main() {
                                         } else {
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                             let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
-                                            let edit_context = serde_json::json!({
+                                            let mut edit_context = serde_json::json!({
                                                 "target_implementation": source,
                                                 "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
                                                 "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
+                                                "same_file_callers": context.as_ref().map(|c| c.same_file_callers.clone()).unwrap_or_default(),
                                                 "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
                                             });
+                                            add_response_size_hint(&mut edit_context);
                                             serde_json::to_string_pretty(&edit_context).unwrap_or_default()
                                         }
                                     }

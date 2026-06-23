@@ -162,6 +162,13 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
                 let target_id: i64 = row.get(0)?;
                 let kind: String = row.get(1)?;
 
+                // A symbol depending on itself is a self-loop with no
+                // navigational value (and was a visible artifact for recursive
+                // or same-named handlers, e.g. DELETE -> DELETE). Skip it.
+                if target_id == curr_id {
+                    continue;
+                }
+
                 let edge_key = (curr_id, target_id, kind.clone());
                 if !visited_edges.contains(&edge_key) {
                     visited_edges.insert(edge_key);
@@ -218,6 +225,13 @@ pub fn explore_graph(db: &Database, symbol_name: &str, max_depth: usize, directi
                     let source_name: String = sym_row.get(1)?;
                     let source_kind: String = sym_row.get(2)?;
                     let source_path: String = sym_row.get(3)?;
+
+                    // Skip self-loops: the resolved source file also contains
+                    // curr_id itself, which would otherwise emit a node -> node
+                    // edge (e.g. DELETE -> DELETE).
+                    if source_id == curr_id {
+                        continue;
+                    }
 
                     let edge_key = (source_id, curr_id, kind.clone());
                     if !visited_edges.contains(&edge_key) {

@@ -182,9 +182,9 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         (jsx_opening_element (identifier) @jsx_element)
         (jsx_self_closing_element (identifier) @jsx_element)
         (jsx_expression (identifier) @call_name)
-        (jsx_expression (member_expression property: (property_identifier) @call_name))
+        (jsx_expression (member_expression property: (property_identifier) @method_call))
         (call_expression function: (identifier) @call_name)
-        (call_expression function: (member_expression property: (property_identifier) @call_name))
+        (call_expression function: (member_expression property: (property_identifier) @method_call))
         (string (string_fragment) @route_string)
     ";
     
@@ -231,6 +231,19 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                         import_kind = "calls".to_string();
                     }
                     line_number = node.start_position().row + 1;
+                } else if *capture_kind == "method_call" {
+                    // Member-access invocation (obj.foo()). Tracked under a
+                    // distinct kind so the linker never resolves it against a
+                    // same-named top-level symbol — that bare-name matching is
+                    // what produced phantom edges like `query.delete()` ->
+                    // exported `DELETE`.
+                    let name = text.trim().to_string();
+                    if crate::utils::is_noisy_call_name(&name) {
+                        continue;
+                    }
+                    import_name = name.clone();
+                    import_kind = "method_call".to_string();
+                    line_number = node.start_position().row + 1;
                 } else if *capture_kind == "route_string" {
                     let val = text.trim().to_string();
                     if val.starts_with('/') {
@@ -252,4 +265,36 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         }
     }
     imports
+}
+
+#[cfg(test)]
+mod call_resolution_tests {
+    use super::*;
+    use crate::frontend::LanguageFrontend;
+
+    // #2 — call_resolution_fixture: a member-access call (obj.foo()) must be
+    // tagged "method_call" so the linker never resolves it to a same-named
+    // top-level symbol, while a free call (foo()) stays "calls".
+    #[test]
+    fn member_calls_tagged_method_call_free_calls_tagged_calls() {
+        let src = r#"
+            export function GET() {
+                helper();
+                query.deleteRoom();
+            }
+            function helper() {}
+        "#;
+        let (_meta, _symbols, imports) = JavaScriptFrontend
+            .parse_and_extract(src, "route.js")
+            .expect("parse should succeed");
+
+        let kind_of = |name: &str| imports.iter()
+            .find(|i| i.name == name)
+            .and_then(|i| i.kind.clone());
+
+        assert_eq!(kind_of("helper").as_deref(), Some("calls"),
+            "free call helper() should be a 'calls' edge");
+        assert_eq!(kind_of("deleteRoom").as_deref(), Some("method_call"),
+            "member call query.deleteRoom() should be a 'method_call', not 'calls'");
+    }
 }

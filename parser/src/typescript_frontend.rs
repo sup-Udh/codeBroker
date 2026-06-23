@@ -246,16 +246,16 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             source: (string (string_fragment) @source)
         )
         (call_expression function: (identifier) @call_name)
-        (call_expression function: (member_expression property: (property_identifier) @call_name))
+        (call_expression function: (member_expression property: (property_identifier) @method_call))
         (string (string_fragment) @route_string)
     ");
-    
+
     if is_tsx {
         query_str.push_str("
         (jsx_opening_element (identifier) @jsx_element)
         (jsx_self_closing_element (identifier) @jsx_element)
         (jsx_expression (identifier) @call_name)
-        (jsx_expression (member_expression property: (property_identifier) @call_name))
+        (jsx_expression (member_expression property: (property_identifier) @method_call))
         ");
     }
     
@@ -304,6 +304,19 @@ fn extract_ts_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     } else {
                         import_kind = "calls".to_string();
                     }
+                    line_number = node.start_position().row + 1;
+                } else if *capture_kind == "method_call" {
+                    // Member-access invocation (obj.foo()). Tracked under a
+                    // distinct kind so the linker never resolves it against a
+                    // same-named top-level symbol — that bare-name matching is
+                    // what produced phantom edges like `query.delete()` ->
+                    // exported `DELETE`.
+                    let name = text.trim().to_string();
+                    if crate::utils::is_noisy_call_name(&name) {
+                        continue;
+                    }
+                    import_name = name.clone();
+                    import_kind = "method_call".to_string();
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "route_string" {
                     let val = text.trim().to_string();

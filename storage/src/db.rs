@@ -198,10 +198,41 @@ impl Database {
     /// Pass 2 Helper: Tries to find a physical symbol matching the import name
     pub fn find_symbol_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE LOWER(name) = LOWER(?1) LIMIT 1")?;
-        
+
         // We use query_row because we only expect 0 or 1 result
         let result = stmt.query_row(params![name], |row| row.get(0));
 
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Case-SENSITIVE exact-name symbol lookup, used specifically for call-edge
+    /// resolution. The case-insensitive `find_symbol_id_by_name` is fine for
+    /// import resolution (where casing is usually stable), but for call edges
+    /// it manufactured phantom relationships: a member call like
+    /// `someObject.get()` would resolve to an unrelated top-level `GET` route
+    /// handler purely because the names matched ignoring case. Returns the
+    /// symbol's id and its defining file_id (the caller needs the file_id to
+    /// skip self-referential edges).
+    pub fn find_symbol_exact_with_file(&self, name: &str) -> Result<Option<(i64, i64)>> {
+        let mut stmt = self.conn.prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")?;
+        let result = stmt.query_row(params![name], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)));
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Case-sensitive exact-name lookup restricted to a single file — used to
+    /// resolve a free call to a same-file helper without risking a cross-file
+    /// phantom match.
+    pub fn find_symbol_id_in_file_exact(&self, file_id: i64, name: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1")?;
+        let result = stmt.query_row(params![file_id, name], |row| row.get(0));
         match result {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

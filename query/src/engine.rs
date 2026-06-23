@@ -155,6 +155,30 @@ impl From<&str> for SearchMode {
     }
 }
 
+/// Maps a `SearchResult.confidence` string to a coarse 1-3 level for
+/// `min_confidence` filtering. Confidence strings always lead with "High"/
+/// "Medium"/"Low" except the file-path weak-token bucket ("File Path Match"),
+/// which is intentionally classified as Low rather than left unrecognized —
+/// under-classifying is safer here than accidentally letting a weak match
+/// through a `min_confidence: "medium"` filter.
+fn confidence_level(confidence: &str) -> u8 {
+    if confidence.starts_with("High") { 3 }
+    else if confidence.starts_with("Medium") { 2 }
+    else { 1 }
+}
+
+/// Parses the `min_confidence` tool param ("high" | "medium" | "low") into the
+/// same 1-3 scale as `confidence_level`. Unrecognized or absent values mean
+/// "no filtering" (0), preserving the default flat-list behavior.
+fn min_confidence_level(min_confidence: Option<&str>) -> u8 {
+    match min_confidence.map(|s| s.to_lowercase()).as_deref() {
+        Some("high") => 3,
+        Some("medium") => 2,
+        Some("low") => 1,
+        _ => 0,
+    }
+}
+
 fn search_symbol_names(
     db: &Database,
     query_lower: &str,
@@ -363,6 +387,7 @@ pub fn search_symbols(
     path_scope: Option<&str>,
     mode: SearchMode,
     whole_word: bool,
+    min_confidence: Option<&str>,
 ) -> Result<(Vec<SearchResult>, Option<String>), rusqlite::Error> {
     let start_time = Instant::now();
 
@@ -388,6 +413,13 @@ pub fn search_symbols(
         }
     };
 
+    let pre_filter_count = results.len();
+    let required_level = min_confidence_level(min_confidence);
+    if required_level > 0 {
+        results.retain(|r| confidence_level(&r.confidence) >= required_level);
+    }
+    let filtered_out_by_confidence = required_level > 0 && results.is_empty() && pre_filter_count > 0;
+
     results.sort_by(|a, b| b.score.cmp(&a.score));
     results.truncate(50);
 
@@ -404,7 +436,12 @@ pub fn search_symbols(
         params![keyword, result_count, latency_ms, fallback_used, llm_used, top_result, search_mode_label]
     );
 
-    let reason = if results.is_empty() {
+    let reason = if filtered_out_by_confidence {
+        Some(format!(
+            "Found {} match(es) for \"{}\" but none met min_confidence: \"{}\". Lower min_confidence or omit it to see them.",
+            pre_filter_count, keyword, min_confidence.unwrap_or("")
+        ))
+    } else if results.is_empty() {
         let scoped_symbol_count: i64 = if let Some(scope) = path_scope {
             let pattern = format!("%{}%", scope);
             db.conn.query_row(
@@ -472,7 +509,11 @@ pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Res
     Ok(results)
 }
 
-pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope: Option<&str>) -> Result<Vec<(String, String, i64, String, i32)>, rusqlite::Error> {
+/// Returns ranked matches as tuples of
+/// `(name, abs_path, kind, start_line, preview, score)`. `name` is the matched
+/// symbol's own name (NOT the query) — callers use it to separate exact hits
+/// from fuzzy ones, since `find_symbol` deliberately blends both by score.
+pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope: Option<&str>) -> Result<Vec<(String, String, String, i64, String, i32)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.name, symbols.kind, symbols.start_line, symbols.end_line
          FROM symbols
@@ -522,7 +563,7 @@ pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope:
     candidates.truncate(10); // Return top 10 best matches
     
     let mut results = Vec::new();
-    for (score, path, _name, kind, start_line, end_line) in candidates {
+    for (score, path, name, kind, start_line, end_line) in candidates {
         let abs_path = db.resolve_path(&path);
         // context_lines: 0 is documented as "existence-only" — skip the disk
         // read and source preview entirely so a yes/no location check doesn't
@@ -538,7 +579,7 @@ pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope:
                 }
             }
         }
-        results.push((abs_path, kind, start_line, preview, score));
+        results.push((name, abs_path, kind, start_line, preview, score));
     }
 
     Ok(results)
@@ -620,4 +661,118 @@ pub fn build_project_overview_scoped(db: &Database, path_scope: Option<&str>) ->
         languages,
         top_level_directories: dirs_vec.into_iter().take(20).collect(),
     })
+}
+
+#[cfg(test)]
+mod min_confidence_tests {
+    use super::*;
+
+    fn setup_fixture() -> Database {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+
+        // "room" matches its own name exactly -> High (Exact Match).
+        // "ChatRoom" contains "room" but doesn't start with it -> Medium (Contains Match).
+        // "roof" is a 1-edit-distance fuzzy match with no substring overlap -> Low (Fuzzy Match).
+        let file_id = db.insert_file("rooms.ts", "fixturehash").unwrap();
+        for name in ["room", "ChatRoom", "roof"] {
+            db.insert_symbol(file_id, &graph::SymbolNode {
+                name: name.to_string(),
+                kind: "function".to_string(),
+                prop_type: None,
+                start_line: 1,
+                end_line: 1,
+                start_byte: 0,
+                end_byte: 0,
+                signature: None,
+            }).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn confidence_level_maps_known_prefixes() {
+        assert_eq!(confidence_level("High (Exact Match)"), 3);
+        assert_eq!(confidence_level("Medium (Contains Match)"), 2);
+        assert_eq!(confidence_level("Low (Fuzzy Match)"), 1);
+        // Unrecognized strings (e.g. "File Path Match") classify as Low
+        // rather than being silently excluded from every filter tier.
+        assert_eq!(confidence_level("File Path Match"), 1);
+    }
+
+    #[test]
+    fn min_confidence_level_parses_known_tiers_case_insensitively() {
+        assert_eq!(min_confidence_level(Some("high")), 3);
+        assert_eq!(min_confidence_level(Some("HIGH")), 3);
+        assert_eq!(min_confidence_level(Some("medium")), 2);
+        assert_eq!(min_confidence_level(Some("low")), 1);
+        assert_eq!(min_confidence_level(None), 0);
+        assert_eq!(min_confidence_level(Some("garbage")), 0);
+    }
+
+    #[test]
+    fn default_search_returns_all_confidence_tiers_unfiltered() {
+        let db = setup_fixture();
+        let (results, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, None).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"room"));
+        assert!(names.contains(&"ChatRoom"));
+        assert!(names.contains(&"roof"), "default (no min_confidence) must not drop any tier, got: {:?}", names);
+    }
+
+    #[test]
+    fn min_confidence_high_drops_medium_and_low_noise() {
+        let db = setup_fixture();
+        let (results, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, Some("high")).unwrap();
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["room"], "min_confidence: \"high\" must keep only the exact match");
+    }
+
+    #[test]
+    fn min_confidence_filtering_does_not_change_result_count_when_unset() {
+        let db = setup_fixture();
+        let (unfiltered, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, None).unwrap();
+        let (explicit_low, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, Some("low")).unwrap();
+        assert_eq!(unfiltered.len(), explicit_low.len(), "every tier here is >= Low, so min_confidence: \"low\" should be a no-op");
+    }
+}
+
+#[cfg(test)]
+mod find_symbol_tests {
+    use super::*;
+
+    // #3 — exact_vs_fuzzy_fixture: find_symbol now returns the matched symbol's
+    // own NAME (first tuple field), which the MCP layer uses to split
+    // exact_matches from fuzzy_matches. The exact hit must also outrank fuzzy.
+    #[test]
+    fn find_symbol_returns_names_and_ranks_exact_first() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let file_id = db.insert_file("handlers.ts", "h").unwrap();
+        for name in ["GET", "GetStarted", "GetGraphHelpers"] {
+            db.insert_symbol(file_id, &graph::SymbolNode {
+                name: name.to_string(),
+                kind: "function".to_string(),
+                prop_type: None,
+                start_line: 1,
+                end_line: 1,
+                start_byte: 0,
+                end_byte: 0,
+                signature: None,
+            }).unwrap();
+        }
+
+        // context_lines = 0 -> no disk reads needed for previews.
+        let results = find_symbol(&db, "GET", 0, None).unwrap();
+        let names: Vec<&str> = results.iter().map(|(name, ..)| name.as_str()).collect();
+        assert!(names.contains(&"GET"));
+        assert!(names.contains(&"GetStarted"));
+
+        // Exact match must be first (highest score).
+        assert_eq!(results.first().map(|(n, ..)| n.as_str()), Some("GET"));
+
+        // The classification rule the MCP handler applies: exactly one exact.
+        let exact: Vec<&str> = names.iter().filter(|n| n.to_lowercase() == "get").copied().collect();
+        assert_eq!(exact, vec!["GET"], "only GET is an exact match");
+    }
 }

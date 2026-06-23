@@ -13,8 +13,15 @@ pub struct ContextObject {
     pub directive: Option<String>,
     pub decorators: Vec<String>,
 
+    /// Files that `import` this symbol — cross-file only. A file never
+    /// imports its own symbols, so this is structurally blind to same-file
+    /// callers; see `same_file_callers` for those.
     pub reverse_dependencies: Vec<String>, // files that rely on symbols
     pub siblings: Vec<String>, // symbols that are defubed ub tge exact same file
+    /// Sibling symbols (same file) whose own source body calls this symbol.
+    /// Empty `reverse_dependencies` + non-empty `same_file_callers` means
+    /// this symbol is a private helper used locally, NOT dead code.
+    pub same_file_callers: Vec<String>,
     pub forward_dependencies: Vec<String>, // local symbols this file imports
     pub external_imports: Vec<String>, // unresolved or third-party package imports
     pub prop_interfaces: Vec<crate::retrieval::SymbolSourceResult>, // bundled prop interfaces
@@ -37,6 +44,30 @@ pub struct ContextObject {
     /// may be wrong when this is true — re-run reindex_workspace (or
     /// `codebroker reindex-incremental` on this file) before trusting them.
     pub stale: bool,
+}
+
+/// True if `haystack` contains `needle` (a symbol name followed by '(') at a
+/// real call-site boundary, i.e. not as a suffix of a longer identifier — so
+/// a needle of "bar(" doesn't false-positive inside "fooBar(".
+fn contains_call(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut start = 0;
+    while let Some(rel_pos) = haystack[start..].find(needle) {
+        let pos = start + rel_pos;
+        let boundary_ok = pos == 0 || {
+            let prev = bytes[pos - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'_')
+        };
+        if boundary_ok {
+            return true;
+        }
+        start = pos + needle_bytes.len();
+        if start >= bytes.len() {
+            break;
+        }
+    }
+    false
 }
 
 impl ContextObject {
@@ -116,30 +147,52 @@ impl ContextObject {
         // A file edited since indexing shifts every byte offset (and often
         // line numbers) for symbols defined in it — surface that instead of
         // letting a caller silently trust a `line_number` that no longer
-        // points at this symbol.
-        let stale = match &indexed_content_hash {
-            Some(stored_hash) => std::fs::read(db.resolve_path(&path))
-                .map(|content| storage::hash_content(&content) != *stored_hash)
-                .unwrap_or(false),
-            None => false,
+        // points at this symbol. Read once here and reuse below for the
+        // same-file-caller scan, instead of hitting disk twice.
+        let live_content = std::fs::read(db.resolve_path(&path)).ok();
+        let stale = match (&indexed_content_hash, &live_content) {
+            (Some(stored_hash), Some(content)) => storage::hash_content(content) != *stored_hash,
+            _ => false,
         };
 
         // 2. Fetch the Blast Radius / Reverse Dependencies (Distance-1 Context)
         // We can completely reuse the awesome engine we built in Phase 1!
+        // NOTE: this is cross-file only (it's backed by `imports` edges, and a
+        // file never imports its own symbols) — same-file callers are a
+        // distinct concept, computed separately as `same_file_callers` below.
         let rev_deps = crate::engine::find_dependents(db, symbol_name)
             .unwrap_or_else(|_| Vec::new());
 
         // 3. Fetch the Siblings (Immediate Neighborhood Context)
         // We want to know what else lives in the exact same file, excluding itself and raw imports.
         let mut sib_stmt = db.conn.prepare(
-            "SELECT name FROM symbols 
+            "SELECT name, start_byte, end_byte FROM symbols
              WHERE file_id = ?1 AND name != ?2 AND kind != 'import'"
         )?;
-        
+
         let mut sib_rows = sib_stmt.query(rusqlite::params![file_id, symbol_name])?;
         let mut siblings = Vec::new();
+        // A sibling whose own source body contains a call to this symbol —
+        // the case `reverse_dependencies` structurally cannot see, since it
+        // never inspects code within the defining file itself. Without this,
+        // a private helper called only by a sibling in the same file reports
+        // zero dependents anywhere, indistinguishable from genuinely dead code.
+        let mut same_file_callers = Vec::new();
+        let call_needle = format!("{}(", symbol_name);
         while let Some(row) = sib_rows.next()? {
-            siblings.push(row.get(0)?);
+            let sib_name: String = row.get(0)?;
+            siblings.push(sib_name.clone());
+
+            if let Some(content) = &live_content {
+                let start_byte: i64 = row.get(1)?;
+                let end_byte: i64 = row.get(2)?;
+                if start_byte >= 0 && end_byte as usize <= content.len() && start_byte < end_byte {
+                    let sib_source = String::from_utf8_lossy(&content[start_byte as usize..end_byte as usize]);
+                    if contains_call(&sib_source, &call_needle) {
+                        same_file_callers.push(sib_name);
+                    }
+                }
+            }
         }
 
         // 4. Fetch Forward Dependencies (Local symbols this file imports)
@@ -316,6 +369,7 @@ impl ContextObject {
             decorators,
             reverse_dependencies: rev_deps,
             siblings,
+            same_file_callers,
             forward_dependencies,
             external_imports,
             prop_interfaces,
@@ -327,5 +381,98 @@ impl ContextObject {
             graph_indexed: total_edges > 0,
             stale,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a throwaway project at a temp dir with `route.ts`'s exact
+    /// content, indexes its two symbols by hand (no parser dependency needed
+    /// — the byte ranges are computed directly off the known fixture text),
+    /// and returns an open `Database` pointed at it.
+    fn setup_fixture() -> (Database, std::path::PathBuf) {
+        let unique = format!(
+            "codebroker_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let project_root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(project_root.join(".codebroker")).unwrap();
+
+        let source = "function generateRoomId(): string {\n  return \"x\";\n}\n\nexport async function GET(request: Request) {\n  const id = generateRoomId();\n  return id;\n}\n";
+        std::fs::write(project_root.join("route.ts"), source).unwrap();
+
+        let db_path = project_root.join(".codebroker").join("codebroker.db");
+        let db = Database::new(db_path.to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+
+        let content_hash = storage::hash_content(source.as_bytes());
+        let file_id = db.insert_file("route.ts", &content_hash).unwrap();
+
+        let helper_start = source.find("function generateRoomId").unwrap();
+        let helper_end = source.find("\n\nexport async function GET").unwrap();
+        db.insert_symbol(file_id, &graph::SymbolNode {
+            name: "generateRoomId".to_string(),
+            kind: "function".to_string(),
+            prop_type: None,
+            start_line: 1,
+            end_line: 3,
+            start_byte: helper_start,
+            end_byte: helper_end,
+            signature: Some("function generateRoomId(): string".to_string()),
+        }).unwrap();
+
+        let handler_start = source.find("export async function GET").unwrap();
+        let handler_end = source.len();
+        db.insert_symbol(file_id, &graph::SymbolNode {
+            name: "GET".to_string(),
+            kind: "function".to_string(),
+            prop_type: None,
+            start_line: 5,
+            end_line: 8,
+            start_byte: handler_start,
+            end_byte: handler_end,
+            signature: Some("export async function GET(request: Request)".to_string()),
+        }).unwrap();
+
+        (db, project_root)
+    }
+
+    /// Regression test: a private helper called only by a sibling function
+    /// in the same file must NOT report empty dependents everywhere — that's
+    /// indistinguishable from dead code and an agent trusting it could
+    /// delete load-bearing logic. `reverse_dependencies` (cross-file/imports
+    /// only) staying empty is correct; `same_file_callers` must catch it.
+    #[test]
+    fn same_file_caller_is_not_reported_as_dead_code() {
+        let (db, project_root) = setup_fixture();
+
+        let context = ContextObject::assemble(&db, "generateRoomId").unwrap().unwrap();
+
+        assert!(
+            context.reverse_dependencies.is_empty(),
+            "reverse_dependencies is import-based and cross-file only; this fixture has no importers"
+        );
+        assert_eq!(
+            context.same_file_callers,
+            vec!["GET".to_string()],
+            "GET calls generateRoomId() in the same file — must show up here even though reverse_dependencies is empty"
+        );
+
+        std::fs::remove_dir_all(&project_root).ok();
+    }
+
+    #[test]
+    fn unreferenced_symbol_has_no_same_file_callers() {
+        let (db, project_root) = setup_fixture();
+
+        let context = ContextObject::assemble(&db, "GET").unwrap().unwrap();
+
+        assert!(context.same_file_callers.is_empty(), "nothing in this fixture calls GET");
+
+        std::fs::remove_dir_all(&project_root).ok();
     }
 }

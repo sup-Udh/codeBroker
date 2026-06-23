@@ -102,6 +102,28 @@ pub fn reindex_paths(db: &Database, project_root: &str, changed_paths: &[String]
             continue;
         }
         let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
+
+        // Call edges use case-sensitive, scope-aware resolution (no global
+        // bare-name fallback), matching the full `codebroker init` linker —
+        // otherwise a member call like `query.delete()` re-links to an
+        // exported `DELETE` on every incremental reindex. See resolve_call_edge.
+        if edge_kind == "calls" || edge_kind == "method_call" {
+            if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, &import_name) {
+                if db.insert_edge(source_file_id, local_id, &edge_kind).is_ok() {
+                    stats.edges_created += 1;
+                }
+            } else if edge_kind == "calls" {
+                if let Ok(Some((target_id, target_file_id))) = db.find_symbol_exact_with_file(&import_name) {
+                    if target_file_id != source_file_id
+                        && db.insert_edge(source_file_id, target_id, &edge_kind).is_ok()
+                    {
+                        stats.edges_created += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
         let words: Vec<&str> = import_name.split(|c: char| !c.is_alphanumeric()).collect();
         for word in words {
             if word.is_empty() {

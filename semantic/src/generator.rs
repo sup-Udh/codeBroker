@@ -172,7 +172,11 @@ impl<'a> ProjectOverviewGenerator<'a> {
 /// instruction asked for, or a hallucinated reference to something that
 /// doesn't exist — the caller must check which before trusting the patch.
 pub struct PatchOutput {
+    /// Raw unified diff, Markdown fences stripped — pipes straight into
+    /// `git apply` / `patch` with no further processing.
     pub diff: String,
+    /// The same diff wrapped in a ```diff fence, for human-readable display.
+    pub rendered_diff: String,
     pub introduced_identifiers: Vec<String>,
 }
 
@@ -203,16 +207,25 @@ fn extract_identifiers(text: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Blanks out the contents of '...'/"..."/`...` string literals (best-effort,
-/// no escape handling) before identifier extraction. Without this, words
-/// inside a human-readable error message like `throw new Error("Division by
-/// zero")` get flagged as "introduced identifiers" even though they're just
-/// English prose, not code references — pure noise on the one signal this
-/// tool exists to provide.
+/// Blanks out the contents of string literals AND comments (best-effort, no
+/// escape handling) before identifier extraction. Without this, words inside a
+/// human-readable error message like `throw new Error("Division by zero")`, or
+/// an explanatory comment like `// use cryptographically secure randomness`,
+/// get flagged as "introduced identifiers" even though they're English prose,
+/// not code references — pure noise on the one signal this tool exists to
+/// provide. Handles `'`/`"`/`` ` `` strings, `//` and `#` line comments, and
+/// `/* ... */` block comments (single-line; the diff is processed line by line).
 fn strip_string_literals(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut quote: Option<char> = None;
-    for c in line.chars() {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let chars: Vec<char> = line.chars().collect();
+    // Operate on chars but peek with a simple index; identifiers are ASCII so
+    // byte/char alignment for the comment markers we look for is fine.
+    let _ = bytes;
+    while i < chars.len() {
+        let c = chars[i];
         match quote {
             Some(q) => {
                 if c == q {
@@ -220,17 +233,61 @@ fn strip_string_literals(line: &str) -> String {
                 } else {
                     out.push(' ');
                 }
+                i += 1;
             }
             None => {
+                // Line comments: // (JS/TS/Rust) or # (Python) — blank the rest.
+                if c == '#' {
+                    break;
+                }
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    break;
+                }
+                // Block comment /* ... */ — blank until the closing */ (or EOL).
+                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 2;
+                    while i < chars.len() {
+                        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
                 if c == '\'' || c == '"' || c == '`' {
                     quote = Some(c);
                 } else {
                     out.push(c);
                 }
+                i += 1;
             }
         }
     }
     out
+}
+
+/// Strips a Markdown code fence (```diff ... ```), if present, from an LLM
+/// patch response so the returned `diff` is a raw unified diff that pipes
+/// straight into `git apply`/`patch`. Models frequently wrap diffs in fences
+/// despite instructions not to; leaving them in both breaks `patch` and forces
+/// the caller to strip them by hand. Returns the inner content unchanged when
+/// no fence is present.
+fn strip_markdown_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return text.to_string();
+    }
+    let mut lines: Vec<&str> = trimmed.lines().collect();
+    // Drop the opening fence line (``` or ```diff etc).
+    if lines.first().map(|l| l.trim_start().starts_with("```")).unwrap_or(false) {
+        lines.remove(0);
+    }
+    // Drop the closing fence line if present.
+    if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 impl<'a> PatchGenerator<'a> {
@@ -282,7 +339,10 @@ impl<'a> PatchGenerator<'a> {
             .ok_or("Failed to assemble context")?;
 
         let prompt = build_patch_prompt(symbol_name, &full_file_source, &context, instruction);
-        let (patch, _) = self.provider.generate_summary(&prompt, 300, 8192)?;
+        let (raw_patch, _) = self.provider.generate_summary(&prompt, 300, 8192)?;
+        // Models often wrap the diff in a Markdown fence despite instructions;
+        // strip it so `diff` is directly consumable by `git apply`/`patch`.
+        let patch = strip_markdown_fence(&raw_patch);
 
         // Grounding check: collect every identifier that's actually known —
         // from the file itself plus the graph context — and flag anything
@@ -312,7 +372,8 @@ impl<'a> PatchGenerator<'a> {
             }
         }
 
-        Ok(PatchOutput { diff: patch, introduced_identifiers: introduced })
+        let rendered_diff = format!("```diff\n{}\n```", patch.trim_end());
+        Ok(PatchOutput { diff: patch, rendered_diff, introduced_identifiers: introduced })
     }
 
     /// Resolves the absolute file path a symbol lives in, scoped by an
@@ -347,5 +408,69 @@ impl<'a> PatchGenerator<'a> {
     /// against without re-deriving it from generate_patch's internals.
     pub fn resolve_file_path(&self, symbol_name: &str) -> Result<String, String> {
         self.resolve_file_path_scoped(symbol_name, None)
+    }
+}
+
+#[cfg(test)]
+mod patch_helper_tests {
+    use super::*;
+
+    // #5 — diff_output_fixture: a fenced LLM response must come back as a raw
+    // unified diff (no ``` markers) so it pipes into git apply / patch.
+    #[test]
+    fn strip_markdown_fence_removes_diff_fence() {
+        let fenced = "```diff\n--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new\n```";
+        let raw = strip_markdown_fence(fenced);
+        assert!(!raw.contains("```"), "fences must be stripped: {:?}", raw);
+        assert!(raw.starts_with("--- a/foo.ts"));
+        assert!(raw.trim_end().ends_with("+new"));
+    }
+
+    #[test]
+    fn strip_markdown_fence_leaves_unfenced_diff_untouched() {
+        let raw = "--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new";
+        assert_eq!(strip_markdown_fence(raw), raw);
+    }
+
+    // #6 — introduced_identifier_fixture: prose inside comments and string
+    // literals must NOT be scanned as identifiers.
+    #[test]
+    fn strip_string_literals_blanks_line_comments() {
+        let line = "const x = 1; // use cryptographically secure randomness";
+        let cleaned = strip_string_literals(line);
+        assert!(!cleaned.contains("cryptographically"));
+        assert!(!cleaned.contains("secure"));
+        assert!(!cleaned.contains("randomness"));
+        assert!(cleaned.contains("const x"));
+    }
+
+    #[test]
+    fn strip_string_literals_blanks_python_and_block_comments() {
+        assert!(!strip_string_literals("y = 2  # explanatory prose here").contains("prose"));
+        let block = "foo(); /* hidden explanation words */ bar();";
+        let cleaned = strip_string_literals(block);
+        assert!(!cleaned.contains("explanation"));
+        assert!(cleaned.contains("foo"));
+        assert!(cleaned.contains("bar"));
+    }
+
+    #[test]
+    fn strip_string_literals_blanks_string_contents() {
+        let line = r#"throw new Error("Division by zero occurred")"#;
+        let cleaned = strip_string_literals(line);
+        assert!(!cleaned.contains("Division"));
+        assert!(!cleaned.contains("occurred"));
+        assert!(cleaned.contains("Error"));
+    }
+
+    // #14 — scope_grounded check: a real new code identifier IS extracted (so it
+    // can be flagged as introduced), while comment/string prose is not.
+    #[test]
+    fn extract_identifiers_picks_code_not_prose() {
+        let added_code = strip_string_literals("const setSubmitting = useState(false); // toggles spinner");
+        let ids = extract_identifiers(&added_code);
+        assert!(ids.contains("setSubmitting"), "real code identifier must be extracted: {:?}", ids);
+        assert!(!ids.contains("toggles"), "comment prose must not be extracted");
+        assert!(!ids.contains("spinner"));
     }
 }
