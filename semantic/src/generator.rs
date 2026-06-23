@@ -403,9 +403,9 @@ impl<'a> PatchGenerator<'a> {
         Ok(self.db.resolve_path(&file_path))
     }
 
-    /// Resolves the absolute file path a symbol lives in, so callers (e.g. the
-    /// `apply: true` path in generate_patch) know which file to run the diff
-    /// against without re-deriving it from generate_patch's internals.
+    /// Resolves the absolute file path a symbol lives in. Read-only helper for
+    /// callers that need to locate a symbol's file (CodeBroker itself never
+    /// writes patches to disk — that's the caller's job via native tooling).
     pub fn resolve_file_path(&self, symbol_name: &str) -> Result<String, String> {
         self.resolve_file_path_scoped(symbol_name, None)
     }

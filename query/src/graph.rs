@@ -578,14 +578,14 @@ pub fn architectural_hotspots(db: &Database, limit: usize, path_scope: Option<&s
     })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CycleNode {
     pub name: String,
     pub kind: String,
     pub file_path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DependencyCycle {
     pub length: usize,
     /// True when this cycle spans more than one distinct file (a real
@@ -610,6 +610,11 @@ pub struct DependencyCyclesResponse {
     pub nodes_scanned: usize,
     pub edges_scanned: usize,
     pub cycles: Vec<DependencyCycle>,
+    /// Up to 3 representative same-file cycles, always populated when
+    /// same_file_cycles_found > 0 — even when include_same_file is false and
+    /// they're therefore excluded from `cycles` — so a caller can sanity-check
+    /// the same_file_cycles_found count without a second query.
+    pub same_file_examples: Vec<DependencyCycle>,
 }
 
 pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, include_same_file: bool) -> Result<DependencyCyclesResponse> {
@@ -618,11 +623,21 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, 
     const MAX_NODES_PER_CYCLE: usize = 40;
 
     let mut adj: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    // Build a true symbol->symbol graph from edges attributed to their source
+    // symbol. The previous query joined `symbols.file_id = edges.source_file_id`,
+    // which made EVERY symbol in a file the source of EVERY edge leaving that
+    // file — a cartesian product that manufactured same-file "cycles" (a file
+    // with k symbols and e edges produced up to k*e fake adjacencies). Using
+    // source_symbol_id collapses each edge to exactly one source symbol.
+    // Edges with a NULL source_symbol_id (top-level imports, or any DB indexed
+    // before this column existed) are excluded — they can't be placed at symbol
+    // granularity, and including them is precisely what produced the noise.
     let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, edges.target_symbol_id, files.path
-         FROM symbols
-         JOIN edges ON symbols.file_id = edges.source_file_id
-         JOIN files ON symbols.file_id = files.id"
+        "SELECT edges.source_symbol_id, edges.target_symbol_id, files.path
+         FROM edges
+         JOIN symbols ON edges.source_symbol_id = symbols.id
+         JOIN files ON symbols.file_id = files.id
+         WHERE edges.source_symbol_id IS NOT NULL"
     )?;
 
     let mut rows = stmt.query([])?;
@@ -635,6 +650,13 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, 
             if !path.contains(scope) {
                 continue;
             }
+        }
+        // A symbol referencing itself (direct recursion, or a recursive type
+        // referencing its own name) is not a dependency cycle in the sense
+        // callers care about; drop these self-edges so they don't register as
+        // length-1 cycles.
+        if source_id == target_id {
+            continue;
         }
         adj.entry(source_id).or_default().push(target_id);
         edges_scanned += 1;
@@ -761,6 +783,10 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, 
     let cross_file_cycles_found = cross_file_cycles.len();
     let same_file_cycles_found = same_file_cycles.len();
 
+    // Always surface a few same-file cycles for sanity-checking the count,
+    // even when they're excluded from `cycles` (include_same_file=false).
+    let same_file_examples: Vec<DependencyCycle> = same_file_cycles.iter().take(3).cloned().collect();
+
     // Cross-file cycles are the higher-signal result, so they always come
     // first; same-file ones are only included (and only count toward the
     // limit) when the caller explicitly opts in.
@@ -783,6 +809,7 @@ pub fn dependency_cycles(db: &Database, limit: usize, path_scope: Option<&str>, 
         nodes_scanned,
         edges_scanned,
         cycles,
+        same_file_examples,
     })
 }
 
@@ -985,4 +1012,121 @@ pub fn graph_subtree(db: &Database, root_symbol: &str, depth: usize, max_nodes: 
         nodes,
         edges,
     })
+}
+
+#[cfg(test)]
+mod dependency_cycles_tests {
+    use super::*;
+
+    fn sym(db: &Database, file_id: i64, name: &str, start: i64, end: i64) -> i64 {
+        db.insert_symbol(file_id, &graph::SymbolNode {
+            name: name.to_string(),
+            kind: "function".to_string(),
+            prop_type: None,
+            start_line: start as usize,
+            end_line: end as usize,
+            start_byte: 0,
+            end_byte: 0,
+            signature: None,
+        }).unwrap()
+    }
+
+    // #1 Fixture A — same-file mutual recursion a()<->b() is exactly ONE cycle.
+    #[test]
+    fn fixture_a_mutual_recursion_is_one_cycle() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f = db.insert_file("recur.ts", "h").unwrap();
+        let a = sym(&db, f, "a", 1, 3);
+        let b = sym(&db, f, "b", 5, 7);
+        // a calls b, b calls a — attributed to their source symbols.
+        db.insert_edge_attributed(f, Some(a), b, "calls").unwrap();
+        db.insert_edge_attributed(f, Some(b), a, "calls").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, true).unwrap();
+        assert_eq!(resp.cycles_found, 1, "a<->b is exactly one cycle");
+        assert_eq!(resp.same_file_cycles_found, 1);
+        assert_eq!(resp.cross_file_cycles_found, 0);
+        // same_file_examples populated for sanity-checking.
+        assert_eq!(resp.same_file_examples.len(), 1);
+    }
+
+    // #1 Fixture B (recursive type) — a symbol referencing itself is NOT a cycle.
+    #[test]
+    fn fixture_b_self_reference_is_not_a_cycle() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f = db.insert_file("tree.ts", "h").unwrap();
+        let t = sym(&db, f, "TreeNode", 1, 3);
+        // TreeNode references TreeNode (recursive type) -> self-edge.
+        db.insert_edge_attributed(f, Some(t), t, "calls").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, true).unwrap();
+        assert_eq!(resp.cycles_found, 0, "self-reference must not be a cycle");
+    }
+
+    // #1 Fixture B (parent/child render) — one-directional edge is NOT a cycle.
+    #[test]
+    fn fixture_b_parent_child_render_is_not_a_cycle() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f = db.insert_file("ui.tsx", "h").unwrap();
+        let parent = sym(&db, f, "Parent", 1, 5);
+        let child = sym(&db, f, "Child", 7, 9);
+        // Parent renders Child; Child does NOT render Parent.
+        db.insert_edge_attributed(f, Some(parent), child, "renders_component").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, true).unwrap();
+        assert_eq!(resp.cycles_found, 0, "one-directional render is not a cycle");
+    }
+
+    // #1 Regression — the old cartesian bug: co-located symbols sharing a file
+    // must NOT manufacture cycles. With per-symbol attribution, a single a->b
+    // edge yields zero cycles even though a, b, c all live in one file.
+    #[test]
+    fn colocated_symbols_do_not_manufacture_cycles() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f = db.insert_file("util.ts", "h").unwrap();
+        let a = sym(&db, f, "a", 1, 3);
+        let b = sym(&db, f, "b", 5, 7);
+        let _c = sym(&db, f, "c", 9, 11);
+        db.insert_edge_attributed(f, Some(a), b, "calls").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, true).unwrap();
+        assert_eq!(resp.cycles_found, 0, "a->b alone is not a cycle");
+    }
+
+    // #1 — genuine cross-file cycle still detected and classified.
+    #[test]
+    fn cross_file_cycle_detected() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f1 = db.insert_file("a.ts", "h").unwrap();
+        let f2 = db.insert_file("b.ts", "h").unwrap();
+        let a = sym(&db, f1, "a", 1, 3);
+        let b = sym(&db, f2, "b", 1, 3);
+        db.insert_edge_attributed(f1, Some(a), b, "calls").unwrap();
+        db.insert_edge_attributed(f2, Some(b), a, "calls").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, false).unwrap();
+        assert_eq!(resp.cross_file_cycles_found, 1);
+        assert_eq!(resp.cycles_returned, 1, "cross-file cycle returned even with include_same_file=false");
+    }
+
+    // #1 — edges with no source attribution (NULL) are ignored, not exploded.
+    #[test]
+    fn unattributed_edges_are_ignored() {
+        let db = Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let f = db.insert_file("legacy.ts", "h").unwrap();
+        let a = sym(&db, f, "a", 1, 3);
+        let b = sym(&db, f, "b", 5, 7);
+        // Simulate a pre-migration / top-level-import edge: no source symbol.
+        db.insert_edge_attributed(f, None, b, "imports").unwrap();
+        db.insert_edge_attributed(f, None, a, "imports").unwrap();
+
+        let resp = dependency_cycles(&db, 50, None, true).unwrap();
+        assert_eq!(resp.cycles_found, 0, "NULL-source edges must not form cycles");
+    }
 }

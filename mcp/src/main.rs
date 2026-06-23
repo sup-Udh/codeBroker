@@ -77,6 +77,34 @@ fn get_file_hint<'a>(arguments: &'a serde_json::Map<String, serde_json::Value>) 
         .and_then(|s| s.as_str())
 }
 
+/// Decides whether impact_analysis should take the cheap, deterministic path
+/// (no LLM): true when the symbol's total dependency count is below the
+/// threshold, OR when no model is available at all. Kept as a standalone fn so
+/// the cheap/LLM boundary is unit-testable without the full MCP request loop.
+fn use_cheap_impact_path(total_dependencies: usize, risk_threshold: usize, has_hf_token: bool) -> bool {
+    total_dependencies < risk_threshold || !has_hf_token
+}
+
+/// Builds the JSON result entry for one generated patch. CodeBroker is
+/// discovery/analysis only and never writes to disk, so this carries only
+/// review data (diff / rendered_diff / introduced_identifiers) — there is no
+/// `apply`/`applied` field and no code path here can mutate a file. Extracted
+/// so that "generate_patch never reports having written anything" is testable.
+fn build_patch_entry(symbol: &str, diff: &str, rendered_diff: &str, introduced_identifiers: &[String]) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "symbol": symbol,
+        "diff": diff,
+        "rendered_diff": rendered_diff,
+        "introduced_identifiers": introduced_identifiers,
+    });
+    if !introduced_identifiers.is_empty() {
+        entry["warning"] = serde_json::Value::String(
+            "introduced_identifiers were not found in the target file or its known graph context. Verify each one actually exists (or is intentionally new) before trusting/applying this patch.".to_string()
+        );
+    }
+    entry
+}
+
 /// Adds an approximate `response_size_hint` field to a JSON object response,
 /// so a calling agent can decide whether to drill deeper or stop without
 /// guessing from raw JSON length. Deliberately cheap (char_count / 4, the
@@ -92,6 +120,66 @@ fn add_response_size_hint(value: &mut serde_json::Value) {
             "char_count": char_count,
             "approx_tokens": approx_tokens
         }));
+    }
+}
+
+#[cfg(test)]
+mod impact_analysis_tests {
+    use super::*;
+
+    // #2 — small symbols take the cheap (no-LLM) path; large ones use the LLM.
+    #[test]
+    fn cheap_path_below_threshold() {
+        // 2 total deps, threshold 5, model available -> cheap path.
+        assert!(use_cheap_impact_path(2, 5, true));
+    }
+
+    #[test]
+    fn llm_path_at_or_above_threshold() {
+        // 5 total deps, threshold 5, model available -> LLM path.
+        assert!(!use_cheap_impact_path(5, 5, true));
+        assert!(!use_cheap_impact_path(9, 5, true));
+    }
+
+    #[test]
+    fn cheap_path_when_no_model_even_if_large() {
+        // No HF token -> always deterministic, regardless of size.
+        assert!(use_cheap_impact_path(50, 5, false));
+    }
+
+    #[test]
+    fn threshold_is_configurable() {
+        // Raising the threshold keeps a mid-size symbol on the cheap path.
+        assert!(use_cheap_impact_path(9, 20, true));
+        // Lowering it (to 0) forces the LLM path for any symbol.
+        assert!(!use_cheap_impact_path(1, 0, true));
+    }
+}
+
+#[cfg(test)]
+mod generate_patch_tests {
+    use super::*;
+
+    // #3 — generate_patch is review-only: its result entry must never carry an
+    // apply/applied field, only diff review data.
+    #[test]
+    fn patch_entry_has_no_apply_or_applied_field() {
+        let entry = build_patch_entry("foo", "--- a\n+++ b\n", "```diff\n```", &[]);
+        let obj = entry.as_object().unwrap();
+        assert!(!obj.contains_key("apply"), "no apply field");
+        assert!(!obj.contains_key("applied"), "no applied field");
+        assert!(!obj.contains_key("apply_error"), "no apply_error field");
+        assert!(obj.contains_key("diff"));
+        assert!(obj.contains_key("rendered_diff"));
+        assert!(obj.contains_key("introduced_identifiers"));
+    }
+
+    #[test]
+    fn patch_entry_warns_when_identifiers_introduced() {
+        let entry = build_patch_entry("foo", "d", "r", &["setSubmitting".to_string()]);
+        assert!(entry.get("warning").is_some());
+        // Still no write-related field.
+        assert!(entry.as_object().unwrap().get("applied").is_none());
     }
 }
 
@@ -172,47 +260,6 @@ fn check_symbol_ambiguity(db: &storage::Database, symbol: &str, file_hint: Optio
         }).to_string())
     } else {
         None
-    }
-}
-
-/// Applies an LLM-generated unified diff to `file_path` using the system `patch`
-/// binary, passing the target file explicitly as the "originalfile" argument so
-/// the patch lands on the right file regardless of whatever path headers the
-/// LLM put in the diff text. Returns Err (no changes made) if `patch` rejects
-/// the diff as malformed/non-applying — the caller still has the raw `diff`
-/// text to apply manually in that case.
-fn apply_unified_diff(file_path: &str, diff_text: &str) -> Result<(), String> {
-    use std::io::Write;
-    let mut tmp_path = std::env::temp_dir();
-    tmp_path.push(format!("codebroker_patch_{}_{}.diff", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
-
-    {
-        let mut f = std::fs::File::create(&tmp_path).map_err(|e| format!("Failed to write temp diff file: {}", e))?;
-        f.write_all(diff_text.as_bytes()).map_err(|e| format!("Failed to write temp diff file: {}", e))?;
-    }
-
-    // Same reasoning as run_index/run_incremental_index: `patch`'s own stdout
-    // would otherwise land on this process's stdout, corrupting the JSON-RPC
-    // transport.
-    let status = std::process::Command::new("patch")
-        .arg("--no-backup-if-mismatch")
-        .arg("-p0")
-        .arg(file_path)
-        .arg("-i")
-        .arg(&tmp_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    let _ = std::fs::remove_file(&tmp_path);
-
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!(
-            "`patch` exited with status {}. The generated diff likely doesn't apply cleanly to the current file content — review the `diff` field and apply manually.",
-            s
-        )),
-        Err(e) => Err(format!("Failed to invoke `patch`: {}. Is GNU patch installed?", e)),
     }
 }
 
@@ -373,7 +420,7 @@ fn main() {
                                     },
                                     {
                                         "name": "impact_analysis",
-                                        "description": "AI-generated (Qwen2.5-Coder), ~5-10s, cache-able. Adds prose explaining WHY a change to this symbol is risky (e.g. which call sites would break and how) on top of the raw dependency list — it does not just restate get_context's graph in different words. Set format: \"structured\" to skip the LLM call and get that same raw dependency data (callers/callees/signature) back as instant JSON instead, with no AI latency or token overhead — equivalent to calling get_context separately, just without the second round trip. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
+                                        "description": "Reports the blast radius of changing a symbol. CHEAP PATH (default): if the symbol's total dependencies (forward + reverse) are below risk_threshold (default 5), this skips the LLM entirely and returns instant deterministic JSON {risk_level:\"LOW\", callers, callees, forward_dependencies, reverse_dependencies, reason, llm_used:false} — no model latency or cost, since for a low-fan-in/out symbol the graph already tells the whole story. LLM PATH: for symbols at/above the threshold it falls back to the AI-generated (Qwen2.5-Coder, ~5-10s, cache-able) prose explaining WHY a change is risky. Set format:\"structured\" to always skip the LLM and get the full get_context graph JSON regardless of size. Raise/lower risk_threshold to control where the cheap/LLM boundary sits. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -388,7 +435,11 @@ fn main() {
                                                 "format": {
                                                     "type": "string",
                                                     "enum": ["prose", "structured"],
-                                                    "description": "Optional, default 'prose'. 'prose': AI-generated risk explanation (default, ~5-10s). 'structured' (alias: 'json'): skip the LLM call, return get_context's raw dependency JSON instantly."
+                                                    "description": "Optional, default 'prose'. 'prose': cheap deterministic output below risk_threshold, AI narrative at/above it. 'structured' (alias: 'json'): always skip the LLM, return get_context's full dependency JSON."
+                                                },
+                                                "risk_threshold": {
+                                                    "type": "number",
+                                                    "description": "Optional, default 5. Total dependency count (forward + reverse) at/above which the LLM narrative is used; below it, instant deterministic graph output is returned. Set to 0 to always use the LLM, or very high to always stay on the cheap path."
                                                 }
                                             },
                                             "required": ["symbol"]
@@ -560,14 +611,13 @@ fn main() {
                                     },
                                     {
                                         "name": "generate_patch",
-                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. Each result's `diff` is a RAW unified diff with any Markdown code fences stripped — it pipes straight into `git apply`/`patch` with no further processing; a fenced `rendered_diff` is also included for display only. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added CODE lines (comments and string literals are ignored, so prose words won't be flagged) that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry. By default this only returns diff text for review (dry_run); pass apply: true to have CodeBroker write it to disk via `patch`.",
+                                        "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. REVIEW-ONLY: CodeBroker is a discovery/analysis layer and NEVER writes to disk — this returns a diff for you to apply yourself via native Edit/Write (or `git apply`/`patch`). Each result's `diff` is a RAW unified diff with any Markdown code fences stripped — it pipes straight into `git apply`/`patch` with no further processing; a fenced `rendered_diff` is also included for display only. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added CODE lines (comments and string literals are ignored, so prose words won't be flagged) that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "The exact name of a single symbol to modify. Use 'symbols' instead for multiple." },
                                                 "symbols": { "type": "array", "items": { "type": "string" }, "description": "Array of symbol names to patch in one call, e.g. a manifest + a background script + a content script that all need the same kind of change." },
                                                 "instruction": { "type": "string", "description": "Instructions for what change to make. Applied identically to every symbol in 'symbols'." },
-                                                "apply": { "type": "boolean", "description": "Default false: only return the diff text for review (preview/dry-run). Set true to write each diff to disk immediately." },
                                                 "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches. 'path_scope' is also accepted as an alias." }
                                             },
                                             "required": ["instruction"]
@@ -755,38 +805,51 @@ fn main() {
                             "impact_analysis" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let file_hint = get_file_hint(&arguments);
-                                // "structured" skips the LLM call entirely and returns the same
-                                // graph data get_context exposes (callers/callees/signature) as
-                                // plain JSON — for callers that just want the dependency list and
-                                // would otherwise pay ~3x the tokens re-reading it out of markdown
-                                // prose. Default stays "prose": the AI-generated risk explanation
-                                // is this tool's actual value-add over get_context.
+                                // "structured" always skips the LLM and returns the full get_context
+                                // graph JSON. Default ("prose") now also has a cheap path: for a
+                                // low-fan-in/out symbol (total dependencies below `risk_threshold`)
+                                // the LLM adds little over the deterministic graph, so we return a
+                                // compact {risk_level, callers, callees, reason} instead — instant
+                                // and zero model cost. Larger symbols still get the LLM narrative.
                                 let format = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("prose");
-                                if format == "structured" || format == "json" {
-                                    match storage::Database::new(&db_path) {
-                                        Ok(db) => {
-                                            if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                                amb
-                                            } else {
-                                                let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                let risk_threshold = arguments.get("risk_threshold").and_then(|n| n.as_u64()).unwrap_or(5) as usize;
+                                match storage::Database::new(&db_path) {
+                                    Ok(db) => {
+                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
+                                            amb
+                                        } else {
+                                            let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                            if format == "structured" || format == "json" {
                                                 serde_json::to_string_pretty(&context).unwrap_or_default()
-                                            }
-                                        }
-                                        Err(_) => "Error connecting to db".to_string(),
-                                    }
-                                } else {
-                                    let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
-                                    if hf_token.is_empty() {
-                                        "Error: HF_API_TOKEN environment variable is not set. Pass format: \"structured\" to get the raw dependency data without an LLM call.".to_string()
-                                    } else {
-                                        match storage::Database::new(&db_path) {
-                                            Ok(db) => {
-                                                // Same ambiguity gate as get_context/get_implementation: don't
-                                                // burn an AI call analyzing the wrong file's symbol when the
-                                                // name matches multiple definitions.
-                                                if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                                    amb
+                                            } else {
+                                                let fwd = context.as_ref().map(|c| c.forward_dependencies.len()).unwrap_or(0);
+                                                let rev = context.as_ref().map(|c| c.reverse_dependencies.len()).unwrap_or(0);
+                                                let total_dependencies = fwd + rev;
+                                                let hf_token = std::env::var("HF_API_TOKEN").unwrap_or_default();
+
+                                                // Cheap path: below threshold (or no model available) ->
+                                                // deterministic graph-derived output, no LLM call.
+                                                if use_cheap_impact_path(total_dependencies, risk_threshold, !hf_token.is_empty()) {
+                                                    let reason = if total_dependencies < risk_threshold {
+                                                        format!("Dependency count ({}) below threshold ({}); returned deterministic graph data instead of an LLM analysis. Raise risk_threshold or use format:\"structured\" for the full graph.", total_dependencies, risk_threshold)
+                                                    } else {
+                                                        "HF_API_TOKEN not set; returned deterministic graph data instead of an LLM analysis.".to_string()
+                                                    };
+                                                    let payload = serde_json::json!({
+                                                        "symbol": symbol,
+                                                        "risk_level": "LOW",
+                                                        "total_dependencies": total_dependencies,
+                                                        "threshold": risk_threshold,
+                                                        "callers": context.as_ref().map(|c| c.callers.clone()).unwrap_or_default(),
+                                                        "callees": context.as_ref().map(|c| c.callees.clone()).unwrap_or_default(),
+                                                        "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
+                                                        "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
+                                                        "llm_used": false,
+                                                        "reason": reason,
+                                                    });
+                                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
                                                 } else {
+                                                    // Complex symbol: existing LLM workflow.
                                                     estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                                     let provider = Box::new(semantic::huggingface::HuggingFaceProvider::new(hf_token));
                                                     let generator = semantic::generator::SummaryGenerator::new(&db, provider);
@@ -799,9 +862,9 @@ fn main() {
                                                     }
                                                 }
                                             }
-                                            Err(_) => "Error connecting to db".to_string(),
                                         }
                                     }
+                                    Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
                             "search_codebase" => {
@@ -1246,9 +1309,9 @@ fn main() {
                                 }
                                 let instruction = arguments.get("instruction").and_then(|s| s.as_str()).unwrap_or("");
                                 let file_hint = get_file_hint(&arguments);
-                                // dry_run by default: a generated diff is only a preview until the
-                                // caller explicitly opts into writing it to disk.
-                                let apply = arguments.get("apply").and_then(|b| b.as_bool()).unwrap_or(false);
+                                // CodeBroker is discovery/analysis only: it never writes to disk.
+                                // generate_patch returns a diff for review; applying it is the
+                                // caller's job via native Edit/Write/patch tooling.
 
                                 if symbols.is_empty() {
                                     "Error: Must provide 'symbol' or 'symbols'".to_string()
@@ -1273,35 +1336,14 @@ fn main() {
                                                     }
                                                     match patch_gen.generate_patch_scoped(symbol, instruction, file_hint) {
                                                         Ok(output) => {
-                                                            let mut entry = serde_json::json!({
-                                                                "symbol": symbol,
-                                                                "diff": output.diff,
-                                                                "rendered_diff": output.rendered_diff,
-                                                                "introduced_identifiers": output.introduced_identifiers,
-                                                                "applied": false,
-                                                            });
-                                                            if !output.introduced_identifiers.is_empty() {
-                                                                entry["warning"] = serde_json::Value::String(
-                                                                    "introduced_identifiers were not found in the target file or its known graph context. Verify each one actually exists (or is intentionally new) before trusting/applying this patch.".to_string()
-                                                                );
-                                                            }
-                                                            if apply {
-                                                                match patch_gen.resolve_file_path_scoped(symbol, file_hint) {
-                                                                    Ok(file_path) => match apply_unified_diff(&file_path, &output.diff) {
-                                                                        Ok(_) => { entry["applied"] = serde_json::Value::Bool(true); }
-                                                                        Err(e) => { entry["apply_error"] = serde_json::Value::String(e); }
-                                                                    },
-                                                                    Err(e) => { entry["apply_error"] = serde_json::Value::String(e); }
-                                                                }
-                                                            }
-                                                            results.push(entry);
+                                                            results.push(build_patch_entry(symbol, &output.diff, &output.rendered_diff, &output.introduced_identifiers));
                                                         }
                                                         Err(e) => {
                                                             results.push(serde_json::json!({ "symbol": symbol, "error": e }));
                                                         }
                                                     }
                                                 }
-                                                serde_json::json!({ "apply": apply, "results": results }).to_string()
+                                                serde_json::json!({ "results": results }).to_string()
                                             }
                                             Err(_) => "Error connecting to db".to_string(),
                                         }

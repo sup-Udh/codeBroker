@@ -96,12 +96,15 @@ pub fn reindex_paths(db: &Database, project_root: &str, changed_paths: &[String]
     // Scoped pass 2: only re-link raw_imports belonging to files we just
     // touched. Re-running the full linker would re-insert duplicate edges for
     // every untouched file in the repo.
-    let raw_imports = db.get_all_raw_imports().map_err(|e| e.to_string())?;
-    for (_raw_id, source_file_id, import_name, _import_source, import_kind) in raw_imports {
+    let raw_imports = db.get_all_raw_imports_with_lines().map_err(|e| e.to_string())?;
+    for (_raw_id, source_file_id, import_name, _import_source, import_kind, line_number) in raw_imports {
         if !touched_file_ids.contains(&source_file_id) {
             continue;
         }
         let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
+        // Attribute the edge to its enclosing symbol (by line) so cycle
+        // detection has a symbol-level graph, matching the full init linker.
+        let src_sym = db.enclosing_symbol_id(source_file_id, line_number).unwrap_or(None);
 
         // Call edges use case-sensitive, scope-aware resolution (no global
         // bare-name fallback), matching the full `codebroker init` linker —
@@ -109,13 +112,15 @@ pub fn reindex_paths(db: &Database, project_root: &str, changed_paths: &[String]
         // exported `DELETE` on every incremental reindex. See resolve_call_edge.
         if edge_kind == "calls" || edge_kind == "method_call" {
             if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, &import_name) {
-                if db.insert_edge(source_file_id, local_id, &edge_kind).is_ok() {
+                if src_sym != Some(local_id)
+                    && db.insert_edge_attributed(source_file_id, src_sym, local_id, &edge_kind).is_ok()
+                {
                     stats.edges_created += 1;
                 }
             } else if edge_kind == "calls" {
                 if let Ok(Some((target_id, target_file_id))) = db.find_symbol_exact_with_file(&import_name) {
                     if target_file_id != source_file_id
-                        && db.insert_edge(source_file_id, target_id, &edge_kind).is_ok()
+                        && db.insert_edge_attributed(source_file_id, src_sym, target_id, &edge_kind).is_ok()
                     {
                         stats.edges_created += 1;
                     }
@@ -130,7 +135,7 @@ pub fn reindex_paths(db: &Database, project_root: &str, changed_paths: &[String]
                 continue;
             }
             if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
-                if db.insert_edge(source_file_id, target_symbol_id, &edge_kind).is_ok() {
+                if db.insert_edge_attributed(source_file_id, src_sym, target_symbol_id, &edge_kind).is_ok() {
                     stats.edges_created += 1;
                 }
             }

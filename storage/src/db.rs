@@ -102,6 +102,13 @@ impl Database {
         let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN signature TEXT;", []);
         let _ = self.conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT;", []);
+        // Which symbol an edge originates FROM. Edges are otherwise recorded at
+        // file granularity (source_file_id only); for cycle detection that's
+        // ambiguous — every symbol in a file looked like the source of every
+        // edge leaving it, manufacturing same-file "cycles". Nullable: top-level
+        // imports and non-call edges have no enclosing symbol, and pre-existing
+        // databases carry NULL here until reindexed.
+        let _ = self.conn.execute("ALTER TABLE edges ADD COLUMN source_symbol_id INTEGER;", []);
 
         Ok(())
     }
@@ -151,7 +158,7 @@ impl Database {
     pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>)>> {
         // Returns a tuple of (raw_import_id, file_id, import_name, source, kind)
         let mut stmt = self.conn.prepare("SELECT id, file_id, name, source, kind FROM raw_imports")?;
-        
+
         let import_iter = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -167,6 +174,49 @@ impl Database {
             results.push(import?);
         }
         Ok(results)
+    }
+
+    /// Like `get_all_raw_imports`, but also returns each import/call's
+    /// `line_number`. The linker uses the line to resolve which symbol a call
+    /// originates from (`enclosing_symbol_id`) and record it as the edge's
+    /// `source_symbol_id`, so cycle detection has a real symbol-level graph.
+    /// Tuple: (raw_import_id, file_id, import_name, source, kind, line_number).
+    pub fn get_all_raw_imports_with_lines(&self) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source, kind, line_number FROM raw_imports")?;
+        let import_iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for import in import_iter {
+            results.push(import?);
+        }
+        Ok(results)
+    }
+
+    /// Returns the id of the innermost symbol in `file_id` whose line range
+    /// contains `line` — i.e. the symbol a call/reference on that line belongs
+    /// to. Returns None for lines outside any symbol (e.g. top-level imports).
+    /// "Innermost" (smallest range) handles nested definitions correctly.
+    pub fn enclosing_symbol_id(&self, file_id: i64, line: i64) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM symbols
+             WHERE file_id = ?1 AND start_line <= ?2 AND end_line >= ?2
+             ORDER BY (end_line - start_line) ASC
+             LIMIT 1"
+        )?;
+        let result = stmt.query_row(params![file_id, line], |row| row.get(0));
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Incremental reindex helper: finds the row id of an already-indexed file
@@ -244,9 +294,19 @@ impl Database {
 
     /// Creates a directional relationship between two symbols
     pub fn insert_edge(&self, source_file_id: i64, target_symbol_id: i64, kind: &str) -> Result<()> {
+        self.insert_edge_attributed(source_file_id, None, target_symbol_id, kind)
+    }
+
+    /// Inserts an edge, optionally attributed to the specific source symbol it
+    /// originates from. `source_symbol_id` should be the enclosing symbol of
+    /// the call/reference (see `enclosing_symbol_id`); pass None for edges with
+    /// no enclosing symbol (top-level imports) or that aren't symbol-scoped.
+    /// dependency_cycles relies on this attribution to build an accurate
+    /// symbol-level graph instead of a file-level cartesian product.
+    pub fn insert_edge_attributed(&self, source_file_id: i64, source_symbol_id: Option<i64>, target_symbol_id: i64, kind: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO edges (source_file_id, target_symbol_id, kind) VALUES (?1, ?2, ?3)",
-            params![source_file_id, target_symbol_id, kind],
+            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
+            params![source_file_id, source_symbol_id, target_symbol_id, kind],
         )?;
         Ok(())
     }

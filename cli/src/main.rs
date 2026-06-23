@@ -21,6 +21,7 @@ use rusqlite::params;
 fn resolve_call_edge(
     db: &storage::Database,
     source_file_id: i64,
+    source_symbol_id: Option<i64>,
     name: &str,
     edge_kind: &str,
     edges_created: &mut i64,
@@ -30,7 +31,12 @@ fn resolve_call_edge(
     }
 
     if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, name) {
-        if db.insert_edge(source_file_id, local_id, edge_kind).is_ok() {
+        // Skip a symbol calling itself: a self-edge is a cycle-detection
+        // artifact, not a dependency relationship.
+        if source_symbol_id == Some(local_id) {
+            return;
+        }
+        if db.insert_edge_attributed(source_file_id, source_symbol_id, local_id, edge_kind).is_ok() {
             *edges_created += 1;
         }
         return;
@@ -47,7 +53,7 @@ fn resolve_call_edge(
         if target_file_id == source_file_id {
             return;
         }
-        if db.insert_edge(source_file_id, target_id, edge_kind).is_ok() {
+        if db.insert_edge_attributed(source_file_id, source_symbol_id, target_id, edge_kind).is_ok() {
             *edges_created += 1;
         }
     }
@@ -276,13 +282,17 @@ fn main() {
             println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
 
             // 1. Get all the "Missing Friends" from our staging table
-            let raw_imports = db.get_all_raw_imports().expect("Failed to fetch raw imports");
+            let raw_imports = db.get_all_raw_imports_with_lines().expect("Failed to fetch raw imports");
             let mut edges_created = 0;
 
             // 2. Loop through every single staged import
-            for (_raw_id, source_file_id, import_name, import_source, import_kind) in raw_imports {
+            for (_raw_id, source_file_id, import_name, import_source, import_kind, line_number) in raw_imports {
                 let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
-                
+                // Attribute this edge to the symbol whose body contains the
+                // call/reference, so dependency_cycles has a real symbol graph
+                // (None for top-level imports outside any symbol).
+                let src_sym = db.enclosing_symbol_id(source_file_id, line_number).unwrap_or(None);
+
                 if edge_kind == "route_push" {
                     // Fetch all routes to try matching
                     let mut route_stmt = db.conn.prepare("SELECT id, route_path FROM files WHERE route_path IS NOT NULL").unwrap();
@@ -303,7 +313,7 @@ fn main() {
                                 // Find the page symbol in this file
                                 let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND kind = 'page' LIMIT 1").unwrap();
                                 if let Ok(target_symbol_id) = sym_stmt.query_row(rusqlite::params![target_file_id], |row| row.get::<_, i64>(0)) {
-                                    let _ = db.insert_edge(source_file_id, target_symbol_id, "navigates_to");
+                                    let _ = db.insert_edge_attributed(source_file_id, src_sym, target_symbol_id, "navigates_to");
                                     edges_created += 1;
                                 }
                                 break;
@@ -319,7 +329,7 @@ fn main() {
                 // common handler names (e.g. a member call `query.delete()`
                 // linking to an exported `DELETE` route). See resolve_call_edge.
                 if edge_kind == "calls" || edge_kind == "method_call" {
-                    resolve_call_edge(&db, source_file_id, &import_name, &edge_kind, &mut edges_created);
+                    resolve_call_edge(&db, source_file_id, src_sym, &import_name, &edge_kind, &mut edges_created);
                     continue;
                 }
 
@@ -348,7 +358,7 @@ fn main() {
                         // find a symbol in that file that matches the name
                         let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND LOWER(name) = LOWER(?2) LIMIT 1").unwrap();
                         if let Ok(target_symbol_id) = sym_stmt.query_row(params![target_file_id, import_name], |row| row.get::<_, i64>(0)) {
-                            let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
+                            let _ = db.insert_edge_attributed(source_file_id, src_sym, target_symbol_id, &edge_kind);
                             edges_created += 1;
                             continue;
                         }
@@ -363,13 +373,13 @@ fn main() {
                     // Local-First Edge Linking
                     let mut local_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
                     if let Ok(local_symbol_id) = local_stmt.query_row(params![source_file_id, word], |row| row.get::<_, i64>(0)) {
-                        let _ = db.insert_edge(source_file_id, local_symbol_id, &edge_kind);
+                        let _ = db.insert_edge_attributed(source_file_id, src_sym, local_symbol_id, &edge_kind);
                         edges_created += 1;
                         continue;
                     }
-                    
+
                     if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
-                        let _ = db.insert_edge(source_file_id, target_symbol_id, &edge_kind);
+                        let _ = db.insert_edge_attributed(source_file_id, src_sym, target_symbol_id, &edge_kind);
                         edges_created += 1;
                     }
                 }
@@ -1111,9 +1121,9 @@ mod call_edge_tests {
 
         let mut created = 0i64;
         // member access -> method_call, name "get"
-        resolve_call_edge(&db, file_b, "get", "method_call", &mut created);
+        resolve_call_edge(&db, file_b, None, "get", "method_call", &mut created);
         // member access with exact-case name "GET"
-        resolve_call_edge(&db, file_b, "GET", "method_call", &mut created);
+        resolve_call_edge(&db, file_b, None, "GET", "method_call", &mut created);
 
         assert_eq!(created, 0, "member calls must not link to a top-level symbol");
         assert_eq!(count_edges(&db), 0);
@@ -1129,12 +1139,12 @@ mod call_edge_tests {
 
         let mut created = 0i64;
         // lowercase free call `get()` must NOT match `GET` (case-sensitive).
-        resolve_call_edge(&db, file_b, "get", "calls", &mut created);
+        resolve_call_edge(&db, file_b, None, "get", "calls", &mut created);
         assert_eq!(created, 0, "case-folded match must not happen");
         assert_eq!(count_edges(&db), 0);
 
         // exact-case free call `GET()` from another file DOES link.
-        resolve_call_edge(&db, file_b, "GET", "calls", &mut created);
+        resolve_call_edge(&db, file_b, None, "GET", "calls", &mut created);
         assert_eq!(created, 1, "exact-case free call should resolve");
         assert_eq!(count_edges(&db), 1);
     }
@@ -1147,7 +1157,23 @@ mod call_edge_tests {
         db.insert_symbol(file_a, &sym("helper")).unwrap();
 
         let mut created = 0i64;
-        resolve_call_edge(&db, file_a, "helper", "calls", &mut created);
+        resolve_call_edge(&db, file_a, None, "helper", "calls", &mut created);
         assert_eq!(created, 1, "same-file helper call should resolve locally");
+    }
+
+    // #1 — a symbol calling itself (recursion) must not create a self-edge,
+    // since dependency_cycles would otherwise see a length-1 cycle.
+    #[test]
+    fn recursive_self_call_creates_no_self_edge() {
+        let db = storage::Database::new(":memory:").unwrap();
+        db.init_schema().unwrap();
+        let file_a = db.insert_file("a.ts", "h").unwrap();
+        let recur = db.insert_symbol(file_a, &sym("recur")).unwrap();
+
+        let mut created = 0i64;
+        // recur() called from within recur's own body (source_symbol == target).
+        resolve_call_edge(&db, file_a, Some(recur), "recur", "calls", &mut created);
+        assert_eq!(created, 0, "a function calling itself must not create a self-edge");
+        assert_eq!(count_edges(&db), 0);
     }
 }
