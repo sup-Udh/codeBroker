@@ -105,6 +105,157 @@ fn build_patch_entry(symbol: &str, diff: &str, rendered_diff: &str, introduced_i
     entry
 }
 
+/// Maps a file extension to a Markdown fenced-code-block language tag, so
+/// capsule output gets syntax highlighting in agents that render Markdown.
+fn lang_from_path(path: &str) -> &'static str {
+    if path.ends_with(".rs") { "rust" }
+    else if path.ends_with(".py") { "python" }
+    else if path.ends_with(".tsx") { "tsx" }
+    else if path.ends_with(".ts") { "typescript" }
+    else if path.ends_with(".jsx") { "jsx" }
+    else if path.ends_with(".js") { "javascript" }
+    else if path.ends_with(".vue") { "vue" }
+    else if path.ends_with(".toml") { "toml" }
+    else if path.ends_with(".json") { "json" }
+    else { "" }
+}
+
+/// find_symbol_candidates/search_symbols resolve paths to absolute (via
+/// db.resolve_path) before returning, but read_symbol_source_scoped's
+/// file_hint is matched against the RAW relative path stored in the `files`
+/// table (`files.path LIKE '%hint%'`). An absolute path is never a substring
+/// of the relative one it was built from, so passing it straight through as
+/// a hint silently matches nothing. Strip the project root prefix back off
+/// so the hint lines up with what's actually stored.
+fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str {
+    let prefix = format!("{}/", db.project_root.trim_end_matches('/'));
+    absolute_path.strip_prefix(prefix.as_str()).unwrap_or(absolute_path)
+}
+
+/// Collapses a symbol's source down to its signature line(s) plus a
+/// `[N lines hidden]` marker, for the "Supporting Context" section of
+/// generate_context_capsule — callers/callees are shown structurally
+/// (so the agent knows they exist and how they connect) without paying
+/// the token cost of their full bodies.
+fn signature_skeleton(db: &storage::Database, name: &str, file_path: &str) -> String {
+    match query::retrieval::read_symbol_source_scoped(db, name, false, Some(file_path)) {
+        Ok(results) => match results.into_iter().next() {
+            Some(r) => {
+                let lines: Vec<&str> = r.source.lines().collect();
+                if lines.is_empty() {
+                    return format!("// {} (source unavailable)", name);
+                }
+                let total = lines.len();
+                let sig_end = lines.iter().position(|l| l.contains('{')).unwrap_or(0);
+                let sig_end = sig_end.min(total.saturating_sub(1));
+                let mut out = lines[..=sig_end].join("\n");
+                let hidden = total - (sig_end + 1);
+                if hidden > 0 {
+                    out.push_str(&format!("\n    ... // [{} lines hidden for token reduction]", hidden));
+                }
+                out
+            }
+            None => format!("// {} (source unavailable)", name),
+        },
+        Err(_) => format!("// {} (source unavailable)", name),
+    }
+}
+
+/// Orchestrates the one-shot "Context Capsule" workflow: discover the 1-3
+/// pivot symbols matching `query`, fetch their full implementation, expand
+/// to immediate (depth=1) callers/callees via the graph, and render
+/// everything as a single Markdown document instead of forcing the caller
+/// to chain search_codebase -> get_implementation -> explore_graph manually.
+fn generate_context_capsule(db: &storage::Database, query: &str, file_hint: Option<&str>) -> String {
+    use std::fmt::Write;
+    let mut md = String::new();
+    let _ = writeln!(md, "# CodeBroker Context Capsule\n");
+    let _ = writeln!(md, "**Query:** {}\n", query);
+
+    // Discover: prefer exact-name matches, fall back to fuzzy/semantic search.
+    let mut pivots: Vec<(String, String)> = Vec::new();
+    if let Ok(candidates) = query::engine::find_symbol_candidates(db, query) {
+        for c in candidates.iter() {
+            if file_hint.map_or(true, |h| c.file_path.contains(h)) {
+                pivots.push((c.name.clone(), c.file_path.clone()));
+            }
+            if pivots.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if pivots.is_empty() {
+        if let Ok((results, _reason)) = query::engine::search_symbols(
+            db, query, &[], false, file_hint, query::engine::SearchMode::Symbol, false, None,
+        ) {
+            for r in results.iter().filter(|r| r.kind != "file") {
+                pivots.push((r.name.clone(), r.path.clone()));
+                if pivots.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if pivots.is_empty() {
+        let _ = writeln!(md, "_No matching symbols found for this query. Try search_codebase with mode: \"both\" for a broader sweep._");
+        return md;
+    }
+
+    let _ = writeln!(md, "## Pivot Symbols (Full Implementation)\n");
+
+    let mut seen_support: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut support_sections: Vec<String> = Vec::new();
+
+    for (name, hint) in &pivots {
+        let rel_hint = relative_hint(db, hint);
+        let sources = query::retrieval::read_symbol_source_scoped(db, name, false, Some(rel_hint)).unwrap_or_default();
+        let Some(src) = sources.into_iter().next() else { continue };
+
+        let _ = writeln!(md, "### `{}::{}`", src.file_path, src.symbol_name);
+        let _ = writeln!(md, "*Why:* Matched search query directly.\n");
+        let _ = writeln!(md, "```{}", lang_from_path(&src.file_path));
+        let _ = writeln!(md, "{}", src.source.trim_end());
+        let _ = writeln!(md, "```\n");
+
+        if let Ok(graph) = query::graph::explore_graph(db, name, 1, query::graph::GraphDirection::Both, 30) {
+            let root_id = graph.nodes.first().map(|n| n.id.clone()).unwrap_or_default();
+            for node in graph.nodes.iter().skip(1).take(8) {
+                let key = (node.file_path.clone(), node.name.clone());
+                if seen_support.contains(&key) {
+                    continue;
+                }
+                seen_support.insert(key);
+
+                let relation = graph.edges.iter().find_map(|e| {
+                    if e.source == root_id && e.target == node.id {
+                        Some(format!("Pivot {} ->", e.kind.to_uppercase()))
+                    } else if e.target == root_id && e.source == node.id {
+                        Some(format!("{} -> Pivot", e.kind.to_uppercase()))
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| "RELATED TO Pivot".to_string());
+
+                let skeleton = signature_skeleton(db, &node.name, &node.file_path);
+                support_sections.push(format!(
+                    "### `{}::{}` — {}\n```{}\n{}\n```\n",
+                    node.file_path, node.name, relation, lang_from_path(&node.file_path), skeleton
+                ));
+            }
+        }
+    }
+
+    if !support_sections.is_empty() {
+        let _ = writeln!(md, "## Supporting Context (Skeletons)\n");
+        for section in support_sections {
+            let _ = writeln!(md, "{}", section);
+        }
+    }
+
+    md
+}
+
 /// Adds an approximate `response_size_hint` field to a JSON object response,
 /// so a calling agent can decide whether to drill deeper or stop without
 /// guessing from raw JSON length. Deliberately cheap (char_count / 4, the
@@ -397,106 +548,21 @@ fn main() {
                             result: serde_json::json!({
                                 "tools": [
                                     {
-                                        "name": "get_context",
-                                        "description": "Shorthand for explore_graph(symbol, depth: 1, direction: 'both') with no depth/max_nodes knobs — immediate dependencies + dependents only, in a fixed response shape. Use explore_graph instead if you need depth > 1 or a single-direction (incoming/outgoing-only) traversal. If 'symbol' is ambiguous (defined in multiple files, e.g. a Next.js route handler named 'GET'), this returns a candidate list instead of guessing — pass 'file_path' to pick one. Set include_source: true to bundle the symbol's own source body (same data read_symbol_source returns) into this same response, for the common 'show me this function and what touches it' case in one call instead of two.",
+                                        "name": "generate_context_capsule",
+                                        "description": "ONE-SHOT discovery tool — prefer this over chaining search_codebase/find_symbol -> get_implementation -> explore_graph by hand. Takes a query (symbol name, feature, or natural-language description), discovers the 1-3 best-matching 'pivot' symbols, fetches their full implementation, expands to their immediate (depth=1) callers/callees via the graph, and returns it all as a single Markdown document: pivot bodies in full, supporting context as signature-only skeletons (bodies collapsed with a '[N lines hidden]' marker) to keep token cost down. Use this FIRST for any 'find/understand X' task; drop to the lower-level tools only if this doesn't surface what you need.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "symbol": {
+                                                "query": {
                                                     "type": "string",
-                                                    "description": "The exact name of the struct, function, or trait."
+                                                    "description": "Symbol name, feature, or natural-language description of what to find."
                                                 },
                                                 "file_path": {
                                                     "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias."
-                                                },
-                                                "include_source": {
-                                                    "type": "boolean",
-                                                    "description": "Optional, default false. When true, bundles the symbol's own source code into the response under a 'source' field, equivalent to also calling read_symbol_source."
+                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'query' matches multiple definitions. 'path_scope' is also accepted as an alias."
                                                 }
                                             },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "impact_analysis",
-                                        "description": "Reports the blast radius of changing a symbol. CHEAP PATH (default): if the symbol's total dependencies (forward + reverse) are below risk_threshold (default 5), this skips the LLM entirely and returns instant deterministic JSON {risk_level:\"LOW\", callers, callees, forward_dependencies, reverse_dependencies, reason, llm_used:false} — no model latency or cost, since for a low-fan-in/out symbol the graph already tells the whole story. LLM PATH: for symbols at/above the threshold it falls back to the AI-generated (Qwen2.5-Coder, ~5-10s, cache-able) prose explaining WHY a change is risky. Set format:\"structured\" to always skip the LLM and get the full get_context graph JSON regardless of size. Raise/lower risk_threshold to control where the cheap/LLM boundary sits. If 'symbol' is ambiguous (defined in multiple files), returns a candidate list instead of analyzing the wrong file — pass 'file_path' to disambiguate.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the struct, function, or trait to analyze."
-                                                },
-                                                "file_path": {
-                                                    "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias."
-                                                },
-                                                "format": {
-                                                    "type": "string",
-                                                    "enum": ["prose", "structured"],
-                                                    "description": "Optional, default 'prose'. 'prose': cheap deterministic output below risk_threshold, AI narrative at/above it. 'structured' (alias: 'json'): always skip the LLM, return get_context's full dependency JSON."
-                                                },
-                                                "risk_threshold": {
-                                                    "type": "number",
-                                                    "description": "Optional, default 5. Total dependency count (forward + reverse) at/above which the LLM narrative is used; below it, instant deterministic graph output is returned. Set to 0 to always use the LLM, or very high to always stay on the cheap path."
-                                                }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "search_codebase",
-                                        "description": "Discovery tool to find where a keyword or concept is mentioned. By default only matches indexed symbol/file names (fast); use mode 'text' or 'both' to also grep raw file content for string literals, comments, and config values that have no symbol name. Text-mode matching is substring-based by default, which WILL match short keywords inside longer identifiers (e.g. searching 'PORT' matches inside 'export'/'import') — set whole_word: true to require non-identifier boundaries around the match if that's not what you want. On a miss, the response includes a 'reason' field explaining why (e.g. how many symbols are in scope) instead of a bare empty array, so you can self-correct without a second round trip. If you already suspect an exact/near-exact name and a generic query like 'room' is returning a flat list mixing one relevant hit with many unrelated Medium/Low matches (e.g. 10 components named *Room*), set min_confidence: \"high\" to skip the manual filtering pass — this shrinks result count, it does not change ranking. Response includes a 'response_size_hint' field ({char_count, approx_tokens}, approx_tokens = char_count/4 — a cheap estimate, not a real token count) so you can gauge response size without guessing from raw JSON length.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "keyword": {
-                                                    "type": "string",
-                                                    "description": "The concept or name to search for (e.g. 'AuthService')."
-                                                },
-                                                "mode": {
-                                                    "type": "string",
-                                                    "enum": ["symbol", "text", "both"],
-                                                    "description": "Optional. 'symbol' (default): match indexed symbol/file names only, fast. 'text': grep raw file content for the literal keyword (catches string literals/comments, slower). 'both': try symbol matching first, fall back to text search if that finds nothing."
-                                                },
-                                                "whole_word": {
-                                                    "type": "boolean",
-                                                    "description": "Optional, default false. Only applies to 'text'/'both' modes. When true, requires non-alphanumeric/underscore boundaries around the match — fixes false positives like 'PORT' matching inside 'export'. When false (default), plain substring matching, which is sometimes exactly what you want (e.g. finding all 'use' prefixed hooks)."
-                                                },
-                                                "path_scope": {
-                                                    "type": "string",
-                                                    "description": "Optional. Restrict results to files whose path contains this substring (e.g. 'src/auth' or 'mcp/'). Narrowing scope reduces result size and token cost."
-                                                },
-                                                "min_confidence": {
-                                                    "type": "string",
-                                                    "enum": ["high", "medium", "low"],
-                                                    "description": "Optional, default unset (no filtering — all matches returned, unchanged from before this param existed). Drops every result below the given confidence tier (e.g. 'high' keeps only Exact/Prefix matches, dropping Medium/Low noise). Use this when you already suspect an exact name and just want to skip reading past weaker matches."
-                                                }
-                                            },
-                                            "required": ["keyword"]
-                                        }
-                                    },
-                                    {
-                                        "name": "find_symbol",
-                                        "description": "Lookup tool to find the definition file, line number, and kind of a symbol. Response includes a boolean 'found' field, plus results split into 'exact_matches' (the symbol's name equals your query, case-insensitive) and 'fuzzy_matches' (prefix/substring/typo hits) so you don't have to disambiguate by score — 'matches' is also present (all results, with score) for completeness. For a common name like 'GET' that matches many route files, previews are suppressed and 'compact': true is set with a 'hint' to narrow via path_scope; passing path_scope re-enables previews for the scoped subset. Honors context_lines (0 = no previews).",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": {
-                                                    "type": "string",
-                                                    "description": "The exact name of the symbol."
-                                                },
-                                                "context_lines": {
-                                                    "type": "number",
-                                                    "description": "Optional. Number of lines of context to fetch above and below the symbol. Defaults to 3. Pass 0 for 'existence-only' mode: skips reading source entirely and returns just found/path/line/kind — use this for a yes/no location check when you don't need the snippet."
-                                                },
-                                                "path_scope": {
-                                                    "type": "string",
-                                                    "description": "Optional. Restrict matches to files whose path contains this substring. Narrowing scope reduces result size and token cost."
-                                                }
-                                            },
-                                            "required": ["symbol"]
+                                            "required": ["query"]
                                         }
                                     },
                                     {
@@ -513,39 +579,6 @@ fn main() {
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {}
-                                        }
-                                    },
-                                    {
-                                        "name": "repository_stats",
-                                        "description": "Raw, deterministic, <1s. Returns counts of files, symbols, edges, and languages in the repository, optionally scoped to a path. Call this before search_codebase/find_symbol on a suspect subdirectory to check whether it's worth querying at all (e.g. 0 symbols indexed there) without inferring it from project_overview's directory list.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "path_scope": {
-                                                    "type": "string",
-                                                    "description": "Optional. Restrict counts to files whose path contains this substring (e.g. 'src/auth')."
-                                                }
-                                            },
-                                            "required": []
-                                        }
-                                    },
-                                    {
-                                        "name": "read_symbol_source",
-                                        "description": "Read exact source code for one or more symbols without returning the entire file. Lower-level than get_implementation/get_edit_context: it returns ONLY the symbol's own source (plus directly related dependencies if include_dependencies is set), with no graph metadata. Prefer this when you already know exactly which symbol(s) you want and don't need dependents/dependencies bundled in. Batches: pass symbols: [\"GET\", \"POST\"] to fetch multiple symbols in ONE call — if you're about to make 2+ sequential read_symbol_source calls against the same file_path (e.g. fetching GET then POST from the same route file), batch them instead; it's the same total data for one round trip instead of several. Use the single 'symbol' field only when you genuinely want just one. If any name is ambiguous (defined in multiple files), returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Preferred. Array of symbol names for batch fetching, e.g. [\"GET\", \"POST\"] — one call instead of one per symbol." },
-                                                "symbol": { "type": "string", "description": "Single symbol name. Use 'symbols' instead if you need more than one from the same lookup." },
-                                                "include_dependencies": {
-                                                    "type": "boolean",
-                                                    "description": "If true, also includes directly related dependencies (e.g., inherited parent classes, prop interfaces)."
-                                                },
-                                                "file_path": {
-                                                    "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches. 'path_scope' is also accepted as an alias."
-                                                }
-                                            }
                                         }
                                     },
                                     {
@@ -579,37 +612,6 @@ fn main() {
                                         }
                                     },
                                     {
-                                        "name": "read_file_skeleton",
-                                        "description": "Returns a skeletonized view of a file where sibling functions and classes are collapsed down to their signatures.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "file_path": {
-                                                    "type": "string",
-                                                    "description": "The path to the file to skeletonize."
-                                                },
-                                                "target_symbol": {
-                                                    "type": "string",
-                                                    "description": "Optional. The exact name of the symbol to keep fully expanded. All other sibling symbols will be collapsed."
-                                                }
-                                            },
-                                            "required": ["file_path"]
-                                        }
-                                    },
-                                    {
-                                        "name": "read_file_snippet",
-                                        "description": "Read a specific line range from a file.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "path": { "type": "string" },
-                                                "start_line": { "type": "number" },
-                                                "end_line": { "type": "number" }
-                                            },
-                                            "required": ["path", "start_line", "end_line"]
-                                        }
-                                    },
-                                    {
                                         "name": "generate_patch",
                                         "description": "Generates unified diff patch(es) to modify one or more symbols, using CodeBroker's onboard AI and semantic context. REVIEW-ONLY: CodeBroker is a discovery/analysis layer and NEVER writes to disk — this returns a diff for you to apply yourself via native Edit/Write (or `git apply`/`patch`). Each result's `diff` is a RAW unified diff with any Markdown code fences stripped — it pipes straight into `git apply`/`patch` with no further processing; a fenced `rendered_diff` is also included for display only. The model is grounded in the FULL enclosing file (not just the symbol's own slice) and explicitly instructed not to invent helpers/imports that don't exist — but it is still an LLM, so each result also includes `introduced_identifiers`: any name in the diff's added CODE lines (comments and string literals are ignored, so prose words won't be flagged) that wasn't found anywhere in the file or its known graph context. ALWAYS check `introduced_identifiers` before trusting a patch — a non-empty list means either a deliberately new name or a hallucinated reference, and you must tell which by eye. Each symbol is patched independently (one diff per symbol) and returned in a `results` array. If a symbol name is ambiguous (e.g. \"GET\" defined in many route files), that entry comes back as a candidate list instead of a generated patch — pass 'file_path' to disambiguate and retry.",
                                         "inputSchema": {
@@ -621,30 +623,6 @@ fn main() {
                                                 "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, applied to every name in 'symbol'/'symbols' to disambiguate matches. 'path_scope' is also accepted as an alias." }
                                             },
                                             "required": ["instruction"]
-                                        }
-                                    },
-                                    {
-                                        "name": "get_implementation",
-                                        "description": "Equivalent to calling read_symbol_source + get_context together in one round trip: returns the symbol's own source PLUS its forward/reverse graph dependencies, bundled as {symbol_source, context}. Use this (not read_symbol_source) when you need to understand how a symbol works in relation to its callers/callees, not just read its body. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string" },
-                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias." }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "get_edit_context",
-                                        "description": "Equivalent to calling read_symbol_source + get_context together, reshaped specifically for editing: returns {target_implementation, forward_dependencies, reverse_dependencies, same_file_callers, suggested_edit_boundaries, response_size_hint}. IMPORTANT: reverse_dependencies is cross-file ONLY (it's backed by import edges, and a file never imports its own symbols) — an empty reverse_dependencies does NOT mean a symbol is unused. Check same_file_callers too: a private helper called only by a sibling function below it in the same file will show reverse_dependencies: [] and same_file_callers: [\"callerName\"], and is NOT dead code. Same underlying data as get_implementation, different shape — use this one before making a change (it surfaces what depends on the symbol you're about to edit), use get_implementation when you're just trying to understand existing code. If 'symbol' is ambiguous, returns a candidate list instead of guessing — pass 'file_path' to disambiguate. response_size_hint is {char_count, approx_tokens} (approx_tokens = char_count/4, a cheap estimate not a real token count) so you can gauge response size without guessing from raw JSON length.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string" },
-                                                "file_path": { "type": "string", "description": "Optional. Substring of the defining file's path, used to disambiguate when 'symbol' matches multiple definitions. 'path_scope' is also accepted as an alias." }
-                                            },
-                                            "required": ["symbol"]
                                         }
                                     },
                                     {
@@ -670,32 +648,6 @@ fn main() {
                                         }
                                     },
                                     {
-                                        "name": "explore_graph",
-                                        "description": "General-purpose BFS traversal of the code graph from a symbol. This is the one tool to reach for for radius/neighborhood questions: get_context is just depth=1/direction='both' with no knobs, and graph_subtree is just direction='undirected' with a fixed max_nodes=500 — prefer explore_graph directly over either unless you specifically want their simpler fixed-shape output. Only shortest_path is a genuinely different algorithm (two named endpoints, not a radius) and stays separate.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string" },
-                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." },
-                                                "direction": { "type": "string", "enum": ["incoming", "outgoing", "both", "undirected"], "description": "'incoming': callers/dependents only. 'outgoing': dependencies only. 'both' (default): both directions, edges reported with true direction. 'undirected': same node set as 'both' (use this to replace graph_subtree)." },
-                                                "max_nodes": { "type": "number", "description": "Cap on returned nodes (1-200). Default 100. Lower this for hotspot symbols with large fan-in/out to avoid oversized responses." }
-                                            },
-                                            "required": ["symbol", "depth", "direction"]
-                                        }
-                                    },
-                                    {
-                                        "name": "shortest_path",
-                                        "description": "Find the shortest relationship path between two NAMED symbols in the repository graph. Distinct from explore_graph/graph_subtree/get_context, which all explore a radius around a single symbol rather than connecting two specific endpoints.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "from": { "type": "string", "description": "The starting symbol" },
-                                                "to": { "type": "string", "description": "The target symbol" }
-                                            },
-                                            "required": ["from", "to"]
-                                        }
-                                    },
-                                    {
                                         "name": "architectural_hotspots",
                                         "description": "Identify the most critical and highly connected symbols in the repository.",
                                         "inputSchema": {
@@ -716,30 +668,6 @@ fn main() {
                                                 "path_scope": { "type": "string", "description": "Optional. Restrict the scanned edge set to symbols whose file path contains this substring." },
                                                 "include_same_file": { "type": "boolean", "description": "Default false: only return cross_file cycles. Set true to also include same-file mutual-recursion cycles." }
                                             }
-                                        }
-                                    },
-                                    {
-                                        "name": "find_duplicate_logic",
-                                        "description": "Scan the repository for near-duplicate function/component bodies that live in different files (copy-pasted logic). Unlike graph tools, this catches duplication even when there is no shared call/import edge between the copies.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "min_length": { "type": "number", "description": "Minimum normalized source length (characters) to consider. Default 80. Lower values surface more, noisier matches." },
-                                                "path_scope": { "type": "string", "description": "Optional. Restrict the scan to symbols whose file path contains this substring." }
-                                            }
-                                        }
-                                    },
-                                    {
-                                        "name": "graph_subtree",
-                                        "description": "DEPRECATED alias, kept for backward compatibility: equivalent to explore_graph(root_symbol, depth, direction: 'undirected'), with a response shape that reports per-node depth and string-named edges instead of ids. Prefer calling explore_graph directly with direction: 'undirected'.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "root_symbol": { "type": "string", "description": "The root symbol name" },
-                                                "depth": { "type": "number", "description": "Traversal depth. Max 5." },
-                                                "max_nodes": { "type": "number", "description": "Cap on returned nodes (1-500). Default 100 (was a fixed 500 with no escape hatch). Lower this for hub symbols with large fan-in/out." }
-                                            },
-                                            "required": ["root_symbol", "depth"]
                                         }
                                     }
                                 ]
@@ -1445,6 +1373,21 @@ fn main() {
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
+                                }
+                            }
+                            "generate_context_capsule" => {
+                                let query_str = arguments.get("query").and_then(|s| s.as_str()).unwrap_or("");
+                                let file_hint = get_file_hint(&arguments);
+                                if query_str.is_empty() {
+                                    "Error: 'query' is required".to_string()
+                                } else {
+                                    match storage::Database::new(&db_path) {
+                                        Ok(db) => {
+                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                            generate_context_capsule(&db, query_str, file_hint)
+                                        }
+                                        Err(_) => "Error connecting to db".to_string(),
+                                    }
                                 }
                             }
                             _ => {
