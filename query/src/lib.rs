@@ -1,6 +1,7 @@
-pub mod engine;
+pub mod concepts;
 pub mod context;
-pub mod retrieval;
-pub mod graph;
-pub mod subsystem;
 pub mod duplicates;
+pub mod engine;
+pub mod graph;
+pub mod retrieval;
+pub mod subsystem;

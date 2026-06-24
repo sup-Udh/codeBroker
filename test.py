@@ -1,8 +1,2 @@
-from storage import Database
-
-class TestService:
-    def __init__(self, db: Database):
-        self.db = db
-
-    def do_something(self):
-        print("Doing something in Python!")
+source = "function generateRoomId(): string {\n  return \"x\";\n}\n\nexport async function GET(request: Request) {\n  const id = generateRoomId();\n  return id;\n}\n"
+print(len(source))

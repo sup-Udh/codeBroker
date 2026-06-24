@@ -28,7 +28,7 @@ pub fn collect_files(root_dir: &str) -> Vec<String> {
     if let Ok(ov) = overrides.build() {
         builder.overrides(ov);
     }
-    
+
     let walker = builder.build(); // automatically ignores the .gitingore files the walkbuilder
 
     for result in walker {
@@ -42,16 +42,37 @@ pub fn collect_files(root_dir: &str) -> Vec<String> {
             }
         }
     }
+    // `WalkBuilder`'s sequential walk reflects raw directory-read order, which
+    // the OS does not guarantee to be stable across runs. Indexing files in a
+    // different order each time changes which file's symbol "wins" a tie in
+    // every ambiguous global name lookup (`LIMIT 1` with no other
+    // tie-breaker), which in turn changed which edges got created — the same
+    // unchanged codebase produced a different edge count on every reindex.
+    // Sorting makes file processing order, and therefore the whole index,
+    // deterministic and idempotent.
+    valid_files.sort();
     valid_files
 }
 
 fn is_supported_file(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
-            return ext_str == "rs" || ext_str == "ts" || ext_str == "tsx" || ext_str == "py" || ext_str == "js" || ext_str == "jsx" || ext_str == "json" || ext_str == "toml" || ext_str == "txt" || ext_str == "yml" || ext_str == "yaml" || ext_str == "vue" || ext_str == "svelte";
+            return ext_str == "rs"
+                || ext_str == "ts"
+                || ext_str == "tsx"
+                || ext_str == "py"
+                || ext_str == "js"
+                || ext_str == "jsx"
+                || ext_str == "json"
+                || ext_str == "toml"
+                || ext_str == "txt"
+                || ext_str == "yml"
+                || ext_str == "yaml"
+                || ext_str == "vue"
+                || ext_str == "svelte";
         }
     }
-    
+
     // Also allow files without extensions or specific names
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if file_name == "Dockerfile" {

@@ -1,5 +1,6 @@
-pub mod provider;
-pub mod huggingface;
-pub mod prompt;
+pub mod embeddings;
 pub mod generator;
-pub mod subsystem;
+pub mod openai;
+pub mod prompt;
+pub mod provider;
+pub mod staleness;

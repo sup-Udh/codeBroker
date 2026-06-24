@@ -9,7 +9,10 @@ impl TokenAccounting {
     }
 
     pub fn estimate_search_context(db: &Database) -> usize {
-        let total_symbols: i64 = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+        let total_symbols: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap_or(0);
         Self::estimate_tokens((total_symbols as usize) * 50)
     }
 
@@ -24,16 +27,22 @@ impl TokenAccounting {
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     Self::estimate_tokens(metadata.len() as usize)
                 } else {
-                    1000 
+                    1000
                 }
             }
-            Err(_) => 0
+            Err(_) => 0,
         }
     }
 
     pub fn estimate_graph_context(db: &Database) -> usize {
-        let total_symbols: i64 = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
-        let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+        let total_symbols: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+            .unwrap_or(0);
+        let total_edges: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap_or(0);
         Self::estimate_tokens((total_symbols as usize * 50) + (total_edges as usize * 100))
     }
 }

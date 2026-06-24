@@ -1,8 +1,8 @@
-use storage::Database;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use serde::{Serialize, Deserialize};
+use storage::Database;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SymbolSourceResult {
     pub symbol_name: String,
     pub symbol_kind: String,
@@ -28,7 +28,11 @@ pub struct FileSnippetResult {
     pub source: String,
 }
 
-pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: bool) -> Result<Vec<SymbolSourceResult>, String> {
+pub fn read_symbol_source(
+    db: &Database,
+    symbol: &str,
+    include_dependencies: bool,
+) -> Result<Vec<SymbolSourceResult>, String> {
     read_symbol_source_scoped(db, symbol, include_dependencies, None)
 }
 
@@ -36,16 +40,27 @@ pub fn read_symbol_source(db: &Database, symbol: &str, include_dependencies: boo
 /// symbol defined in a file whose path contains that substring — used to
 /// disambiguate a name like "GET" that's defined in many files once the
 /// caller has picked one from `find_symbol_candidates`.
-pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependencies: bool, file_hint: Option<&str>) -> Result<Vec<SymbolSourceResult>, String> {
-    let (mut stmt, params_vec): (rusqlite::Statement, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(hint) = file_hint {
+pub fn read_symbol_source_scoped(
+    db: &Database,
+    symbol: &str,
+    include_dependencies: bool,
+    file_hint: Option<&str>,
+) -> Result<Vec<SymbolSourceResult>, String> {
+    let (mut stmt, params_vec): (rusqlite::Statement, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(
+        hint,
+    ) =
+        file_hint
+    {
         let stmt = db.conn.prepare(
             "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
-             WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 5"
+             WHERE symbols.name = ?1 AND INSTR(files.path, ?2) > 0 LIMIT 5"
         ).map_err(|e| e.to_string())?;
-        let pattern = format!("%{}%", hint);
-        (stmt, vec![Box::new(symbol.to_string()), Box::new(pattern)])
+        (
+            stmt,
+            vec![Box::new(symbol.to_string()), Box::new(hint.to_string())],
+        )
     } else {
         let stmt = db.conn.prepare(
             "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
@@ -57,9 +72,11 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
     };
 
     let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
-    let mut rows = stmt.query(param_refs.as_slice()).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(param_refs.as_slice())
+        .map_err(|e| e.to_string())?;
     let mut results = Vec::new();
-    
+
     while let Some(row) = rows.next().unwrap_or(None) {
         let file_path: String = row.get(0).unwrap_or_default();
         let abs_path = db.resolve_path(&file_path);
@@ -113,7 +130,10 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
             source = "<ERROR: Stale index. This file was modified after indexing; the stored start/end byte offsets no longer match the file on disk and would return a corrupted snippet. Reindex the workspace, then retry.>".to_string();
         } else if source.is_empty() {
             source_unavailable = Some(true);
-            reason = Some("Failed to extract code snippet using byte bounds. Please use native file Read.".to_string());
+            reason = Some(
+                "Failed to extract code snippet using byte bounds. Please use native file Read."
+                    .to_string(),
+            );
             source = "<ERROR: Source extraction failed. The file was read successfully but the requested byte bounds were invalid. Please fall back to the native Read tool using the file path provided.>".to_string();
         }
 
@@ -131,21 +151,37 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
             source_unavailable,
             reason,
         });
-        
+
         if include_dependencies {
-            let mut file_id_stmt = db.conn.prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1").unwrap();
-            if let Ok(file_id) = file_id_stmt.query_row(rusqlite::params![file_path], |r: &rusqlite::Row| Ok(r.get::<_, i64>(0).unwrap_or(0))) {
+            let mut file_id_stmt = db
+                .conn
+                .prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1")
+                .unwrap();
+            if let Ok(file_id) = file_id_stmt
+                .query_row(rusqlite::params![file_path], |r: &rusqlite::Row| {
+                    Ok(r.get::<_, i64>(0).unwrap_or(0))
+                })
+            {
                 // To fetch dependencies, we need the signature. Since read_symbol_source doesn't fetch signature by default,
                 // we'll quickly query the signature from the symbols table for this specific symbol id.
-                let mut sig_stmt = db.conn.prepare("SELECT signature FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").unwrap();
-                let signature: Option<String> = sig_stmt.query_row(rusqlite::params![file_id, symbol], |r: &rusqlite::Row| Ok(r.get::<_, Option<String>>(0).unwrap_or(None))).unwrap_or(None);
-                
+                let mut sig_stmt = db
+                    .conn
+                    .prepare(
+                        "SELECT signature FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1",
+                    )
+                    .unwrap();
+                let signature: Option<String> = sig_stmt
+                    .query_row(rusqlite::params![file_id, symbol], |r: &rusqlite::Row| {
+                        Ok(r.get::<_, Option<String>>(0).unwrap_or(None))
+                    })
+                    .unwrap_or(None);
+
                 let deps = fetch_data_model_dependencies(db, symbol, file_id, signature.as_deref());
                 results.extend(deps);
             }
         }
     }
-    
+
     Ok(results)
 }
 
@@ -159,7 +195,12 @@ pub fn read_symbol_source_scoped(db: &Database, symbol: &str, include_dependenci
 /// inlined source bodies and the token cost that comes with it.
 const MAX_DEPENDENCY_EXPANSIONS: usize = 8;
 
-pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: i64, signature: Option<&str>) -> Vec<SymbolSourceResult> {
+pub fn fetch_data_model_dependencies(
+    db: &Database,
+    symbol_name: &str,
+    file_id: i64,
+    signature: Option<&str>,
+) -> Vec<SymbolSourceResult> {
     let mut deps = Vec::new();
     let mut processed_words: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
@@ -175,7 +216,12 @@ pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: 
             // as its own "data model dependency" and re-looked-up with no
             // file scoping, silently resolving to a same-named symbol in a
             // completely different file.
-            if word.is_empty() || word.chars().next().unwrap().is_lowercase() || word == "Depends" || word == "Session" || word == symbol_name {
+            if word.is_empty()
+                || word.chars().next().unwrap().is_lowercase()
+                || word == "Depends"
+                || word == "Session"
+                || word == symbol_name
+            {
                 continue;
             }
             // A generic type repeated across params (Map<string, User>, User[], User)
@@ -184,10 +230,23 @@ pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: 
                 continue;
             }
             // Check if this word exists as a symbol
-            let mut check_stmt = db.conn.prepare("SELECT name, file_id FROM symbols WHERE name = ?1 LIMIT 1").unwrap();
-            if let Ok((_name, found_file_id)) = check_stmt.query_row(rusqlite::params![word], |row| Ok((row.get::<_, String>(0).unwrap(), row.get::<_, i64>(1).unwrap()))) {
-                if let Ok(mut srcs) = read_symbol_source(db, word, false) { // false to prevent infinite recursion
-                    for src in &mut srcs { src.is_dependency = true; }
+            let mut check_stmt = db
+                .conn
+                .prepare("SELECT name, file_id FROM symbols WHERE name = ?1 LIMIT 1")
+                .unwrap();
+            if let Ok((_name, found_file_id)) =
+                check_stmt.query_row(rusqlite::params![word], |row| {
+                    Ok((
+                        row.get::<_, String>(0).unwrap(),
+                        row.get::<_, i64>(1).unwrap(),
+                    ))
+                })
+            {
+                if let Ok(mut srcs) = read_symbol_source(db, word, false) {
+                    // false to prevent infinite recursion
+                    for src in &mut srcs {
+                        src.is_dependency = true;
+                    }
                     deps.extend(srcs);
                 }
 
@@ -199,14 +258,18 @@ pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: 
                 let mut inherits_stmt = db.conn.prepare(
                     "SELECT symbols.name FROM edges JOIN symbols ON edges.target_symbol_id = symbols.id WHERE edges.source_file_id = ?1 AND edges.kind = 'inherits'"
                 ).unwrap();
-                let mut inherits_rows = inherits_stmt.query(rusqlite::params![found_file_id]).unwrap();
+                let mut inherits_rows = inherits_stmt
+                    .query(rusqlite::params![found_file_id])
+                    .unwrap();
                 while let Some(i_row) = inherits_rows.next().unwrap_or(None) {
                     if deps.len() >= MAX_DEPENDENCY_EXPANSIONS {
                         break;
                     }
                     let i_name: String = i_row.get(0).unwrap();
                     if let Ok(mut srcs) = read_symbol_source(db, &i_name, false) {
-                        for src in &mut srcs { src.is_dependency = true; }
+                        for src in &mut srcs {
+                            src.is_dependency = true;
+                        }
                         deps.extend(srcs);
                     }
                 }
@@ -227,7 +290,9 @@ pub fn fetch_data_model_dependencies(db: &Database, symbol_name: &str, file_id: 
         // Prevent dupes if it was already fetched via signature
         if !deps.iter().any(|d| d.symbol_name == name) {
             if let Ok(mut srcs) = read_symbol_source(db, &name, false) {
-                for src in &mut srcs { src.is_dependency = true; }
+                for src in &mut srcs {
+                    src.is_dependency = true;
+                }
                 deps.extend(srcs);
             }
         }
@@ -261,23 +326,27 @@ fn directory_hint_error(path: &std::path::Path) -> String {
     }
 }
 
-pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Result<FileSnippetResult, String> {
+pub fn read_file_snippet(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Result<FileSnippetResult, String> {
     let path_obj = std::path::Path::new(path);
     if path_obj.is_dir() {
         return Err(directory_hint_error(path_obj));
     }
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
-    
+
     let s_idx = start_line.saturating_sub(1);
     let e_idx = end_line.min(lines.len());
-    
+
     let source = if s_idx < lines.len() {
         lines[s_idx..e_idx].join("\n")
     } else {
         String::new()
     };
-    
+
     Ok(FileSnippetResult {
         file_path: path.to_string(),
         start_line,
@@ -286,7 +355,11 @@ pub fn read_file_snippet(path: &str, start_line: usize, end_line: usize) -> Resu
     })
 }
 
-pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&str>) -> Result<String, String> {
+pub fn skeletonize_file(
+    db: &Database,
+    file_path: &str,
+    target_symbol: Option<&str>,
+) -> Result<String, String> {
     let abs_file_path = db.resolve_path(file_path);
     let abs_path_obj = std::path::Path::new(&abs_file_path);
     if abs_path_obj.is_dir() {
@@ -295,7 +368,10 @@ pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&s
     let content = fs::read(&abs_file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     // Find file_id by resolving paths to absolute and comparing
-    let mut files_stmt = db.conn.prepare("SELECT id, path, content_hash FROM files").map_err(|e| e.to_string())?;
+    let mut files_stmt = db
+        .conn
+        .prepare("SELECT id, path, content_hash FROM files")
+        .map_err(|e| e.to_string())?;
     let mut files_rows = files_stmt.query([]).map_err(|e| e.to_string())?;
     let mut file_id = 0;
     let mut indexed_content_hash: Option<String> = None;
@@ -326,21 +402,33 @@ pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&s
             ));
         }
     }
-    
+
     let mut target_start = 0;
     let mut target_end = 0;
     if let Some(target) = target_symbol {
-        let mut target_stmt = db.conn.prepare("SELECT start_byte, end_byte FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1").map_err(|e| e.to_string())?;
-        if let Ok((ts, te)) = target_stmt.query_row(rusqlite::params![file_id, target], |r| Ok((r.get::<_, i64>(0).unwrap_or(0), r.get::<_, i64>(1).unwrap_or(0)))) {
+        let mut target_stmt = db
+            .conn
+            .prepare(
+                "SELECT start_byte, end_byte FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+        if let Ok((ts, te)) = target_stmt.query_row(rusqlite::params![file_id, target], |r| {
+            Ok((
+                r.get::<_, i64>(0).unwrap_or(0),
+                r.get::<_, i64>(1).unwrap_or(0),
+            ))
+        }) {
             target_start = ts;
             target_end = te;
         } else {
             return Err(format!("Symbol '{}' not found in '{}'", target, file_path));
         }
     }
-    
+
     let mut stmt = db.conn.prepare("SELECT name, start_byte, end_byte, signature, kind FROM symbols WHERE file_id = ?1 ORDER BY start_byte ASC").map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(rusqlite::params![file_id]).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![file_id])
+        .map_err(|e| e.to_string())?;
 
     let mut output = String::new();
     let mut current_byte: usize = 0;
@@ -397,10 +485,10 @@ pub fn skeletonize_file(db: &Database, file_path: &str, target_symbol: Option<&s
 
         current_byte = end_byte;
     }
-    
+
     if current_byte < content.len() {
         output.push_str(&String::from_utf8_lossy(&content[current_byte..]));
     }
-    
+
     Ok(output)
 }

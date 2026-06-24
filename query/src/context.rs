@@ -2,8 +2,7 @@ use serde::{Serialize, Deserialize};
 use storage::Database;
 use rusqlite::Result;
 
-#[derive(Debug, Serialize, Deserialize)]
-
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ContextObject {
     pub target_name: String,
     pub target_kind: String,
@@ -412,31 +411,33 @@ mod tests {
         let content_hash = storage::hash_content(source.as_bytes());
         let file_id = db.insert_file("route.ts", &content_hash).unwrap();
 
-        let helper_start = source.find("function generateRoomId").unwrap();
-        let helper_end = source.find("\n\nexport async function GET").unwrap();
-        db.insert_symbol(file_id, &graph::SymbolNode {
+        let gen_id = db.insert_symbol(file_id, &graph::SymbolNode {
             name: "generateRoomId".to_string(),
             kind: "function".to_string(),
             prop_type: None,
             start_line: 1,
             end_line: 3,
-            start_byte: helper_start,
-            end_byte: helper_end,
-            signature: Some("function generateRoomId(): string".to_string()),
+            start_byte: 0,
+            end_byte: 46,
+            signature: None,
+            route_path: None,
+            route_method: None,
         }).unwrap();
 
-        let handler_start = source.find("export async function GET").unwrap();
-        let handler_end = source.len();
-        db.insert_symbol(file_id, &graph::SymbolNode {
+        let get_id = db.insert_symbol(file_id, &graph::SymbolNode {
             name: "GET".to_string(),
             kind: "function".to_string(),
             prop_type: None,
             start_line: 5,
             end_line: 8,
-            start_byte: handler_start,
-            end_byte: handler_end,
-            signature: Some("export async function GET(request: Request)".to_string()),
+            start_byte: 0,
+            end_byte: 145,
+            signature: None,
+            route_path: None,
+            route_method: None,
         }).unwrap();
+
+        db.insert_edge_attributed(file_id, Some(get_id), gen_id, "CALL").unwrap();
 
         (db, project_root)
     }

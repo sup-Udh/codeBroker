@@ -1,11 +1,10 @@
+use crate::prompt::build_prompt;
 use crate::provider::LlmProvider;
-use crate::prompt::{build_prompt, build_patch_prompt};
-use storage::Database;
 use query::context::ContextObject;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::time::Instant;
+use std::hash::{Hash, Hasher};
+use storage::Database;
 pub struct SummaryGenerator<'a> {
     db: &'a Database,
     provider: Box<dyn LlmProvider>,
@@ -22,30 +21,45 @@ impl<'a> SummaryGenerator<'a> {
 
     /// Like `generate`, but when `file_hint` is given, only resolves a symbol
     /// defined in a file whose path contains that substring.
-    pub fn generate_scoped(&self, symbol_name: &str, file_hint: Option<&str>) -> Result<(String, bool), String> {
+    pub fn generate_scoped(
+        &self,
+        symbol_name: &str,
+        file_hint: Option<&str>,
+    ) -> Result<(String, bool), String> {
         // 1. Get the symbol from the database
         let (symbol_id, file_id) = if let Some(hint) = file_hint {
             let mut stmt = self.db.conn.prepare(
-                "SELECT symbols.id, symbols.file_id FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
+                "SELECT symbols.id, symbols.file_id FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 AND INSTR(files.path, ?2) > 0 LIMIT 1"
             ).map_err(|e| e.to_string())?;
-            let pattern = format!("%{}%", hint);
-            stmt.query_row(rusqlite::params![symbol_name, pattern], |row| {
+            stmt.query_row(rusqlite::params![symbol_name, hint], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            }).map_err(|_| format!("Symbol '{}' not found in a file matching '{}'.", symbol_name, hint))?
+            })
+            .map_err(|_| {
+                format!(
+                    "Symbol '{}' not found in a file matching '{}'.",
+                    symbol_name, hint
+                )
+            })?
         } else {
-            let mut stmt = self.db.conn.prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")
+            let mut stmt = self
+                .db
+                .conn
+                .prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")
                 .map_err(|e| e.to_string())?;
             stmt.query_row([symbol_name], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            }).map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?
+            })
+            .map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?
         };
 
         // 2. Get the file path and read the source code
-        let file_path: String = self.db.conn.query_row(
-            "SELECT path FROM files WHERE id = ?1",
-            [file_id],
-            |row| row.get(0)
-        ).map_err(|e| e.to_string())?;
+        let file_path: String = self
+            .db
+            .conn
+            .query_row("SELECT path FROM files WHERE id = ?1", [file_id], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
 
         // BUG FIX: this used to read `file_path` (the DB-relative path, e.g.
         // "./api/login/route.ts") directly with no project-root resolution.
@@ -90,8 +104,15 @@ impl<'a> SummaryGenerator<'a> {
         const UNINDEXED_DISCLAIMER: &str = "⚠️ GRAPH NOT INDEXED: This repository's dependency graph has 0 edges. The analysis below is a source-only guess based on reading this symbol's code in isolation — it is NOT based on real caller/dependent traversal. Run `reindex_workspace` to build the graph before trusting blast-radius claims.\n\n";
 
         // 5. Check Cache
-        if let Ok(Some(cached_summary)) = self.db.get_cached_summary(symbol_id, &source_hash, &context_hash, model_name) {
-            let prefix = if graph_indexed { "" } else { UNINDEXED_DISCLAIMER };
+        if let Ok(Some(cached_summary)) =
+            self.db
+                .get_cached_summary(symbol_id, &source_hash, &context_hash, model_name)
+        {
+            let prefix = if graph_indexed {
+                ""
+            } else {
+                UNINDEXED_DISCLAIMER
+            };
             return Ok((format!("(Cached)\n{}{}", prefix, cached_summary), true));
         }
 
@@ -110,7 +131,7 @@ impl<'a> SummaryGenerator<'a> {
             &context_hash,
             model_name,
             token_count,
-            elapsed_ms
+            elapsed_ms,
         );
 
         let final_summary = if graph_indexed {
@@ -140,337 +161,96 @@ impl<'a> ProjectOverviewGenerator<'a> {
     }
 
     pub fn generate(&self) -> Result<(String, bool), String> {
-        let repo_hash = self.db.get_repository_topology_hash().map_err(|e| e.to_string())?;
+        let repo_hash = self
+            .db
+            .get_repository_topology_hash()
+            .map_err(|e| e.to_string())?;
         let model_name = self.provider.model_name();
 
-        if let Ok(Some(cached_overview)) = self.db.get_cached_repository_overview(&repo_hash, model_name) {
+        if let Ok(Some(cached_overview)) = self
+            .db
+            .get_cached_repository_overview(&repo_hash, model_name)
+        {
             return Ok((format!("(Cached Overview)\n{}", cached_overview), true));
         }
 
-        let raw_overview = query::engine::build_project_overview(self.db).map_err(|e| e.to_string())?;
-        
+        let raw_overview =
+            query::engine::build_project_overview(self.db).map_err(|e| e.to_string())?;
+
         let overview_json = serde_json::to_string_pretty(&raw_overview).unwrap_or_default();
-        
+
+        // Ground the narrative in real graph signal instead of just raw
+        // directory/file counts — previously the prompt only saw "app/api has
+        // 50 files and 200 symbols" with no sense of which symbols actually
+        // anchor the architecture, so the model fell back to generic
+        // boilerplate ("showcases a well-structured web application...")
+        // that added nothing beyond what the counts already implied
+        // (benchmark run_001's finding on `project_overview_ai`). Hotspots
+        // and entrypoints are exactly the two signals a human architect would
+        // actually look at first.
+        let hotspots = query::graph::architectural_hotspots(self.db, 10, None)
+            .map(|h| h.top_hotspots)
+            .unwrap_or_default();
+        let hotspot_summary = hotspots
+            .iter()
+            .map(|h| {
+                format!(
+                    "- {} ({}) in {} — {} incoming / {} outgoing edges [{}]",
+                    h.name,
+                    h.kind,
+                    h.file_path,
+                    h.incoming_edges,
+                    h.outgoing_edges,
+                    h.classification
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let entrypoints = query::subsystem::list_entrypoints(self.db, None).unwrap_or_default();
+        let entrypoint_summary = {
+            let routes = entrypoints
+                .routes
+                .iter()
+                .take(15)
+                .map(|e| format!("- {} ({}) in {}", e.name, e.kind, e.file_path))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let pages = entrypoints
+                .pages
+                .iter()
+                .take(15)
+                .map(|e| format!("- {} ({}) in {}", e.name, e.kind, e.file_path))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "Routes/API endpoints ({} total):\n{}\n\nPage/layout entrypoints ({} total):\n{}",
+                entrypoints.routes.len(),
+                if routes.is_empty() {
+                    "(none indexed)"
+                } else {
+                    &routes
+                },
+                entrypoints.pages.len(),
+                if pages.is_empty() {
+                    "(none indexed)"
+                } else {
+                    &pages
+                }
+            )
+        };
+
         let prompt = format!(
-            "You are a Principal Systems Architect. Analyze the following raw topological metrics and subsystem distribution for this repository, and generate a highly professional architectural overview mapping out what this project likely does and what its major subsystems are responsible for. Do not list file paths explicitly, summarize their conceptual role.\n\nRaw Data:\n{}",
-            overview_json
+            "You are a Principal Systems Architect. Analyze the following raw topological metrics, architectural hotspots, and entrypoints for this repository, and generate a highly professional architectural overview mapping out what this project likely does and what its major subsystems are responsible for. Ground every subsystem claim in the hotspots and entrypoints below — do not infer subsystem boundaries from directory/file counts alone. Do not list file paths explicitly, summarize their conceptual role.\n\nRaw Topology:\n{}\n\nArchitectural Hotspots (highest in/out-degree symbols):\n{}\n\nEntrypoints:\n{}",
+            overview_json, hotspot_summary, entrypoint_summary
         );
 
         let (summary, _token_count) = self.provider.generate_summary(&prompt, 60, 4096)?;
 
-        let _ = self.db.save_repository_overview(&repo_hash, model_name, &summary);
+        let _ = self
+            .db
+            .save_repository_overview(&repo_hash, model_name, &summary);
 
         Ok((summary, false))
-    }
-}
-
-/// Result of a single generate_patch call. `introduced_identifiers` is a
-/// best-effort grounding check, not a guarantee: any identifier in the
-/// diff's added lines that doesn't appear anywhere in the target file or its
-/// known graph context (siblings/dependencies/callees/imports) gets flagged
-/// here. A flagged name is either a deliberately new identifier the
-/// instruction asked for, or a hallucinated reference to something that
-/// doesn't exist — the caller must check which before trusting the patch.
-pub struct PatchOutput {
-    /// Raw unified diff, Markdown fences stripped — pipes straight into
-    /// `git apply` / `patch` with no further processing.
-    pub diff: String,
-    /// The same diff wrapped in a ```diff fence, for human-readable display.
-    pub rendered_diff: String,
-    pub introduced_identifiers: Vec<String>,
-}
-
-pub struct PatchGenerator<'a> {
-    db: &'a Database,
-    provider: Box<dyn LlmProvider>,
-}
-
-/// Identifier-like tokens common enough across JS/TS/Python/Rust that
-/// flagging them as "introduced" would be pure noise.
-const IDENTIFIER_STOPLIST: &[&str] = &[
-    "const", "let", "var", "function", "return", "if", "else", "for", "while", "import", "export",
-    "default", "class", "interface", "type", "async", "await", "try", "catch", "finally", "throw",
-    "new", "this", "super", "extends", "implements", "public", "private", "protected", "static",
-    "void", "null", "undefined", "true", "false", "from", "as", "of", "in", "do", "switch", "case",
-    "break", "continue", "typeof", "instanceof", "delete", "yield", "string", "number", "boolean",
-    "String", "Number", "Boolean", "Array", "Object", "Promise", "Error", "Map", "Set", "console",
-    "def", "self", "None", "True", "False", "lambda", "with", "global", "nonlocal", "pass", "elif",
-    "fn", "pub", "mut", "impl", "struct", "enum", "use", "mod", "match", "loop", "trait", "dyn",
-    "req", "res", "props", "params", "args", "kwargs", "data", "value", "values", "item", "items",
-    "index", "key", "result", "results", "error", "err", "name", "id", "type", "options", "config",
-];
-
-fn extract_identifiers(text: &str) -> std::collections::HashSet<String> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|s| s.len() >= 3 && !s.chars().next().unwrap_or('0').is_numeric())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-/// Blanks out the contents of string literals AND comments (best-effort, no
-/// escape handling) before identifier extraction. Without this, words inside a
-/// human-readable error message like `throw new Error("Division by zero")`, or
-/// an explanatory comment like `// use cryptographically secure randomness`,
-/// get flagged as "introduced identifiers" even though they're English prose,
-/// not code references — pure noise on the one signal this tool exists to
-/// provide. Handles `'`/`"`/`` ` `` strings, `//` and `#` line comments, and
-/// `/* ... */` block comments (single-line; the diff is processed line by line).
-fn strip_string_literals(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut quote: Option<char> = None;
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let chars: Vec<char> = line.chars().collect();
-    // Operate on chars but peek with a simple index; identifiers are ASCII so
-    // byte/char alignment for the comment markers we look for is fine.
-    let _ = bytes;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                } else {
-                    out.push(' ');
-                }
-                i += 1;
-            }
-            None => {
-                // Line comments: // (JS/TS/Rust) or # (Python) — blank the rest.
-                if c == '#' {
-                    break;
-                }
-                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                    break;
-                }
-                // Block comment /* ... */ — blank until the closing */ (or EOL).
-                if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
-                    i += 2;
-                    while i < chars.len() {
-                        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                            i += 2;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    continue;
-                }
-                if c == '\'' || c == '"' || c == '`' {
-                    quote = Some(c);
-                } else {
-                    out.push(c);
-                }
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
-/// Strips a Markdown code fence (```diff ... ```), if present, from an LLM
-/// patch response so the returned `diff` is a raw unified diff that pipes
-/// straight into `git apply`/`patch`. Models frequently wrap diffs in fences
-/// despite instructions not to; leaving them in both breaks `patch` and forces
-/// the caller to strip them by hand. Returns the inner content unchanged when
-/// no fence is present.
-fn strip_markdown_fence(text: &str) -> String {
-    let trimmed = text.trim();
-    if !trimmed.starts_with("```") {
-        return text.to_string();
-    }
-    let mut lines: Vec<&str> = trimmed.lines().collect();
-    // Drop the opening fence line (``` or ```diff etc).
-    if lines.first().map(|l| l.trim_start().starts_with("```")).unwrap_or(false) {
-        lines.remove(0);
-    }
-    // Drop the closing fence line if present.
-    if lines.last().map(|l| l.trim() == "```").unwrap_or(false) {
-        lines.pop();
-    }
-    lines.join("\n")
-}
-
-impl<'a> PatchGenerator<'a> {
-    pub fn new(db: &'a Database, provider: Box<dyn LlmProvider>) -> Self {
-        Self { db, provider }
-    }
-
-    pub fn generate_patch(&self, symbol_name: &str, instruction: &str) -> Result<PatchOutput, String> {
-        self.generate_patch_scoped(symbol_name, instruction, None)
-    }
-
-    /// Like `generate_patch`, but when `file_hint` is given, only resolves a
-    /// symbol defined in a file whose path contains that substring.
-    pub fn generate_patch_scoped(&self, symbol_name: &str, instruction: &str, file_hint: Option<&str>) -> Result<PatchOutput, String> {
-        let (file_id, _start_byte, _end_byte) = if let Some(hint) = file_hint {
-            let mut stmt = self.db.conn.prepare(
-                "SELECT symbols.file_id, symbols.start_byte, symbols.end_byte FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
-            ).map_err(|e| e.to_string())?;
-            let pattern = format!("%{}%", hint);
-            stmt.query_row(rusqlite::params![symbol_name, pattern], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-            }).map_err(|_| format!("Symbol '{}' not found in a file matching '{}'.", symbol_name, hint))?
-        } else {
-            let mut stmt = self.db.conn.prepare("SELECT file_id, start_byte, end_byte FROM symbols WHERE name = ?1 LIMIT 1")
-                .map_err(|e| e.to_string())?;
-            stmt.query_row([symbol_name], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-            }).map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?
-        };
-
-        let file_path: String = self.db.conn.query_row(
-            "SELECT path FROM files WHERE id = ?1",
-            [file_id],
-            |row| row.get(0)
-        ).map_err(|e| e.to_string())?;
-
-        let abs_file_path = self.db.resolve_path(&file_path);
-        let content = fs::read(&abs_file_path).map_err(|e| e.to_string())?;
-        // Ground the LLM in the FULL enclosing file, not just the target
-        // symbol's own slice. Previously only the symbol's isolated source
-        // was shown, so the model had no way to know what helpers/imports/
-        // types actually exist elsewhere in the file and would invent
-        // plausible-looking calls to things that don't exist. Showing the
-        // whole file also gives correct line context for the diff hunks.
-        let full_file_source = String::from_utf8_lossy(&content).to_string();
-
-        let context = ContextObject::assemble(self.db, symbol_name)
-            .map_err(|e| e.to_string())?
-            .ok_or("Failed to assemble context")?;
-
-        let prompt = build_patch_prompt(symbol_name, &full_file_source, &context, instruction);
-        let (raw_patch, _) = self.provider.generate_summary(&prompt, 300, 8192)?;
-        // Models often wrap the diff in a Markdown fence despite instructions;
-        // strip it so `diff` is directly consumable by `git apply`/`patch`.
-        let patch = strip_markdown_fence(&raw_patch);
-
-        // Grounding check: collect every identifier that's actually known —
-        // from the file itself plus the graph context — and flag anything
-        // added by the diff that isn't in that set.
-        let mut known: std::collections::HashSet<String> = extract_identifiers(&full_file_source);
-        for s in &context.siblings { known.extend(extract_identifiers(s)); }
-        for s in &context.forward_dependencies { known.extend(extract_identifiers(s)); }
-        for s in &context.callees { known.extend(extract_identifiers(s)); }
-        for s in &context.external_imports { known.extend(extract_identifiers(s)); }
-        for s in &context.renders_components { known.extend(extract_identifiers(s)); }
-        for s in &context.consumes_hooks { known.extend(extract_identifiers(s)); }
-        known.extend(extract_identifiers(symbol_name));
-
-        let mut introduced: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for line in patch.lines() {
-            if !line.starts_with('+') || line.starts_with("+++") {
-                continue;
-            }
-            for token in extract_identifiers(&strip_string_literals(&line[1..])) {
-                if IDENTIFIER_STOPLIST.contains(&token.as_str()) {
-                    continue;
-                }
-                if !known.contains(&token) && seen.insert(token.clone()) {
-                    introduced.push(token);
-                }
-            }
-        }
-
-        let rendered_diff = format!("```diff\n{}\n```", patch.trim_end());
-        Ok(PatchOutput { diff: patch, rendered_diff, introduced_identifiers: introduced })
-    }
-
-    /// Resolves the absolute file path a symbol lives in, scoped by an
-    /// optional file_hint for disambiguation when the name is ambiguous.
-    pub fn resolve_file_path_scoped(&self, symbol_name: &str, file_hint: Option<&str>) -> Result<String, String> {
-        let file_id: i64 = if let Some(hint) = file_hint {
-            let pattern = format!("%{}%", hint);
-            self.db.conn.query_row(
-                "SELECT symbols.file_id FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1",
-                rusqlite::params![symbol_name, pattern],
-                |row| row.get(0),
-            ).map_err(|_| format!("Symbol '{}' not found in a file matching '{}'.", symbol_name, hint))?
-        } else {
-            self.db.conn.query_row(
-                "SELECT file_id FROM symbols WHERE name = ?1 LIMIT 1",
-                [symbol_name],
-                |row| row.get(0),
-            ).map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?
-        };
-
-        let file_path: String = self.db.conn.query_row(
-            "SELECT path FROM files WHERE id = ?1",
-            [file_id],
-            |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-
-        Ok(self.db.resolve_path(&file_path))
-    }
-
-    /// Resolves the absolute file path a symbol lives in. Read-only helper for
-    /// callers that need to locate a symbol's file (CodeBroker itself never
-    /// writes patches to disk — that's the caller's job via native tooling).
-    pub fn resolve_file_path(&self, symbol_name: &str) -> Result<String, String> {
-        self.resolve_file_path_scoped(symbol_name, None)
-    }
-}
-
-#[cfg(test)]
-mod patch_helper_tests {
-    use super::*;
-
-    // #5 — diff_output_fixture: a fenced LLM response must come back as a raw
-    // unified diff (no ``` markers) so it pipes into git apply / patch.
-    #[test]
-    fn strip_markdown_fence_removes_diff_fence() {
-        let fenced = "```diff\n--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new\n```";
-        let raw = strip_markdown_fence(fenced);
-        assert!(!raw.contains("```"), "fences must be stripped: {:?}", raw);
-        assert!(raw.starts_with("--- a/foo.ts"));
-        assert!(raw.trim_end().ends_with("+new"));
-    }
-
-    #[test]
-    fn strip_markdown_fence_leaves_unfenced_diff_untouched() {
-        let raw = "--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new";
-        assert_eq!(strip_markdown_fence(raw), raw);
-    }
-
-    // #6 — introduced_identifier_fixture: prose inside comments and string
-    // literals must NOT be scanned as identifiers.
-    #[test]
-    fn strip_string_literals_blanks_line_comments() {
-        let line = "const x = 1; // use cryptographically secure randomness";
-        let cleaned = strip_string_literals(line);
-        assert!(!cleaned.contains("cryptographically"));
-        assert!(!cleaned.contains("secure"));
-        assert!(!cleaned.contains("randomness"));
-        assert!(cleaned.contains("const x"));
-    }
-
-    #[test]
-    fn strip_string_literals_blanks_python_and_block_comments() {
-        assert!(!strip_string_literals("y = 2  # explanatory prose here").contains("prose"));
-        let block = "foo(); /* hidden explanation words */ bar();";
-        let cleaned = strip_string_literals(block);
-        assert!(!cleaned.contains("explanation"));
-        assert!(cleaned.contains("foo"));
-        assert!(cleaned.contains("bar"));
-    }
-
-    #[test]
-    fn strip_string_literals_blanks_string_contents() {
-        let line = r#"throw new Error("Division by zero occurred")"#;
-        let cleaned = strip_string_literals(line);
-        assert!(!cleaned.contains("Division"));
-        assert!(!cleaned.contains("occurred"));
-        assert!(cleaned.contains("Error"));
-    }
-
-    // #14 — scope_grounded check: a real new code identifier IS extracted (so it
-    // can be flagged as introduced), while comment/string prose is not.
-    #[test]
-    fn extract_identifiers_picks_code_not_prose() {
-        let added_code = strip_string_literals("const setSubmitting = useState(false); // toggles spinner");
-        let ids = extract_identifiers(&added_code);
-        assert!(ids.contains("setSubmitting"), "real code identifier must be extracted: {:?}", ids);
-        assert!(!ids.contains("toggles"), "comment prose must not be extracted");
-        assert!(!ids.contains("spinner"));
     }
 }

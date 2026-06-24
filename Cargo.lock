@@ -1467,6 +1467,8 @@ dependencies = [
 name = "semantic"
 version = "0.1.0"
 dependencies = [
+ "graph",
+ "indexer",
  "query",
  "reqwest",
  "rusqlite",

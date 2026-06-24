@@ -1,13 +1,13 @@
 use query::context::ContextObject;
 
 pub fn build_prompt(
-    symbol_name: &str, 
-    source_code: &str, 
+    symbol_name: &str,
+    source_code: &str,
     context: &ContextObject,
-    config_files_text: &str
+    config_files_text: &str,
 ) -> String {
     let json_context = serde_json::to_string_pretty(context).unwrap_or_default();
-    
+
     // We construct a massive, highly structured string using the format! macro
     format!(
         "You are an expert AI software architect. Analyze the following code symbol and explain its purpose, its role in the system, and what impact modifying it would have based on its blast radius.
@@ -30,42 +30,5 @@ The following JSON object contains the exact dependencies, reverse dependencies,
 ```
 
 Keep your summary concise, highly technical, and focus on system architecture."
-    )
-}
-
-pub fn build_patch_prompt(
-    symbol_name: &str,
-    full_file_source: &str,
-    context: &ContextObject,
-    instruction: &str
-) -> String {
-    let json_context = serde_json::to_string_pretty(context).unwrap_or_default();
-
-    format!(
-        "You are an expert AI software architect and engineer. You are given the FULL source of the file containing a target symbol, along with its graph dependencies.
-Your task is to generate a valid unified diff patch that applies the requested changes.
-
-Target Symbol: {symbol_name}
-
-=== GROUNDING RULES (do not violate these) ===
-1. Only call functions, reference variables, or import modules that ALREADY appear in the FULL FILE SOURCE below or in the GRAPH DEPENDENCIES context. Do not invent helper functions, hooks, utilities, or APIs that you assume \"probably exist\" — if something doesn't appear in the provided source or context, do not call it.
-2. If the requested change genuinely requires a new identifier (a new local variable, a new parameter, a new constant), that is fine — but prefer names that don't collide with anything already in the file.
-3. Base line numbers and surrounding context in your diff hunks on the FULL FILE SOURCE exactly as given below, not on a guess of what the file \"usually\" looks like.
-
-=== GRAPH DEPENDENCIES (Blast Radius) ===
-```json
-{json_context}
-```
-
-=== FULL FILE SOURCE ===
-```
-{full_file_source}
-```
-
-=== REQUESTED CHANGE ===
-{instruction}
-
-Generate ONLY a standard unified diff patch block. Do not include conversational text or explanations. Use `---` and `+++` for the file header, and use standard `@@` hunks.
-"
     )
 }

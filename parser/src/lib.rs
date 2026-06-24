@@ -1,10 +1,10 @@
-pub mod treesitter;
+pub mod config_frontend;
 pub mod extractor;
 pub mod frontend;
-pub mod typescript_frontend;
-pub mod python_frontend;
-pub mod config_frontend;
-pub mod vue_frontend;
-pub mod svelte_frontend;
 pub mod javascript_frontend;
+pub mod python_frontend;
+pub mod svelte_frontend;
+pub mod treesitter;
+pub mod typescript_frontend;
 pub mod utils;
+pub mod vue_frontend;

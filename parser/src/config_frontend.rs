@@ -1,20 +1,28 @@
 use crate::frontend::LanguageFrontend;
-use graph::{SymbolNode, ImportNode};
+use graph::{ImportNode, SymbolNode};
 
 pub struct ConfigFrontend;
 
 impl LanguageFrontend for ConfigFrontend {
     fn can_handle(&self, path: &str) -> bool {
-        path.ends_with("package.json") ||
-        path.ends_with("tsconfig.json") ||
-        path.ends_with("Cargo.toml") ||
-        path.ends_with("pyproject.toml") ||
-        path.ends_with("requirements.txt") ||
-        path.ends_with("docker-compose.yml") ||
-        path.ends_with("Dockerfile")
+        path.ends_with("package.json")
+            || path.ends_with("tsconfig.json")
+            || path.ends_with("Cargo.toml")
+            || path.ends_with("pyproject.toml")
+            || path.ends_with("requirements.txt")
+            || path.ends_with("docker-compose.yml")
+            || path.ends_with("Dockerfile")
     }
 
-    fn parse_and_extract(&self, source_code: &str, path: &str) -> Option<(graph::models::FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
+    fn parse_and_extract(
+        &self,
+        source_code: &str,
+        path: &str,
+    ) -> Option<(
+        graph::models::FileMetadata,
+        Vec<SymbolNode>,
+        Vec<ImportNode>,
+    )> {
         let mut symbols = Vec::new();
 
         if path.ends_with("package.json") {
@@ -22,30 +30,47 @@ impl LanguageFrontend for ConfigFrontend {
                 if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
                     for (k, _) in deps {
                         symbols.push(SymbolNode {
+                            route_path: None,
+                            route_method: None,
                             name: k.clone(),
                             kind: "dependency".to_string(),
                             prop_type: None,
-                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0, signature: None,
+                            start_line: 0,
+                            end_line: 0,
+                            start_byte: 0,
+                            end_byte: 0,
+                            signature: None,
                         });
                     }
                 }
                 if let Some(dev_deps) = json.get("devDependencies").and_then(|d| d.as_object()) {
                     for (k, _) in dev_deps {
                         symbols.push(SymbolNode {
+                            route_path: None,
+                            route_method: None,
                             name: k.clone(),
                             kind: "devDependency".to_string(),
                             prop_type: None,
-                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0, signature: None,
+                            start_line: 0,
+                            end_line: 0,
+                            start_byte: 0,
+                            end_byte: 0,
+                            signature: None,
                         });
                     }
                 }
                 if let Some(scripts) = json.get("scripts").and_then(|d| d.as_object()) {
                     for (k, _) in scripts {
                         symbols.push(SymbolNode {
+                            route_path: None,
+                            route_method: None,
                             name: k.clone(),
                             kind: "script".to_string(),
                             prop_type: None,
-                            start_line: 0, end_line: 0, start_byte: 0, end_byte: 0,
+                            start_line: 0,
+                            end_line: 0,
+                            start_byte: 0,
+                            end_byte: 0,
                             signature: None,
                         });
                     }

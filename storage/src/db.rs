@@ -1,6 +1,24 @@
-use rusqlite::{Connection, Result};
+use graph::{ImportNode, SymbolNode};
 use rusqlite::params;
-use graph::{SymbolNode, ImportNode};
+use rusqlite::{Connection, Result};
+
+/// Names so generic and widely reused (HTTP route-handler conventions,
+/// common factory functions) that a bare-name match against them is more
+/// likely a coincidence than a real call/reference. Matching these globally
+/// fabricated phantom edges (e.g. every `query.delete()` linking to an
+/// exported `DELETE` route, or every import of *some* `createClient` linking
+/// to one unrelated local helper).
+pub const GENERIC_SYMBOL_NAMES: &[&str] = &[
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "PATCH",
+    "HEAD",
+    "OPTIONS",
+    "createClient",
+    "createContext",
+];
 
 use crate::schema::INIT_SQL;
 
@@ -14,12 +32,14 @@ pub fn normalize_path(path: &std::path::Path) -> String {
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                match components.last() {
-                    Some(Component::Normal(_)) => { components.pop(); }
-                    _ => { components.push(component); }
+            Component::ParentDir => match components.last() {
+                Some(Component::Normal(_)) => {
+                    components.pop();
                 }
-            }
+                _ => {
+                    components.push(component);
+                }
+            },
             other => components.push(other),
         }
     }
@@ -48,6 +68,45 @@ pub fn hash_content(content: &[u8]) -> String {
     format!("{:x}", hasher.finish())
 }
 
+/// Serializes an embedding vector to a flat little-endian f32 BLOB for
+/// storage in `symbol_embeddings.embedding`. Chosen over a JSON array of
+/// floats to keep the table compact and avoid repeated float-formatting
+/// precision loss on every read of a value that's never edited by hand.
+pub fn embedding_to_blob(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for v in vector {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// Inverse of `embedding_to_blob`. Silently drops a trailing partial float
+/// (a corrupt/truncated row) rather than erroring — callers treat a missing
+/// or malformed embedding as "not embedded yet," not a hard failure.
+pub fn blob_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Cosine similarity between two equal-length embedding vectors. Returns 0.0
+/// for a length mismatch or a zero-magnitude vector rather than panicking or
+/// returning NaN — both are "this comparison is meaningless," not an error
+/// worth propagating through every caller.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return 0.0;
+    }
+    dot / (mag_a * mag_b)
+}
+
 pub struct CodeBrokerStats {
     pub files_indexed: i64,
     pub summaries_generated: i64,
@@ -62,12 +121,12 @@ impl Database {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        
+
         // Canonicalize the db_path to absolute, then get parent (.codebroker), then get its parent (project root)
         let abs_db_path = std::path::Path::new(db_path)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(db_path));
-            
+
         let project_root = abs_db_path
             .parent()
             .and_then(|p| p.parent())
@@ -75,7 +134,17 @@ impl Database {
             .to_string_lossy()
             .to_string();
 
-        Ok(Database { conn, project_root })
+        let db = Database { conn, project_root };
+        // Every caller of `new` used to be responsible for calling
+        // `init_schema` itself, and most forgot to — a database created
+        // before a later migration (e.g. `edges.source_symbol_id`) would
+        // then surface a raw "no such column" SQLite error from whichever
+        // query happened to need it first. `init_schema` is pure
+        // `CREATE TABLE IF NOT EXISTS` + best-effort `ALTER TABLE ADD
+        // COLUMN`, so running it unconditionally on every open is safe and
+        // keeps any pre-existing database current.
+        db.init_schema()?;
+        Ok(db)
     }
 
     /// Resolves a stored relative path into an absolute path based on the project root
@@ -88,29 +157,103 @@ impl Database {
     /// Creates the tables if they don't already exist
     pub fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(INIT_SQL)?;
-        
+
         // Safely migrate old schemas
-        let _ = self.conn.execute("ALTER TABLE symbols RENAME COLUMN line_number TO start_line;", []);
-        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0;", []);
-        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN start_byte INTEGER NOT NULL DEFAULT 0;", []);
-        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER NOT NULL DEFAULT 0;", []);
-        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN prop_type TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN directive TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE symbols ADD COLUMN signature TEXT;", []);
-        let _ = self.conn.execute("ALTER TABLE files ADD COLUMN content_hash TEXT;", []);
+        let _ = self.conn.execute(
+            "ALTER TABLE symbols RENAME COLUMN line_number TO start_line;",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE symbols ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0;",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE symbols ADD COLUMN start_byte INTEGER NOT NULL DEFAULT 0;",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE symbols ADD COLUMN end_byte INTEGER NOT NULL DEFAULT 0;",
+            [],
+        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE symbols ADD COLUMN prop_type TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE files ADD COLUMN directive TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE symbols ADD COLUMN signature TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE files ADD COLUMN content_hash TEXT;", []);
         // Which symbol an edge originates FROM. Edges are otherwise recorded at
         // file granularity (source_file_id only); for cycle detection that's
         // ambiguous — every symbol in a file looked like the source of every
         // edge leaving it, manufacturing same-file "cycles". Nullable: top-level
         // imports and non-call edges have no enclosing symbol, and pre-existing
         // databases carry NULL here until reindexed.
-        let _ = self.conn.execute("ALTER TABLE edges ADD COLUMN source_symbol_id INTEGER;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE edges ADD COLUMN source_symbol_id INTEGER;", []);
+        // Distinguishes AST-derived edges ("static") from edges inferred by
+        // matching a runtime boundary pattern, e.g. a `fetch("/api/...")`
+        // literal resolved to the route handler that answers it ("logical").
+        // Defaulted to 'static' so every pre-existing row (all of which came
+        // from syntax-walking) is correctly classified with no backfill pass.
+        let _ = self.conn.execute(
+            "ALTER TABLE edges ADD COLUMN edge_type TEXT NOT NULL DEFAULT 'static';",
+            [],
+        );
 
         Ok(())
+    }
+
+    /// Counts indexed files whose on-disk content no longer matches the hash
+    /// recorded at index time (i.e. edited outside CodeBroker since the last
+    /// `reindex_workspace`). Capped at `limit` files so this stays cheap on a
+    /// large repo — `total_checked < limit` tells the caller the scan covered
+    /// every file; `stale_count` may then undercount on a workspace with more
+    /// files than `limit` that aren't otherwise touched by name.
+    pub fn count_stale_files(&self, limit: usize) -> Result<(usize, usize)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files LIMIT ?1")?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut total_checked = 0usize;
+        let mut stale_count = 0usize;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let indexed_hash: Option<String> = row.get(1)?;
+            total_checked += 1;
+            let Some(indexed_hash) = indexed_hash else {
+                continue;
+            };
+            let abs_path = self.resolve_path(&path);
+            match std::fs::read(&abs_path) {
+                Ok(content) => {
+                    if hash_content(&content) != indexed_hash {
+                        stale_count += 1;
+                    }
+                }
+                // A file that's gone missing since indexing is just as stale
+                // as one with edited content.
+                Err(_) => stale_count += 1,
+            }
+        }
+        Ok((stale_count, total_checked))
     }
 
     /// Inserts a file and returns its new SQLite ID. `content_hash` (from
@@ -125,7 +268,13 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn update_file_metadata(&self, file_id: i64, directive: Option<&str>, route_path: Option<&str>, route_segment: Option<&str>) -> Result<()> {
+    pub fn update_file_metadata(
+        &self,
+        file_id: i64,
+        directive: Option<&str>,
+        route_path: Option<&str>,
+        route_segment: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE files SET directive = ?1, route_path = ?2, route_segment = ?3 WHERE id = ?4",
             params![directive, route_path, route_segment, file_id],
@@ -142,22 +291,111 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn insert_entrypoint(
+        &self,
+        symbol_id: i64,
+        route_path: &str,
+        method: &str,
+    ) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT INTO entrypoints (symbol_id, route_path, method) VALUES (?1, ?2, ?3)",
+            rusqlite::params![symbol_id, route_path, method],
+        )?;
+        Ok(())
+    }
+
+    /// Stores (or replaces) a symbol's embedding vector. `REPLACE` rather
+    /// than `INSERT` since a symbol whose body changed gets re-embedded with
+    /// the same symbol_id when an incremental reindex only touched its
+    /// signature/content, not its declaration identity.
+    pub fn upsert_symbol_embedding(
+        &self,
+        symbol_id: i64,
+        embedding: &[f32],
+        model: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO symbol_embeddings (symbol_id, embedding, model) VALUES (?1, ?2, ?3)",
+            params![symbol_id, embedding_to_blob(embedding), model],
+        )?;
+        Ok(())
+    }
+
+    /// All stored embeddings, joined back to their symbol's name/kind/file
+    /// for direct use as search results. A linear scan over this is fine at
+    /// the symbol counts CodeBroker indexes (hundreds to low thousands) —
+    /// not worth standing up a real vector index for.
+    pub fn get_all_symbol_embeddings(&self) -> Result<Vec<(i64, String, String, String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbol_embeddings.embedding
+             FROM symbol_embeddings
+             JOIN symbols ON symbol_embeddings.symbol_id = symbols.id
+             JOIN files ON symbols.file_id = files.id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Symbols that have no row in `symbol_embeddings` yet — either never
+    /// embedded (no API key was set at index time) or re-inserted with a new
+    /// id by an incremental reindex (whose old embedding row was deleted by
+    /// `delete_file_data`). Lets a caller backfill embeddings incrementally
+    /// instead of re-embedding the whole repo on every reindex.
+    pub fn symbols_missing_embeddings(
+        &self,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.signature, semantic_summaries.summary
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             LEFT JOIN semantic_summaries ON semantic_summaries.symbol_id = symbols.id
+             LEFT JOIN symbol_embeddings ON symbol_embeddings.symbol_id = symbols.id
+             WHERE symbol_embeddings.symbol_id IS NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Inserts an import as a special kind of symbol
-     pub fn insert_raw_import(&self, file_id: i64, import: &ImportNode) -> Result<i64> {
+    pub fn insert_raw_import(&self, file_id: i64, import: &ImportNode) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO raw_imports (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![file_id, import.name, import.source, import.line_number as i64, import.kind],
         )?;
         Ok(self.conn.last_insert_rowid())
-    
     }
 
-    // new methods: 
+    // new methods:
 
-        /// Pass 2 Helper: Gets all staged imports that need to be resolved
-    pub fn get_all_raw_imports(&self) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>)>> {
+    /// Pass 2 Helper: Gets all staged imports that need to be resolved
+    pub fn get_all_raw_imports(
+        &self,
+    ) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>)>> {
         // Returns a tuple of (raw_import_id, file_id, import_name, source, kind)
-        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source, kind FROM raw_imports")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, file_id, name, source, kind FROM raw_imports")?;
 
         let import_iter = stmt.query_map([], |row| {
             Ok((
@@ -181,8 +419,12 @@ impl Database {
     /// originates from (`enclosing_symbol_id`) and record it as the edge's
     /// `source_symbol_id`, so cycle detection has a real symbol-level graph.
     /// Tuple: (raw_import_id, file_id, import_name, source, kind, line_number).
-    pub fn get_all_raw_imports_with_lines(&self) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>, i64)>> {
-        let mut stmt = self.conn.prepare("SELECT id, file_id, name, source, kind, line_number FROM raw_imports")?;
+    pub fn get_all_raw_imports_with_lines(
+        &self,
+    ) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_id, name, source, kind, line_number FROM raw_imports ORDER BY id",
+        )?;
         let import_iter = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -209,7 +451,7 @@ impl Database {
             "SELECT id FROM symbols
              WHERE file_id = ?1 AND start_line <= ?2 AND end_line >= ?2
              ORDER BY (end_line - start_line) ASC
-             LIMIT 1"
+             LIMIT 1",
         )?;
         let result = stmt.query_row(params![file_id, line], |row| row.get(0));
         match result {
@@ -223,7 +465,11 @@ impl Database {
     /// by its stored (relative) path, so a re-parse can clear its stale data
     /// first instead of accumulating duplicate symbols/edges.
     pub fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>> {
-        let result = self.conn.query_row("SELECT id FROM files WHERE path = ?1", params![path], |row| row.get(0));
+        let result = self.conn.query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        );
         match result {
             Ok(id) => Ok(Some(id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -231,23 +477,39 @@ impl Database {
         }
     }
 
-    /// Incremental reindex helper: clears all symbols, edges, and raw_imports
-    /// tied to a file before re-parsing it. Must run before re-inserting fresh
-    /// rows for the same file — `init_schema` never enables `PRAGMA
-    /// foreign_keys`, so the `ON DELETE CASCADE` declared in the schema is
-    /// inert and stale rows would otherwise dangle or double up on re-link.
+    /// Incremental reindex helper: clears all symbols, edges, raw_imports, and
+    /// embeddings tied to a file before re-parsing it. Must run before
+    /// re-inserting fresh rows for the same file — `init_schema` never enables
+    /// `PRAGMA foreign_keys`, so the `ON DELETE CASCADE` declared in the
+    /// schema is inert and stale rows would otherwise dangle or double up on
+    /// re-link. The `symbol_embeddings` delete matters for the same reason:
+    /// symbols are about to be deleted and reinserted with new ids, so their
+    /// old embedding rows (keyed by the old id) would otherwise become
+    /// permanently orphaned, silently bloating the table without ever being
+    /// queryable again.
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM symbol_embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
         self.conn.execute("DELETE FROM edges WHERE target_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
-        self.conn.execute("DELETE FROM edges WHERE source_file_id = ?1", params![file_id])?;
-        self.conn.execute("DELETE FROM raw_imports WHERE file_id = ?1", params![file_id])?;
-        self.conn.execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
-        self.conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+        self.conn.execute(
+            "DELETE FROM edges WHERE source_file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM raw_imports WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+        self.conn
+            .execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
         Ok(())
     }
 
     /// Pass 2 Helper: Tries to find a physical symbol matching the import name
     pub fn find_symbol_id_by_name(&self, name: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE LOWER(name) = LOWER(?1) LIMIT 1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM symbols WHERE LOWER(name) = LOWER(?1) ORDER BY id LIMIT 1")?;
 
         // We use query_row because we only expect 0 or 1 result
         let result = stmt.query_row(params![name], |row| row.get(0));
@@ -268,8 +530,12 @@ impl Database {
     /// symbol's id and its defining file_id (the caller needs the file_id to
     /// skip self-referential edges).
     pub fn find_symbol_exact_with_file(&self, name: &str) -> Result<Option<(i64, i64)>> {
-        let mut stmt = self.conn.prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")?;
-        let result = stmt.query_row(params![name], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)));
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, file_id FROM symbols WHERE name = ?1 ORDER BY id LIMIT 1")?;
+        let result = stmt.query_row(params![name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        });
         match result {
             Ok(pair) => Ok(Some(pair)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -281,7 +547,9 @@ impl Database {
     /// resolve a free call to a same-file helper without risking a cross-file
     /// phantom match.
     pub fn find_symbol_id_in_file_exact(&self, file_id: i64, name: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 ORDER BY id LIMIT 1",
+        )?;
         let result = stmt.query_row(params![file_id, name], |row| row.get(0));
         match result {
             Ok(id) => Ok(Some(id)),
@@ -289,11 +557,14 @@ impl Database {
             Err(e) => Err(e),
         }
     }
-    
-
 
     /// Creates a directional relationship between two symbols
-    pub fn insert_edge(&self, source_file_id: i64, target_symbol_id: i64, kind: &str) -> Result<()> {
+    pub fn insert_edge(
+        &self,
+        source_file_id: i64,
+        target_symbol_id: i64,
+        kind: &str,
+    ) -> Result<()> {
         self.insert_edge_attributed(source_file_id, None, target_symbol_id, kind)
     }
 
@@ -303,7 +574,30 @@ impl Database {
     /// no enclosing symbol (top-level imports) or that aren't symbol-scoped.
     /// dependency_cycles relies on this attribution to build an accurate
     /// symbol-level graph instead of a file-level cartesian product.
-    pub fn insert_edge_attributed(&self, source_file_id: i64, source_symbol_id: Option<i64>, target_symbol_id: i64, kind: &str) -> Result<()> {
+    pub fn insert_edge_attributed(
+        &self,
+        source_file_id: i64,
+        source_symbol_id: Option<i64>,
+        target_symbol_id: i64,
+        kind: &str,
+    ) -> Result<()> {
+        // A single raw_import can yield the same logical edge more than once
+        // (e.g. the same name appearing in several word-split fallback
+        // matches, or being imported more than once in the same file). Without
+        // a dedup check, edge counts for hotspot/cycle scoring inflate by a
+        // factor that depends on how many times a name happened to be
+        // re-encountered — not on the actual number of relationships — which
+        // is itself a source of run-to-run-looking instability. `source_symbol_id`
+        // is compared with `IS`, not `=`, so two NULLs (both "no enclosing
+        // symbol") count as the same edge rather than always comparing unequal.
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_file_id = ?1 AND source_symbol_id IS ?2 AND target_symbol_id = ?3 AND kind = ?4)",
+            params![source_file_id, source_symbol_id, target_symbol_id, kind],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
             params![source_file_id, source_symbol_id, target_symbol_id, kind],
@@ -311,18 +605,44 @@ impl Database {
         Ok(())
     }
 
+    /// Inserts a logical edge (`graph::EdgeType::Logical`) — one inferred by
+    /// matching a runtime-boundary pattern (HTTP fetch, websocket emit) to
+    /// the symbol that handles it, rather than found by walking syntax. Same
+    /// dedup contract as `insert_edge_attributed`: a (source_symbol_id,
+    /// target_symbol_id, kind) triple is only ever stored once.
+    pub fn insert_logical_edge(
+        &self,
+        source_file_id: i64,
+        source_symbol_id: Option<i64>,
+        target_symbol_id: i64,
+        kind: &str,
+    ) -> Result<()> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_symbol_id IS ?1 AND target_symbol_id = ?2 AND kind = ?3 AND edge_type = 'logical')",
+            params![source_symbol_id, target_symbol_id, kind],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, edge_type) VALUES (?1, ?2, ?3, ?4, 'logical')",
+            params![source_file_id, source_symbol_id, target_symbol_id, kind],
+        )?;
+        Ok(())
+    }
 
-        /// Layer 3: Save an AI-generated summary to the Knowledge Store
-     /// Layer 3: Save an AI-generated summary to the Knowledge Store with metadata
+    /// Layer 3: Save an AI-generated summary to the Knowledge Store
+    /// Layer 3: Save an AI-generated summary to the Knowledge Store with metadata
     pub fn save_semantic_summary(
-        &self, 
-        symbol_id: i64, 
-        summary: &str, 
-        source_hash: &str, 
+        &self,
+        symbol_id: i64,
+        summary: &str,
+        source_hash: &str,
         context_hash: &str,
         model_name: &str,
         token_count: usize,
-        generation_time_ms: u128
+        generation_time_ms: u128,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO semantic_summaries (symbol_id, summary, source_hash, context_hash, model_name, token_count, generation_time_ms, hit_count) 
@@ -333,50 +653,68 @@ impl Database {
 
     /// Layer 3: Retrieve a cached summary and increment its hit_count
     pub fn get_cached_summary(
-        &self, 
-        symbol_id: i64, 
-        source_hash: &str, 
+        &self,
+        symbol_id: i64,
+        source_hash: &str,
         context_hash: &str,
-        model_name: &str
+        model_name: &str,
     ) -> Result<Option<String>> {
         // 1. Fetch the summary and its primary ID
         let mut stmt = self.conn.prepare(
             "SELECT id, summary FROM semantic_summaries 
              WHERE symbol_id = ?1 AND source_hash = ?2 AND context_hash = ?3 AND model_name = ?4 
-             ORDER BY created_at DESC LIMIT 1"
+             ORDER BY created_at DESC LIMIT 1",
         )?;
-        
-        let result = stmt.query_row(params![symbol_id, source_hash, context_hash, model_name], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        });
+
+        let result = stmt.query_row(
+            params![symbol_id, source_hash, context_hash, model_name],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        );
 
         match result {
             Ok((id, summary)) => {
                 // 2. Increment the hit_count!
-                let _ = self.conn.execute("UPDATE semantic_summaries SET hit_count = hit_count + 1 WHERE id = ?1", params![id]);
+                let _ = self.conn.execute(
+                    "UPDATE semantic_summaries SET hit_count = hit_count + 1 WHERE id = ?1",
+                    params![id],
+                );
                 Ok(Some(summary))
-            },
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-
-
-        /// Phase 2: Aggregates metrics for the Knowledge Dashboard
+    /// Phase 2: Aggregates metrics for the Knowledge Dashboard
     pub fn get_codebroker_stats(&self) -> Result<CodeBrokerStats> {
-        let files_indexed: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
-        let summaries_generated: i64 = self.conn.query_row("SELECT COUNT(*) FROM semantic_summaries", [], |row| row.get(0)).unwrap_or(0);
-        
+        let files_indexed: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap_or(0);
+        let summaries_generated: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM semantic_summaries", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
         // Sum up all the hits
-        let total_cache_hits: i64 = self.conn.query_row("SELECT SUM(hit_count) FROM semantic_summaries", [], |row| row.get(0)).unwrap_or(0);
-        
+        let total_cache_hits: i64 = self
+            .conn
+            .query_row("SELECT SUM(hit_count) FROM semantic_summaries", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+
         // Grab all file paths so we can calculate languages
         let mut extensions = std::collections::HashMap::new();
         if let Ok(mut stmt) = self.conn.prepare("SELECT path FROM files") {
             if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
                 for path in rows.flatten() {
-                    if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
+                    if let Some(ext) = std::path::Path::new(&path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                    {
                         *extensions.entry(ext.to_string()).or_insert(0) += 1;
                     }
                 }
@@ -387,7 +725,7 @@ impl Database {
             files_indexed,
             summaries_generated,
             total_cache_hits,
-            extensions
+            extensions,
         })
     }
 
@@ -400,9 +738,18 @@ impl Database {
     /// whenever any symbol's shape actually changes, while still avoiding a
     /// full re-read of file contents on every cache check.
     pub fn get_repository_topology_hash(&self) -> Result<String> {
-        let files: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0)).unwrap_or(0);
-        let symbols: i64 = self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0)).unwrap_or(0);
-        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0)).unwrap_or(0);
+        let files: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap_or(0);
+        let symbols: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))
+            .unwrap_or(0);
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap_or(0);
 
         let mut stmt = self.conn.prepare("SELECT path FROM files")?;
         let mut rows = stmt.query([])?;
@@ -420,7 +767,7 @@ impl Database {
         let mut sym_stmt = self.conn.prepare(
             "SELECT files.path, symbols.name, symbols.kind, symbols.signature
              FROM symbols JOIN files ON symbols.file_id = files.id
-             ORDER BY files.path, symbols.name"
+             ORDER BY files.path, symbols.name",
         )?;
         let mut sym_rows = sym_stmt.query([])?;
         let mut symbol_shapes = String::new();
@@ -442,12 +789,28 @@ impl Database {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
-        format!("{}-{}-{}-{}-{}", files, symbols, edges, top_modules, symbol_shapes).hash(&mut hasher);
+        format!(
+            "{}-{}-{}-{}-{}",
+            files, symbols, edges, top_modules, symbol_shapes
+        )
+        .hash(&mut hasher);
         Ok(format!("{:x}", hasher.finish()))
     }
 
-    pub fn save_repository_overview(&self, repository_hash: &str, model_name: &str, overview_text: &str) -> Result<()> {
-        let max_version: i64 = self.conn.query_row("SELECT MAX(topology_version) FROM repository_overviews", [], |row| row.get(0)).unwrap_or(0);
+    pub fn save_repository_overview(
+        &self,
+        repository_hash: &str,
+        model_name: &str,
+        overview_text: &str,
+    ) -> Result<()> {
+        let max_version: i64 = self
+            .conn
+            .query_row(
+                "SELECT MAX(topology_version) FROM repository_overviews",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         self.conn.execute(
             "INSERT INTO repository_overviews (repository_hash, topology_version, model_name, overview_text) VALUES (?1, ?2, ?3, ?4)",
             params![repository_hash, max_version + 1, model_name, overview_text]
@@ -455,11 +818,17 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_cached_repository_overview(&self, repository_hash: &str, model_name: &str) -> Result<Option<String>> {
+    pub fn get_cached_repository_overview(
+        &self,
+        repository_hash: &str,
+        model_name: &str,
+    ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT overview_text FROM repository_overviews WHERE repository_hash = ?1 AND model_name = ?2 ORDER BY created_at DESC LIMIT 1"
         )?;
-        let result = stmt.query_row(params![repository_hash, model_name], |row| row.get::<_, String>(0));
+        let result = stmt.query_row(params![repository_hash, model_name], |row| {
+            row.get::<_, String>(0)
+        });
         match result {
             Ok(summary) => Ok(Some(summary)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),

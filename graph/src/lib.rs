@@ -1,4 +1,5 @@
 pub mod models;
 
-pub use models::SymbolNode;
+pub use models::EdgeType;
 pub use models::ImportNode;
+pub use models::SymbolNode;

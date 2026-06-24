@@ -1,7 +1,7 @@
 use crate::frontend::LanguageFrontend;
-use graph::models::{FileMetadata, ImportNode, SymbolNode};
-use crate::typescript_frontend::TsxFrontend;
 use crate::javascript_frontend::JavaScriptFrontend;
+use crate::typescript_frontend::TsxFrontend;
+use graph::models::{FileMetadata, ImportNode, SymbolNode};
 
 pub struct SvelteFrontend;
 
@@ -10,7 +10,11 @@ impl LanguageFrontend for SvelteFrontend {
         path.ends_with(".svelte")
     }
 
-    fn parse_and_extract(&self, source_code: &str, path: &str) -> Option<(FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
+    fn parse_and_extract(
+        &self,
+        source_code: &str,
+        path: &str,
+    ) -> Option<(FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
         // Find <script> block and extract its content
         let mut script_content = String::new();
         let mut is_ts = false;
@@ -47,7 +51,8 @@ impl LanguageFrontend for SvelteFrontend {
 
         if let Some((_, _, ref mut imports)) = result {
             // Process template bindings
-            let re = regex::Regex::new(r#"(?:on:|bind:)[a-zA-Z0-9_\-]+=\{([a-zA-Z0-9_]+)(?:\(|})"#).unwrap();
+            let re = regex::Regex::new(r#"(?:on:|bind:)[a-zA-Z0-9_\-]+=\{([a-zA-Z0-9_]+)(?:\(|})"#)
+                .unwrap();
             for (line_idx, line) in source_code.lines().enumerate() {
                 for cap in re.captures_iter(line) {
                     if let Some(handler) = cap.get(1) {
@@ -61,7 +66,7 @@ impl LanguageFrontend for SvelteFrontend {
                 }
             }
         }
-        
+
         result
     }
 }

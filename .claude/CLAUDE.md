@@ -1,4 +1,4 @@
-## vexp - Context-Aware AI Coding <!-- vexp v2.0.32 -->
+## vexp - Context-Aware AI Coding <!-- vexp v2.0.33 -->
 
 ### MANDATORY: use vexp pipeline - do NOT grep or glob the codebase
 For every task - bug fixes, features, refactors, debugging:

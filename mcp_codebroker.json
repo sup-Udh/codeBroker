@@ -5,7 +5,7 @@
       "args": ["run", "-p", "mcp"],
       "cwd": "/home/labuser/code/codeBroker",
       "env": {
-        "HF_API_TOKEN": "your-token-here"
+        "OPENAI_API_KEY": "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"
       }
     }
   }

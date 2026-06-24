@@ -1,6 +1,6 @@
 use crate::frontend::LanguageFrontend;
-use graph::{SymbolNode, ImportNode};
-use tree_sitter::{Parser, Query, QueryCursor, Tree, StreamingIterator};
+use graph::{ImportNode, SymbolNode};
+use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct JavaScriptFrontend;
 
@@ -9,11 +9,19 @@ impl LanguageFrontend for JavaScriptFrontend {
         path.ends_with(".js") || path.ends_with(".jsx")
     }
 
-    fn parse_and_extract(&self, source_code: &str, _path: &str) -> Option<(graph::models::FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
+    fn parse_and_extract(
+        &self,
+        source_code: &str,
+        _path: &str,
+    ) -> Option<(
+        graph::models::FileMetadata,
+        Vec<SymbolNode>,
+        Vec<ImportNode>,
+    )> {
         let language = tree_sitter_javascript::LANGUAGE.into();
         let mut parser = Parser::new();
         parser.set_language(&language).ok()?;
-        
+
         let tree = parser.parse(source_code, None)?;
 
         let mut directive = None;
@@ -35,9 +43,17 @@ impl LanguageFrontend for JavaScriptFrontend {
     }
 }
 
-fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Language, path: &str) -> Vec<SymbolNode> {
+fn extract_js_symbols(
+    tree: &Tree,
+    source_code: &str,
+    _language: tree_sitter::Language,
+    path: &str,
+) -> Vec<SymbolNode> {
     let mut symbols = Vec::new();
-    let filename = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     let is_jsx = path.ends_with(".jsx");
     let query_str = "
         (class_declaration name: (identifier) @type)
@@ -57,7 +73,7 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             )
         )
     ";
-    
+
     let language = tree_sitter_javascript::LANGUAGE.into();
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
@@ -70,12 +86,47 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
                 let mut name_str = name.to_string();
                 let mut kind = capture_kind.to_string();
+                let mut route_path = None;
+                let mut route_method = None;
 
                 if kind == "jsx_render" {
                     name_str = "render".to_string();
                     kind = "jsx_element".to_string();
                 } else if kind == "function" {
-                    if name_str.starts_with("use") {
+                    const HTTP_METHODS: [&str; 7] =
+                        ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+                    if (filename == "route.js" || filename == "route.jsx")
+                        && HTTP_METHODS.contains(&name_str.as_str())
+                    {
+                        kind = "route".to_string();
+
+                        let mut p = path.to_string();
+                        if p.starts_with("./src/app") {
+                            p = p.replacen("./src/app", "", 1);
+                        } else if p.starts_with("./app") {
+                            p = p.replacen("./app", "", 1);
+                        } else if p.starts_with("src/app") {
+                            p = p.replacen("src/app", "", 1);
+                        } else if p.starts_with("app") {
+                            p = p.replacen("app", "", 1);
+                        }
+
+                        if p.ends_with("/route.js") {
+                            p = p.replacen("/route.js", "", 1);
+                        } else if p.ends_with("/route.jsx") {
+                            p = p.replacen("/route.jsx", "", 1);
+                        }
+
+                        if p.is_empty() {
+                            p = "/".to_string();
+                        }
+                        if !p.starts_with('/') {
+                            p = format!("/{}", p);
+                        }
+
+                        route_path = Some(p);
+                        route_method = Some(name_str.clone());
+                    } else if name_str.starts_with("use") {
                         kind = "hook".to_string();
                     } else if name_str.ends_with("Provider") {
                         kind = "provider".to_string();
@@ -118,7 +169,9 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     // A statement_block belongs to an enclosing function/method body.
                     // Anything nested inside one is a local, never a module-level export,
                     // no matter what wraps the enclosing function.
-                    if p.kind() == "program" || p.kind() == "statement_block" { break; }
+                    if p.kind() == "program" || p.kind() == "statement_block" {
+                        break;
+                    }
                     current = p;
                 }
 
@@ -147,12 +200,15 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                 let signature = decl_node
                     .and_then(|d| d.child_by_field_name("body"))
                     .and_then(|body| {
-                        source_code.get(parent.start_byte()..body.start_byte())
+                        source_code
+                            .get(parent.start_byte()..body.start_byte())
                             .map(|s| s.trim_end().to_string())
                     })
                     .filter(|s| !s.is_empty());
 
                 symbols.push(SymbolNode {
+                    route_path,
+                    route_method,
                     name: name_str,
                     kind,
                     prop_type: None,
@@ -168,7 +224,11 @@ fn extract_js_symbols(tree: &Tree, source_code: &str, language: tree_sitter::Lan
     symbols
 }
 
-fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Language) -> Vec<ImportNode> {
+fn extract_js_imports(
+    tree: &Tree,
+    source_code: &str,
+    language: tree_sitter::Language,
+) -> Vec<ImportNode> {
     let mut imports = Vec::new();
     let query_str = "
         (import_statement 
@@ -185,9 +245,14 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
         (jsx_expression (member_expression property: (property_identifier) @method_call))
         (call_expression function: (identifier) @call_name)
         (call_expression function: (member_expression property: (property_identifier) @method_call))
+        (call_expression 
+            function: [(identifier) @http_fn (member_expression property: (property_identifier) @http_fn)]
+            arguments: (arguments [(string (string_fragment) @http_route) (template_string (string_fragment) @http_route)])
+        )
+        (member_expression property: (property_identifier) @member_access)
         (string (string_fragment) @route_string)
     ";
-    
+
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
@@ -244,9 +309,49 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
                     import_name = name.clone();
                     import_kind = "method_call".to_string();
                     line_number = node.start_position().row + 1;
+                } else if *capture_kind == "member_access" {
+                    let name = text.trim().to_string();
+                    if !crate::utils::is_noisy_call_name(&name) {
+                        import_name = name.clone();
+                        import_kind = "MEMBER_ACCESS".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "http_fn" {
+                    let fn_name = text.trim().to_string();
+                    let is_http = fn_name == "fetch"
+                        || fn_name == "get"
+                        || fn_name == "post"
+                        || fn_name == "put"
+                        || fn_name == "delete"
+                        || fn_name == "patch"
+                        || fn_name == "request";
+                    if is_http {
+                        // find the string argument in the same match
+                        if let Some(route_node) = m
+                            .captures
+                            .iter()
+                            .find(|c| query.capture_names()[c.index as usize] == "http_route")
+                        {
+                            if let Ok(route) = route_node.node.utf8_text(source_code.as_bytes()) {
+                                let r = route.trim().to_string();
+                                if r.starts_with('/') {
+                                    import_name = r.clone();
+                                    import_kind = "HTTP_CALL".to_string();
+                                    line_number = node.start_position().row + 1;
+
+                                    let m = if fn_name == "fetch" || fn_name == "request" {
+                                        "GET"
+                                    } else {
+                                        &fn_name
+                                    };
+                                    import_source = m.to_uppercase();
+                                }
+                            }
+                        }
+                    }
                 } else if *capture_kind == "route_string" {
                     let val = text.trim().to_string();
-                    if val.starts_with('/') {
+                    if val.starts_with('/') && import_kind == "imports" {
                         import_name = val;
                         import_kind = "route_push".to_string();
                         line_number = node.start_position().row + 1;
@@ -255,10 +360,30 @@ fn extract_js_imports(tree: &Tree, source_code: &str, language: tree_sitter::Lan
             }
         }
 
+        if import_kind == "HTTP_CALL" {
+            imports.push(ImportNode {
+                name: import_name.clone(),
+                source: if import_source.is_empty() {
+                    None
+                } else {
+                    Some(import_source.clone())
+                },
+                line_number,
+                kind: Some(import_kind.clone()),
+            });
+        } else if !import_name.is_empty() && import_kind != "imports" {
+            // We set import_kind to imports initially, but here we don't want to push empty imports. Wait, original logic pushed imports!
+            // We should just use the original logic.
+        }
+
         if !import_name.is_empty() {
             imports.push(ImportNode {
                 name: import_name,
-                source: if import_source.is_empty() { None } else { Some(import_source) },
+                source: if import_source.is_empty() {
+                    None
+                } else {
+                    Some(import_source)
+                },
                 line_number,
                 kind: Some(import_kind),
             });
@@ -288,13 +413,22 @@ mod call_resolution_tests {
             .parse_and_extract(src, "route.js")
             .expect("parse should succeed");
 
-        let kind_of = |name: &str| imports.iter()
-            .find(|i| i.name == name)
-            .and_then(|i| i.kind.clone());
+        let kind_of = |name: &str| {
+            imports
+                .iter()
+                .find(|i| i.name == name)
+                .and_then(|i| i.kind.clone())
+        };
 
-        assert_eq!(kind_of("helper").as_deref(), Some("calls"),
-            "free call helper() should be a 'calls' edge");
-        assert_eq!(kind_of("deleteRoom").as_deref(), Some("method_call"),
-            "member call query.deleteRoom() should be a 'method_call', not 'calls'");
+        assert_eq!(
+            kind_of("helper").as_deref(),
+            Some("calls"),
+            "free call helper() should be a 'calls' edge"
+        );
+        assert_eq!(
+            kind_of("deleteRoom").as_deref(),
+            Some("method_call"),
+            "member call query.deleteRoom() should be a 'method_call', not 'calls'"
+        );
     }
 }

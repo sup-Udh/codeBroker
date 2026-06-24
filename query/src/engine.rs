@@ -184,10 +184,129 @@ fn search_symbol_names(
     query_lower: &str,
     query_tokens: &[String],
     path_scope: Option<&str>,
+    query_vector: Option<&[f32]>,
 ) -> Result<Vec<SearchResult>, rusqlite::Error> {
     let mut results = Vec::new();
 
-    // 0. check files table for matches
+    // 1. Fetch all symbol embeddings first if we have a query vector
+    let mut symbol_embeddings: std::collections::HashMap<i64, Vec<f32>> = std::collections::HashMap::new();
+    if let Some(_) = query_vector {
+        let mut embed_stmt = db.conn.prepare("SELECT symbol_id, embedding FROM symbol_embeddings")?;
+        let mut embed_rows = embed_stmt.query([])?;
+        while let Some(row) = embed_rows.next()? {
+            let s_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let vec = storage::blob_to_embedding(&blob);
+            symbol_embeddings.insert(s_id, vec);
+        }
+    }
+
+    let query_str = "
+        SELECT 
+            files.path, 
+            symbols.name, 
+            symbols.kind,
+            (SELECT COUNT(*) FROM edges WHERE target_symbol_id = symbols.id) as in_edges,
+            (SELECT COUNT(*) FROM edges WHERE source_symbol_id = symbols.id) as out_edges,
+            symbols.id
+        FROM symbols
+        JOIN files ON symbols.file_id = files.id
+    ";
+    let mut stmt = db.conn.prepare(query_str)?;
+    let mut rows = stmt.query([])?;
+
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        if let Some(scope) = path_scope {
+            if !path.contains(scope) {
+                continue;
+            }
+        }
+        let name: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let in_edges: i64 = row.get(3).unwrap_or(0);
+        let out_edges: i64 = row.get(4).unwrap_or(0);
+        let s_id: i64 = row.get(5)?;
+
+        let name_lower = name.to_lowercase();
+        let path_lower = path.to_lowercase();
+
+        let mut base_score = 0;
+
+        // 1. Symbol Name Match
+        if name_lower == query_lower { base_score += 1000; }
+        else if name_lower.starts_with(query_lower) { base_score += 500; }
+        else if name_lower.contains(query_lower) { base_score += 250; }
+
+        for token in query_tokens {
+            if name_lower == *token { base_score += 100; }
+            else {
+                let dist = levenshtein(&name_lower, token);
+                if dist <= 1 && token.len() > 3 {
+                    base_score += 50;
+                } else if dist == 2 && token.len() > 5 {
+                    base_score += 25;
+                }
+            }
+        }
+
+        // 2. Full Path Match
+        if path_lower.contains(query_lower) { base_score += 200; }
+        for token in query_tokens {
+            if path_lower.contains(token) { base_score += 50; }
+        }
+
+        let mut semantic_score = 0;
+        if let Some(q_vec) = query_vector {
+            if let Some(s_vec) = symbol_embeddings.get(&s_id) {
+                let sim = storage::cosine_similarity(q_vec, s_vec);
+                semantic_score = ((sim + 1.0) * 1000.0) as i32;
+            }
+        }
+
+        if base_score == 0 && semantic_score < 1250 { // If no lexical match, only include if semantic is reasonably strong
+            continue;
+        }
+
+        let mut score = base_score + semantic_score;
+
+        // 3. Entrypoint Bonuses
+        if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
+            score += 200;
+        } else if kind == "function" && (name_lower == "get" || name_lower == "post" || name_lower == "put" || name_lower == "delete") {
+            score += 100;
+        }
+
+        // 4. Production Path Boosts
+        let path_parts: Vec<&str> = path_lower.split('/').collect();
+        if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
+            score += 150;
+        }
+
+        // 5. Scratch/Test Penalties
+        if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
+            score -= 300;
+        }
+
+        // 6. Graph Centrality Scoring
+        score += (in_edges * 15) as i32;
+        score += (out_edges * 5) as i32;
+
+        if score > 0 {
+            let confidence = if semantic_score > 1350 { "High (Semantic Match)".to_string() }
+            else if score >= 1000 { "High (Exact Match)".to_string() }
+            else if score >= 500 { "High (Prefix Match)".to_string() }
+            else if semantic_score > 1250 { "Medium (Semantic Match)".to_string() }
+            else if score >= 250 { "Medium (Contains Match)".to_string() }
+            else if score >= 100 { "Medium (Token Match)".to_string() }
+            else if score >= 50 { "Low (Fuzzy Match)".to_string() }
+            else { "Low (Weak Fuzzy)".to_string() };
+
+            results.push(SearchResult { path: db.resolve_path(&path), name, kind, score, confidence, line: None });
+        }
+    }
+
+    // 7. Check isolated files table
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
     let mut file_rows = file_stmt.query([])?;
     while let Some(row) = file_rows.next()? {
@@ -198,15 +317,34 @@ fn search_symbol_names(
             }
         }
 
+        let path_lower = path.to_lowercase();
         let filename = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_lowercase();
+        
+        let mut base_score = 0;
 
-        let mut score = 0;
-        if filename == query_lower { score += 800; }
-        else if filename.contains(query_lower) { score += 250; }
+        if filename == query_lower { base_score += 800; }
+        else if filename.contains(query_lower) { base_score += 250; }
+        
+        if path_lower.contains(query_lower) && !filename.contains(query_lower) { base_score += 100; }
 
         for token in query_tokens {
-            if filename == *token { score += 100; }
-            else if filename.contains(token) { score += 50; }
+            if filename == *token { base_score += 100; }
+            else if filename.contains(token) { base_score += 50; }
+            else if path_lower.contains(token) { base_score += 25; }
+        }
+
+        if base_score == 0 {
+            continue;
+        }
+        
+        let mut score = base_score;
+
+        let path_parts: Vec<&str> = path_lower.split('/').collect();
+        if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
+            score += 150;
+        }
+        if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
+            score -= 300;
         }
 
         if score > 0 {
@@ -223,58 +361,6 @@ fn search_symbol_names(
                 confidence,
                 line: None,
             });
-        }
-    }
-
-    let mut stmt = db.conn.prepare(
-        "SELECT files.path, symbols.name, symbols.kind
-         FROM symbols
-         JOIN files ON symbols.file_id = files.id"
-    )?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let path: String = row.get(0)?;
-        if let Some(scope) = path_scope {
-            if !path.contains(scope) {
-                continue;
-            }
-        }
-        let name: String = row.get(1)?;
-        let kind: String = row.get(2)?;
-
-        let name_lower = name.to_lowercase();
-        let mut score = 0;
-
-        if name_lower == query_lower {
-            score += 1000;
-        } else if name_lower.starts_with(query_lower) {
-            score += 500;
-        } else if name_lower.contains(query_lower) {
-            score += 250;
-        }
-
-        for token in query_tokens {
-            if name_lower == *token {
-                score += 100;
-            } else {
-                let dist = levenshtein(&name_lower, token);
-                if dist <= 1 && token.len() > 3 {
-                    score += 50;
-                } else if dist == 2 && token.len() > 5 {
-                    score += 25;
-                }
-            }
-        }
-
-        if score > 0 {
-            let confidence = if score >= 1000 { "High (Exact Match)".to_string() }
-            else if score >= 500 { "High (Prefix Match)".to_string() }
-            else if score >= 250 { "Medium (Contains Match)".to_string() }
-            else if score >= 100 { "Medium (Token Match)".to_string() }
-            else if score >= 50 { "Low (Fuzzy Match)".to_string() }
-            else { "Low (Weak Fuzzy)".to_string() };
-
-            results.push(SearchResult { path: db.resolve_path(&path), name, kind, score, confidence, line: None });
         }
     }
 
@@ -383,6 +469,7 @@ pub fn search_symbols(
     db: &Database,
     keyword: &str,
     semantic_tokens: &[String],
+    query_vector: Option<&[f32]>,
     llm_used: bool,
     path_scope: Option<&str>,
     mode: SearchMode,
@@ -402,10 +489,10 @@ pub fn search_symbols(
     }
 
     let mut results = match mode {
-        SearchMode::Symbol => search_symbol_names(db, &query_lower, &query_tokens, path_scope)?,
+        SearchMode::Symbol => search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?,
         SearchMode::Text => search_file_contents(db, &query_lower, path_scope, whole_word)?,
         SearchMode::Both => {
-            let mut symbol_results = search_symbol_names(db, &query_lower, &query_tokens, path_scope)?;
+            let mut symbol_results = search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?;
             if symbol_results.is_empty() {
                 symbol_results.extend(search_file_contents(db, &query_lower, path_scope, whole_word)?);
             }
@@ -684,7 +771,7 @@ mod min_confidence_tests {
                 end_line: 1,
                 start_byte: 0,
                 end_byte: 0,
-                signature: None,
+                signature: None, route_path: None, route_method: None,
             }).unwrap();
         }
         db
@@ -758,7 +845,7 @@ mod find_symbol_tests {
                 end_line: 1,
                 start_byte: 0,
                 end_byte: 0,
-                signature: None,
+                signature: None, route_path: None, route_method: None,
             }).unwrap();
         }
 

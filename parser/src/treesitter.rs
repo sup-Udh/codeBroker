@@ -6,8 +6,9 @@ pub fn parse_rust_code(source_code: &str) -> Option<Tree> {
 
     let rust_language = tree_sitter_rust::LANGUAGE.into();
 
-    parser.set_language(&rust_language).expect("error Loading the rust grammar");
+    parser
+        .set_language(&rust_language)
+        .expect("error Loading the rust grammar");
 
     parser.parse(source_code, None) // none - optional for previus parsing
-
 }

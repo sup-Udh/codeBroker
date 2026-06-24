@@ -9,6 +9,14 @@ pub const INIT_SQL: &str = "
         route_segment TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS entrypoints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol_id INTEGER NOT NULL,
+        route_path TEXT NOT NULL,
+        method TEXT NOT NULL,
+        FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS symbols (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id INTEGER NOT NULL,
@@ -42,6 +50,21 @@ pub const INIT_SQL: &str = "
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 
+    -- Embedding-based semantic search. One row per symbol, keyed by
+    -- symbol_id so it's trivial to tell which symbols still need (re-)embedding
+    -- (LEFT JOIN symbols -> symbol_embeddings WHERE embedding IS NULL) after an
+    -- incremental reindex inserts new symbols with new ids. `embedding` is a
+    -- flat little-endian f32 BLOB (see storage::embedding_to_blob/blob_to_embedding)
+    -- rather than a JSON array, to keep a ~300-symbol repo's embedding table
+    -- small and avoid float-formatting precision loss on every read.
+    CREATE TABLE IF NOT EXISTS symbol_embeddings (
+        symbol_id INTEGER PRIMARY KEY,
+        embedding BLOB NOT NULL,
+        model TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
 
         CREATE TABLE IF NOT EXISTS semantic_summaries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,13 +90,9 @@ pub const INIT_SQL: &str = "
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    CREATE TABLE IF NOT EXISTS subsystem_overviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        subsystem_name TEXT NOT NULL,
-        subsystem_hash TEXT NOT NULL,
-        model_name TEXT NOT NULL,
-        overview_text TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     );
 
     -- Layer 4.5: Unified Analytics Events
@@ -106,5 +125,24 @@ pub const INIT_SQL: &str = "
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
-    
+
+    -- Domain-concept tags (auth, realtime, notifications, database, ...),
+    -- independent of literal symbol-name/path substring matching. A symbol
+    -- can carry more than one concept (e.g. a Supabase client factory is
+    -- both 'auth' and 'database'). `matched_on` records whether the tag came
+    -- from the symbol's own name or its file's path, for transparency in
+    -- search results. Without this, a query like \"auth system\" only ever
+    -- found symbols whose literal name/path contained \"auth\" — missing
+    -- e.g. createClient/createAdminClient/signInWithOAuth entirely
+    -- (benchmark run_005's central finding).
+    CREATE TABLE IF NOT EXISTS symbol_concepts (
+        symbol_id INTEGER NOT NULL,
+        concept TEXT NOT NULL,
+        matched_on TEXT NOT NULL,
+        PRIMARY KEY (symbol_id, concept),
+        FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_symbol_concepts_concept ON symbol_concepts(concept);
+
 ";
