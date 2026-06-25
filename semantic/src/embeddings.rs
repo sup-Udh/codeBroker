@@ -94,12 +94,11 @@ mod tests {
                 &graph::SymbolNode {
                     name: "foo".to_string(),
                     kind: "function".to_string(),
-                    prop_type: None,
                     start_line: 1,
                     end_line: 1,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, route_path: None, route_method: None,
+                    signature: None, attributes: Vec::new(), metadata: None,
                 },
             )
             .unwrap();
@@ -130,12 +129,11 @@ mod tests {
                 &graph::SymbolNode {
                     name: "untouched".to_string(),
                     kind: "function".to_string(),
-                    prop_type: None,
                     start_line: 1,
                     end_line: 1,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, route_path: None, route_method: None,
+                    signature: None, attributes: Vec::new(), metadata: None,
                 },
             )
             .unwrap();
@@ -145,12 +143,11 @@ mod tests {
                 &graph::SymbolNode {
                     name: "touched".to_string(),
                     kind: "function".to_string(),
-                    prop_type: None,
                     start_line: 2,
                     end_line: 2,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, route_path: None, route_method: None,
+                    signature: None, attributes: Vec::new(), metadata: None,
                 },
             )
             .unwrap();

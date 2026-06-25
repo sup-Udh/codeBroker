@@ -3,22 +3,19 @@
 // retruning the following below
 #[derive(Debug, Default)]
 pub struct FileMetadata {
-    pub directive: Option<String>,
-    pub route_path: Option<String>,
-    pub route_segment: Option<String>,
+    pub metadata: Option<String>,
 }
 
 pub struct SymbolNode {
     pub name: String,
     pub kind: String,
-    pub prop_type: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     pub start_byte: usize,
     pub end_byte: usize,
     pub signature: Option<String>,
-    pub route_path: Option<String>,
-    pub route_method: Option<String>,
+    pub attributes: Vec<String>,
+    pub metadata: Option<String>,
 }
 
 pub struct ImportNode {

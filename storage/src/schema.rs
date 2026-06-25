@@ -4,16 +4,13 @@ pub const INIT_SQL: &str = "
     CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         path TEXT NOT NULL UNIQUE,
-        directive TEXT,
-        route_path TEXT,
-        route_segment TEXT
+        metadata TEXT
     );
 
     CREATE TABLE IF NOT EXISTS entrypoints (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol_id INTEGER NOT NULL,
-        route_path TEXT NOT NULL,
-        method TEXT NOT NULL,
+        reason TEXT,
         FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
 
@@ -22,12 +19,13 @@ pub const INIT_SQL: &str = "
         file_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         kind TEXT NOT NULL,
-        prop_type TEXT,
         start_line INTEGER NOT NULL,
         end_line INTEGER NOT NULL,
         start_byte INTEGER NOT NULL DEFAULT 0,
         end_byte INTEGER NOT NULL DEFAULT 0,
         signature TEXT,
+        attributes TEXT,
+        metadata TEXT,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 

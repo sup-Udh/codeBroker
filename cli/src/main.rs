@@ -238,96 +238,11 @@ fn main() {
                             if let Some((metadata, symbols, imports)) =
                                 frontend.parse_and_extract(&source_code, &file_path)
                             {
-                                let mut route_path = None;
-                                let mut route_segment = None;
-
-                                // Next.js App Router (`app/`) only treats these specific
-                                // filenames as routable entrypoints — every other file
-                                // under `app/` is a plain module (e.g. `app/lib/utils.ts`).
-                                // Without this check, ANY file whose path merely contains
-                                // "app/" got a route_path/route_segment, mislabeling
-                                // ordinary helpers like wrapper/transpiler modules as
-                                // routes. `src/routes/` (SvelteKit) and `pages/` (Next.js
-                                // pages router / Remix) are genuinely file-based routing —
-                                // every file under those prefixes really is a route — so
-                                // they're left ungated.
-                                const APP_ROUTER_FILENAMES: [&str; 10] = [
-                                    "route.ts",
-                                    "route.tsx",
-                                    "page.ts",
-                                    "page.tsx",
-                                    "layout.ts",
-                                    "layout.tsx",
-                                    "loading.tsx",
-                                    "error.tsx",
-                                    "not-found.tsx",
-                                    "template.tsx",
-                                ];
-
-                                // Universal route discovery
-                                let route_prefixes =
-                                    [("app/", "/"), ("src/routes/", "/"), ("pages/", "/")];
-                                for (prefix, _route_base) in route_prefixes.iter() {
-                                    if file_path.contains(prefix) {
-                                        let parts: Vec<&str> = file_path.split(prefix).collect();
-                                        if parts.len() > 1 {
-                                            let route_parts: Vec<&str> =
-                                                parts[1].split('/').collect();
-                                            if !route_parts.is_empty() {
-                                                let file_name = route_parts.last().unwrap();
-
-                                                // Remix's flat-routes convention
-                                                // (`app/routes/dashboard.users.tsx`) makes
-                                                // every dot-separated file under
-                                                // `app/routes/` a route in its own right —
-                                                // distinct from Next.js App Router, where
-                                                // only the filenames above are routable.
-                                                let is_remix_route = file_path
-                                                    .contains("app/routes/")
-                                                    && file_name.contains('.')
-                                                    && !file_name.starts_with('+');
-
-                                                if *prefix == "app/"
-                                                    && !is_remix_route
-                                                    && !APP_ROUTER_FILENAMES.contains(file_name)
-                                                {
-                                                    continue;
-                                                }
-
-                                                route_segment = Some(
-                                                    file_name
-                                                        .split('.')
-                                                        .next()
-                                                        .unwrap_or(file_name)
-                                                        .to_string(),
-                                                );
-
-                                                // Handle Remix dot notation e.g. dashboard.users.tsx
-                                                let dir_path = if file_name.contains('.')
-                                                    && !file_name.starts_with('+')
-                                                    && *prefix == "app/"
-                                                {
-                                                    file_name.split('.').collect::<Vec<&str>>()
-                                                        [..file_name.split('.').count() - 1]
-                                                        .join("/")
-                                                } else {
-                                                    route_parts[..route_parts.len() - 1].join("/")
-                                                };
-
-                                                route_path = Some(format!("/{}", dir_path));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                db.update_file_metadata(
-                                    file_id,
-                                    metadata.directive.as_deref(),
-                                    route_path.as_deref(),
-                                    route_segment.as_deref(),
-                                )
-                                .unwrap();
+                                let metadata_str = metadata
+                                    .metadata
+                                    .as_deref()
+                                    .unwrap_or("{}");
+                                let _ = db.update_file_metadata(file_id, Some(metadata_str));
 
                                 for symbol in symbols {
                                     db.insert_symbol(file_id, &symbol).unwrap();
@@ -400,120 +315,7 @@ fn main() {
                         .enclosing_symbol_id(source_file_id, line_number)
                         .unwrap_or(None);
 
-                    if edge_kind == "route_push" {
-                        // Fetch all routes to try matching
-                        let mut route_stmt = db
-                            .conn
-                            .prepare(
-                                "SELECT id, route_path FROM files WHERE route_path IS NOT NULL",
-                            )
-                            .unwrap();
-                        let mut route_rows = route_stmt.query([]).unwrap();
-                        let push_parts: Vec<&str> = import_name.split('/').collect();
-                        while let Some(row) = route_rows.next().unwrap_or(None) {
-                            let target_file_id: i64 = row.get(0).unwrap();
-                            let route_path: String = row.get(1).unwrap();
-                            let path_parts: Vec<&str> = route_path.split('/').collect();
 
-                            if push_parts.len() == path_parts.len() {
-                                let mut matched = true;
-                                for (pu, pa) in push_parts.iter().zip(path_parts.iter()) {
-                                    if pa.starts_with('[') && pa.ends_with(']') {
-                                        continue;
-                                    }
-                                    if pu != pa {
-                                        matched = false;
-                                        break;
-                                    }
-                                }
-                                if matched {
-                                    // A string literal matching a route path resolves to
-                                    // either a page navigation (`router.push("/dashboard")`
-                                    // -> the page.tsx default export) or an API call
-                                    // (`fetch("/api/run")` -> the route.ts HTTP method
-                                    // handlers). Previously only 'page' was matched, so
-                                    // fetch-to-API-route — the client/server boundary in
-                                    // any Next.js-style app — produced zero edges and made
-                                    // shortest_path/explore_graph blind across it. A fetch
-                                    // doesn't name which HTTP method it calls in the URL
-                                    // itself, so every handler in the matched route file is
-                                    // linked; that's still strictly more signal than the
-                                    // previous "no edge at all".
-                                    let mut sym_stmt = db.conn.prepare("SELECT id, kind FROM symbols WHERE file_id = ?1 AND kind IN ('page', 'route')").unwrap();
-                                    let mut sym_rows =
-                                        sym_stmt.query(rusqlite::params![target_file_id]).unwrap();
-                                    while let Some(sym_row) = sym_rows.next().unwrap_or(None) {
-                                        let target_symbol_id: i64 = sym_row.get(0).unwrap();
-                                        let target_kind: String = sym_row.get(1).unwrap();
-                                        let edge_label = if target_kind == "page" {
-                                            "navigates_to"
-                                        } else {
-                                            "fetches"
-                                        };
-                                        let _ = db.insert_edge_attributed(
-                                            source_file_id,
-                                            src_sym,
-                                            target_symbol_id,
-                                            edge_label,
-                                        );
-                                        edges_created += 1;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    if edge_kind == "HTTP_CALL" {
-                        let import_source_str = import_source.as_deref().unwrap_or("");
-                        let push_parts: Vec<&str> = import_name.split('/').collect();
-                        let mut route_stmt = db
-                            .conn
-                            .prepare("SELECT symbol_id, route_path, method FROM entrypoints")
-                            .unwrap();
-                        let mut route_rows = route_stmt.query([]).unwrap();
-                        while let Some(row) = route_rows.next().unwrap_or(None) {
-                            let target_symbol_id: i64 = row.get(0).unwrap();
-                            let route_path: String = row.get(1).unwrap();
-                            let route_method: String = row.get(2).unwrap();
-
-                            let path_parts: Vec<&str> = route_path.split('/').collect();
-                            if push_parts.len() == path_parts.len() {
-                                let mut matched = true;
-                                for (pu, pa) in push_parts.iter().zip(path_parts.iter()) {
-                                    if (pa.starts_with('[') && pa.ends_with(']'))
-                                        || (pa.starts_with('{') && pa.ends_with('}'))
-                                        || (pa.starts_with('<') && pa.ends_with('>'))
-                                    {
-                                        continue;
-                                    }
-                                    if pu != pa {
-                                        matched = false;
-                                        break;
-                                    }
-                                }
-                                if matched {
-                                    let mut method_match = true;
-                                    if !import_source_str.is_empty()
-                                        && import_source_str != route_method
-                                    {
-                                        method_match = false;
-                                    }
-                                    if method_match {
-                                        let _ = db.insert_logical_edge(
-                                            source_file_id,
-                                            src_sym,
-                                            target_symbol_id,
-                                            "HTTP_CALL",
-                                        );
-                                        edges_created += 1;
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
 
                     // Call edges are resolved case-sensitively and without the
                     // global bare-name fallback that the import path uses below,
@@ -632,61 +434,10 @@ fn main() {
                     }
                 }
 
-                // 3. Link Prop Types
-                let mut prop_stmt = db
-                    .conn
-                    .prepare("SELECT file_id, prop_type FROM symbols WHERE prop_type IS NOT NULL")
-                    .unwrap();
-                let mut prop_rows = prop_stmt.query([]).unwrap();
-                while let Some(row) = prop_rows.next().unwrap_or(None) {
-                    let file_id: i64 = row.get(0).unwrap();
-                    let prop_type: String = row.get(1).unwrap();
-                    if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(&prop_type) {
-                        let _ = db.insert_edge(file_id, target_symbol_id, "accepts_props");
-                        edges_created += 1;
-                    }
-                }
-
-                // 4. Link Layouts to Pages (wraps_route)
-                let mut layout_stmt = db.conn.prepare(
-                "SELECT id, path FROM files WHERE path LIKE '%layout.%' OR path LIKE '%+layout.%'"
-            ).unwrap();
-                let mut layout_rows = layout_stmt.query([]).unwrap();
-                while let Some(row) = layout_rows.next().unwrap_or(None) {
-                    let layout_file_id: i64 = row.get(0).unwrap();
-                    let layout_path: String = row.get(1).unwrap();
-
-                    if let Some(dir_end) = layout_path.rfind('/') {
-                        let dir_prefix = &layout_path[..dir_end + 1];
-                        let search_pattern = format!("{}%", dir_prefix);
-
-                        let mut page_stmt = db.conn.prepare(
-                        "SELECT symbols.id FROM symbols JOIN files ON symbols.file_id = files.id 
-                         WHERE files.path LIKE ?1 AND symbols.kind = 'page'"
-                    ).unwrap();
-                        let mut page_rows = page_stmt.query(params![search_pattern]).unwrap();
-                        while let Some(page_row) = page_rows.next().unwrap_or(None) {
-                            let page_symbol_id: i64 = page_row.get(0).unwrap();
-                            let _ = db.insert_edge(layout_file_id, page_symbol_id, "wraps_route");
-                            edges_created += 1;
-                        }
-                    }
-                }
-
                 println!(
                     "Linking complete. Created {} true graph edges.",
                     edges_created
                 );
-
-                // 4.4 Detect logical edges: fetch("/api/...") literals
-                // resolved to the Next.js route handler that answers them.
-                // Must run after all static edges/symbols above are in place
-                // since it needs every route/endpoint symbol indexed first.
-                match query::graph::detect_logical_edges(&db) {
-                    Ok(count) => println!("Detected {} logical (HTTP boundary) edges.", count),
-                    Err(e) => println!("Warning: logical edge detection failed: {}", e),
-                }
-
                 // 4.45 Tag symbols with domain concepts (auth, realtime,
                 // notifications, database, ...) independent of literal
                 // name/path matching, so natural-language discovery doesn't
@@ -974,14 +725,7 @@ fn main() {
                         println!("Skipped (unreadable or unsupported): {:?}", stats.skipped);
                     }
 
-                    // Re-detect logical (fetch -> route) edges: a changed
-                    // file may have added/removed a fetch() call or a route
-                    // handler, so this must re-run on every incremental
-                    // reindex, not just the initial full index.
-                    match query::graph::detect_logical_edges(&db) {
-                        Ok(count) => println!("Detected {} logical (HTTP boundary) edges.", count),
-                        Err(e) => println!("Warning: logical edge detection failed: {}", e),
-                    }
+
 
                     // Re-tag concepts too: cheap full re-tag (see
                     // tag_concepts doc comment) so a changed file's symbols
@@ -1514,12 +1258,11 @@ mod call_edge_tests {
         graph::SymbolNode {
             name: name.to_string(),
             kind: "function".to_string(),
-            prop_type: None,
             start_line: 1,
             end_line: 1,
             start_byte: 0,
             end_byte: 0,
-            signature: None, route_path: None, route_method: None,
+            signature: None, attributes: Vec::new(), metadata: None,
         }
     }
 

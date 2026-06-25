@@ -89,7 +89,7 @@ impl ContextObject {
         // 1. Fetch the primary target's core definition (Distance-0 Context)
         let target_info = if let Some(hint) = file_hint {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive, files.content_hash
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
@@ -109,7 +109,7 @@ impl ContextObject {
             })
         } else {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.directive, files.content_hash
+                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 LIMIT 1"
@@ -132,7 +132,7 @@ impl ContextObject {
             Ok(info) => info,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // Fallback: check if the 'symbol_name' is actually a file path
-                let mut file_stmt = db.conn.prepare("SELECT id, path, directive, content_hash FROM files WHERE path LIKE ?1 LIMIT 1")?;
+                let mut file_stmt = db.conn.prepare("SELECT id, path, metadata, content_hash FROM files WHERE path LIKE ?1 LIMIT 1")?;
                 let file_search = format!("%{}%", symbol_name);
                 if let Ok((f_id, f_path, f_dir, f_hash)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))) {
                     (symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir, f_hash)
@@ -414,27 +414,25 @@ mod tests {
         let gen_id = db.insert_symbol(file_id, &graph::SymbolNode {
             name: "generateRoomId".to_string(),
             kind: "function".to_string(),
-            prop_type: None,
             start_line: 1,
             end_line: 3,
             start_byte: 0,
             end_byte: 46,
             signature: None,
-            route_path: None,
-            route_method: None,
+            attributes: Vec::new(),
+            metadata: None,
         }).unwrap();
 
         let get_id = db.insert_symbol(file_id, &graph::SymbolNode {
             name: "GET".to_string(),
             kind: "function".to_string(),
-            prop_type: None,
             start_line: 5,
             end_line: 8,
             start_byte: 0,
             end_byte: 145,
             signature: None,
-            route_path: None,
-            route_method: None,
+            attributes: Vec::new(),
+            metadata: None,
         }).unwrap();
 
         db.insert_edge_attributed(file_id, Some(get_id), gen_id, "CALL").unwrap();

@@ -73,8 +73,7 @@ fn extract_py_symbols(
         if let Some(node) = def_node {
             let mut signature_parts = Vec::new();
             let short_name = name.clone();
-            let mut route_path = None;
-            let mut route_method = None;
+            let mut attributes = Vec::new();
 
             // 1. Check for decorators
             if let Some(parent) = node.parent() {
@@ -85,40 +84,7 @@ fn extract_py_symbols(
                             if let Ok(text) = child.utf8_text(source_code.as_bytes()) {
                                 let trimmed = text.trim();
                                 signature_parts.push(format!("[{}]", trimmed));
-
-                                if trimmed.starts_with('@') && trimmed.contains('(') {
-                                    let lower = trimmed.to_lowercase();
-                                    if lower.contains(".get(")
-                                        || lower.contains(".post(")
-                                        || lower.contains(".put(")
-                                        || lower.contains(".delete(")
-                                        || lower.contains(".patch(")
-                                    {
-                                        let method = if lower.contains(".get(") {
-                                            "GET"
-                                        } else if lower.contains(".post(") {
-                                            "POST"
-                                        } else if lower.contains(".put(") {
-                                            "PUT"
-                                        } else if lower.contains(".delete(") {
-                                            "DELETE"
-                                        } else {
-                                            "PATCH"
-                                        };
-
-                                        if let Some(start) = trimmed.find('(') {
-                                            if let Some(end) = trimmed.rfind(')') {
-                                                let args = trimmed[start + 1..end].trim();
-                                                if args.starts_with('"') || args.starts_with('\'') {
-                                                    route_path =
-                                                        Some(args[1..args.len() - 1].to_string());
-                                                    route_method = Some(method.to_string());
-                                                    kind = "route".to_string();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                attributes.push(trimmed.to_string());
                             }
                         }
                     }
@@ -182,14 +148,13 @@ fn extract_py_symbols(
             symbols.push(SymbolNode {
                 name,
                 kind,
-                prop_type: None,
                 start_line: node.start_position().row + 1,
                 end_line,
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 signature,
-                route_path,
-                route_method,
+                attributes,
+                metadata: None,
             });
         }
     }
@@ -214,10 +179,6 @@ fn extract_py_imports(
         (assignment right: (call function: (identifier) @instantiates))
         (call function: (identifier) @call_name)
         (call function: (attribute attribute: (identifier) @call_name))
-        (call 
-            function: [(identifier) @http_fn (attribute attribute: (identifier) @http_fn)]
-            arguments: (argument_list (string (string_content) @http_route))
-        )
         (attribute attribute: (identifier) @member_access)
     ";
 
@@ -263,54 +224,10 @@ fn extract_py_imports(
                         line_number = node.start_position().row + 1;
                         import_kind = Some("MEMBER_ACCESS".to_string());
                     }
-                } else if *capture_kind == "http_fn" {
-                    let fn_name = text.trim().to_string();
-                    let is_http = fn_name == "get"
-                        || fn_name == "post"
-                        || fn_name == "put"
-                        || fn_name == "delete"
-                        || fn_name == "patch"
-                        || fn_name == "request";
-                    if is_http {
-                        if let Some(route_node) = m
-                            .captures
-                            .iter()
-                            .find(|c| query.capture_names()[c.index as usize] == "http_route")
-                        {
-                            if let Ok(route) = route_node.node.utf8_text(source_code.as_bytes()) {
-                                let r = route.trim().to_string();
-                                if r.starts_with('/') {
-                                    import_name = r.clone();
-                                    import_kind = Some("HTTP_CALL".to_string());
-                                    line_number = node.start_position().row + 1;
-                                    let m = if fn_name == "request" {
-                                        "GET"
-                                    } else {
-                                        &fn_name
-                                    };
-                                    import_source = m.to_uppercase();
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
-        if let Some(k) = &import_kind {
-            if k == "HTTP_CALL" {
-                imports.push(ImportNode {
-                    name: import_name.clone(),
-                    source: if import_source.is_empty() {
-                        None
-                    } else {
-                        Some(import_source.clone())
-                    },
-                    line_number,
-                    kind: Some(k.clone()),
-                });
-                import_name.clear(); // prevent duplicate insertion
-            }
-        }
+
         if !import_name.is_empty() {
             imports.push(ImportNode {
                 name: import_name,

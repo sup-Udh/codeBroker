@@ -7,3 +7,4 @@ edition = "2024"
 
 graph = {path="../graph"}
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde_json = "1.0.150"

@@ -1586,14 +1586,13 @@ mod shortest_path_tests {
             &graph::SymbolNode {
                 name: name.to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: 1,
                 end_line: 3,
                 start_byte: 0,
                 end_byte: 0,
                 signature: None,
-                route_path: None,
-                route_method: None,
+                attributes: Vec::new(),
+                metadata: None,
             },
         )
         .unwrap()
@@ -1684,14 +1683,13 @@ mod shortest_path_tests {
             &graph::SymbolNode {
                 name: "runCode".to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: 1,
                 end_line: 3,
                 start_byte: 0,
                 end_byte: run_code_source.len(),
                 signature: None,
-                route_path: None,
-                route_method: None,
+                attributes: Vec::new(),
+                metadata: None,
             },
         )
         .unwrap();
@@ -1707,14 +1705,13 @@ mod shortest_path_tests {
             &graph::SymbolNode {
                 name: "POST".to_string(),
                 kind: "route".to_string(),
-                prop_type: None,
                 start_line: 1,
                 end_line: 3,
                 start_byte: 0,
                 end_byte: route_source.len(),
                 signature: None,
-                route_path: None,
-                route_method: None,
+                attributes: Vec::new(),
+                metadata: None,
             },
         )
         .unwrap();
@@ -1746,14 +1743,13 @@ mod architectural_hotspots_tests {
             &graph::SymbolNode {
                 name: name.to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: start as usize,
                 end_line: end as usize,
                 start_byte: 0,
                 end_byte: 0,
                 signature: None,
-                route_path: None,
-                route_method: None,
+                attributes: Vec::new(),
+                metadata: None,
             },
         )
         .unwrap()
@@ -1795,14 +1791,13 @@ mod dependency_cycles_tests {
             &graph::SymbolNode {
                 name: name.to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: start as usize,
                 end_line: end as usize,
                 start_byte: 0,
                 end_byte: 0,
                 signature: None,
-                route_path: None,
-                route_method: None,
+                attributes: Vec::new(),
+                metadata: None,
             },
         )
         .unwrap()

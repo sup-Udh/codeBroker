@@ -123,12 +123,9 @@ pub fn reindex_paths(
         if let Some((metadata, symbols, imports)) =
             frontend.parse_and_extract(&source_code, &stored_path)
         {
-            let _ = db.update_file_metadata(file_id, metadata.directive.as_deref(), None, None);
+            let _ = db.update_file_metadata(file_id, metadata.metadata.as_deref());
             for symbol in symbols {
                 if let Ok(symbol_id) = db.insert_symbol(file_id, &symbol) {
-                    if let (Some(p), Some(m)) = (&symbol.route_path, &symbol.route_method) {
-                        let _ = db.insert_entrypoint(symbol_id, p, m);
-                    }
                     stats.symbols_inserted += 1;
                     stats.touched_symbol_ids.push(symbol_id);
                     touched_symbol_names.insert(symbol.name.clone());
@@ -169,54 +166,6 @@ pub fn reindex_paths(
         // bare-name fallback), matching the full `codebroker init` linker —
         // otherwise a member call like `query.delete()` re-links to an
         // exported `DELETE` on every incremental reindex. See resolve_call_edge.
-        if edge_kind == "HTTP_CALL" {
-            let import_source_str = _import_source.as_deref().unwrap_or("");
-            let push_parts: Vec<&str> = import_name.split('/').collect();
-            let mut route_stmt = db
-                .conn
-                .prepare("SELECT symbol_id, route_path, method FROM entrypoints")
-                .unwrap();
-            let mut route_rows = route_stmt.query([]).unwrap();
-            while let Some(row) = route_rows.next().unwrap_or(None) {
-                let target_symbol_id: i64 = row.get(0).unwrap();
-                let route_path: String = row.get(1).unwrap();
-                let route_method: String = row.get(2).unwrap();
-
-                let path_parts: Vec<&str> = route_path.split('/').collect();
-                if push_parts.len() == path_parts.len() {
-                    let mut matched = true;
-                    for (pu, pa) in push_parts.iter().zip(path_parts.iter()) {
-                        if (pa.starts_with('[') && pa.ends_with(']'))
-                            || (pa.starts_with('{') && pa.ends_with('}'))
-                            || (pa.starts_with('<') && pa.ends_with('>'))
-                        {
-                            continue;
-                        }
-                        if pu != pa {
-                            matched = false;
-                            break;
-                        }
-                    }
-                    if matched {
-                        let mut method_match = true;
-                        if !import_source_str.is_empty() && import_source_str != route_method {
-                            method_match = false;
-                        }
-                        if method_match {
-                            let _ = db.insert_logical_edge(
-                                source_file_id,
-                                src_sym,
-                                target_symbol_id,
-                                "HTTP_CALL",
-                            );
-                            stats.edges_created += 1;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
         if edge_kind == "calls" || edge_kind == "method_call" || edge_kind == "MEMBER_ACCESS" {
             if let Ok(Some(local_id)) =
                 db.find_symbol_id_in_file_exact(source_file_id, &import_name)

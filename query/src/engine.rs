@@ -89,6 +89,7 @@ pub struct SearchResult {
     pub kind: String,
     pub score: i32,
     pub confidence: String,
+    pub explanation: String,
     /// Line number for content/text matches. Absent for symbol/file matches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<i64>,
@@ -118,13 +119,22 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 fn deterministic_query_expansion(keyword: &str) -> Vec<String> {
     let query_lower = keyword.to_lowercase();
+    let stopwords = ["a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by", "of", "from", "system", "feature", "code", "run", "user", "users", "use", "using", "used"];
     let mut tokens: Vec<String> = query_lower.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !stopwords.contains(s))
         .map(|s| s.to_string())
         .collect();
     tokens.sort();
     tokens.dedup();
     tokens
+}
+
+fn token_weight(token: &str) -> i32 {
+    let high_value = ["notification", "notifications", "judge", "awareness", "cursor", "execution", "auth", "authentication", "collaborate", "collaboration", "sync", "presence", "websocket", "realtime", "api"];
+    if high_value.contains(&token) {
+        return 300;
+    }
+    100
 }
 
 /// Caps how many indexed files get their on-disk content scanned per `text`/`both`
@@ -234,26 +244,30 @@ fn search_symbol_names(
         let mut base_score = 0;
 
         // 1. Symbol Name Match
-        if name_lower == query_lower { base_score += 1000; }
-        else if name_lower.starts_with(query_lower) { base_score += 500; }
-        else if name_lower.contains(query_lower) { base_score += 250; }
+        let mut expl = Vec::new();
+
+        if name_lower == query_lower { base_score += 1000; expl.push(format!("Exact lexical match")); }
+        else if name_lower.starts_with(query_lower) { base_score += 500; expl.push(format!("Prefix lexical match")); }
+        else if name_lower.contains(query_lower) { base_score += 250; expl.push(format!("Substring lexical match")); }
 
         for token in query_tokens {
-            if name_lower == *token { base_score += 100; }
+            let weight = token_weight(token);
+            if name_lower == *token { base_score += weight; expl.push(format!("Token match '{}'", token)); }
             else {
                 let dist = levenshtein(&name_lower, token);
                 if dist <= 1 && token.len() > 3 {
-                    base_score += 50;
+                    base_score += weight / 2; expl.push(format!("Fuzzy match '{}'", token));
                 } else if dist == 2 && token.len() > 5 {
-                    base_score += 25;
+                    base_score += weight / 4; expl.push(format!("Weak fuzzy match '{}'", token));
                 }
             }
         }
 
         // 2. Full Path Match
-        if path_lower.contains(query_lower) { base_score += 200; }
+        if path_lower.contains(query_lower) { base_score += 200; expl.push(format!("Path contains query")); }
         for token in query_tokens {
-            if path_lower.contains(token) { base_score += 50; }
+            let weight = token_weight(token);
+            if path_lower.contains(token) { base_score += weight / 2; expl.push(format!("Path contains '{}'", token)); }
         }
 
         let mut semantic_score = 0;
@@ -261,6 +275,9 @@ fn search_symbol_names(
             if let Some(s_vec) = symbol_embeddings.get(&s_id) {
                 let sim = storage::cosine_similarity(q_vec, s_vec);
                 semantic_score = ((sim + 1.0) * 1000.0) as i32;
+                if semantic_score > 1250 {
+                    expl.push(format!("Semantic similarity {:.2}", sim));
+                }
             }
         }
 
@@ -268,41 +285,50 @@ fn search_symbol_names(
             continue;
         }
 
-        let mut score = base_score + semantic_score;
+        let mut relevance_score = base_score + semantic_score;
 
         // 3. Entrypoint Bonuses
         if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
-            score += 200;
+            relevance_score += 200;
+            expl.push(format!("Entrypoint bonus"));
         } else if kind == "function" && (name_lower == "get" || name_lower == "post" || name_lower == "put" || name_lower == "delete") {
-            score += 100;
+            relevance_score += 100;
+            expl.push(format!("Handler bonus"));
         }
 
         // 4. Production Path Boosts
         let path_parts: Vec<&str> = path_lower.split('/').collect();
         if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
-            score += 150;
+            relevance_score += 150;
+            expl.push(format!("Production path bonus"));
         }
 
         // 5. Scratch/Test Penalties
         if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
-            score -= 300;
+            relevance_score -= 300;
+            expl.push(format!("Test/scratch penalty"));
         }
 
-        // 6. Graph Centrality Scoring
-        score += (in_edges * 15) as i32;
-        score += (out_edges * 5) as i32;
+        // Confidence MUST be derived purely from relevance_score (lexical + semantic + path)
+        let confidence = if semantic_score > 1350 { "High (Semantic Match)".to_string() }
+        else if relevance_score >= 1000 { "High (Exact Match)".to_string() }
+        else if relevance_score >= 500 { "High (Prefix Match)".to_string() }
+        else if semantic_score > 1250 { "Medium (Semantic Match)".to_string() }
+        else if relevance_score >= 250 { "Medium (Contains Match)".to_string() }
+        else if relevance_score >= 100 { "Medium (Token Match)".to_string() }
+        else if relevance_score >= 50 { "Low (Fuzzy Match)".to_string() }
+        else { "Low (Weak Fuzzy)".to_string() };
 
-        if score > 0 {
-            let confidence = if semantic_score > 1350 { "High (Semantic Match)".to_string() }
-            else if score >= 1000 { "High (Exact Match)".to_string() }
-            else if score >= 500 { "High (Prefix Match)".to_string() }
-            else if semantic_score > 1250 { "Medium (Semantic Match)".to_string() }
-            else if score >= 250 { "Medium (Contains Match)".to_string() }
-            else if score >= 100 { "Medium (Token Match)".to_string() }
-            else if score >= 50 { "Low (Fuzzy Match)".to_string() }
-            else { "Low (Weak Fuzzy)".to_string() };
+        // 6. Graph Centrality Scoring (Only breaks ties, does not create relevance!)
+        // e.g. relevance_score is multiplied by 1000, graph_score is added.
+        let graph_score = (in_edges * 15) as i32 + (out_edges * 5) as i32;
+        let final_score = relevance_score * 1000 + graph_score;
+        if graph_score > 0 {
+            expl.push(format!("Graph score {}", graph_score));
+        }
 
-            results.push(SearchResult { path: db.resolve_path(&path), name, kind, score, confidence, line: None });
+        if final_score > 0 {
+            results.push(SearchResult { path: db.resolve_path(&path), name, kind, score: final_score, confidence, explanation: expl.join(", "), line: None });
         }
     }
 
@@ -320,45 +346,51 @@ fn search_symbol_names(
         let path_lower = path.to_lowercase();
         let filename = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_lowercase();
         
+        let mut expl = Vec::new();
         let mut base_score = 0;
 
-        if filename == query_lower { base_score += 800; }
-        else if filename.contains(query_lower) { base_score += 250; }
+        if filename == query_lower { base_score += 800; expl.push(format!("Exact file match")); }
+        else if filename.contains(query_lower) { base_score += 250; expl.push(format!("File substring match")); }
         
-        if path_lower.contains(query_lower) && !filename.contains(query_lower) { base_score += 100; }
+        if path_lower.contains(query_lower) && !filename.contains(query_lower) { base_score += 100; expl.push(format!("Path contains query")); }
 
         for token in query_tokens {
-            if filename == *token { base_score += 100; }
-            else if filename.contains(token) { base_score += 50; }
-            else if path_lower.contains(token) { base_score += 25; }
+            let weight = token_weight(token);
+            if filename == *token { base_score += weight; expl.push(format!("Token file match '{}'", token)); }
+            else if filename.contains(token) { base_score += weight / 2; expl.push(format!("File fuzzy match '{}'", token)); }
+            else if path_lower.contains(token) { base_score += weight / 4; expl.push(format!("Path token match '{}'", token)); }
         }
 
         if base_score == 0 {
             continue;
         }
         
-        let mut score = base_score;
+        let mut relevance_score = base_score;
 
         let path_parts: Vec<&str> = path_lower.split('/').collect();
         if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
-            score += 150;
+            relevance_score += 150;
+            expl.push(format!("Production path bonus"));
         }
         if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
-            score -= 300;
+            relevance_score -= 300;
+            expl.push(format!("Test/scratch penalty"));
         }
 
-        if score > 0 {
-            let confidence = if score >= 800 { "High (Exact File Match)".to_string() }
-            else if score >= 250 { "Medium (File Substring Match)".to_string() }
-            else if score >= 100 { "Low (Token File Match)".to_string() }
+        if relevance_score > 0 {
+            let confidence = if relevance_score >= 800 { "High (Exact File Match)".to_string() }
+            else if relevance_score >= 250 { "Medium (File Substring Match)".to_string() }
+            else if relevance_score >= 100 { "Low (Token File Match)".to_string() }
             else { "File Path Match".to_string() };
 
+            let final_score = relevance_score * 1000;
             results.push(SearchResult {
                 path: db.resolve_path(&path),
                 name: std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string(),
                 kind: "file".to_string(),
-                score,
+                score: final_score,
                 confidence,
+                explanation: expl.join(", "),
                 line: None,
             });
         }
@@ -456,6 +488,7 @@ fn search_file_contents(
                     kind: "text_match".to_string(),
                     score: 200,
                     confidence: "Medium (Content Match)".to_string(),
+                    explanation: format!("Matched literal text in file"),
                     line: Some((idx + 1) as i64),
                 });
             }
@@ -480,6 +513,10 @@ pub fn search_symbols(
 
     let query_lower = keyword.to_lowercase();
     let mut query_tokens = deterministic_query_expansion(keyword);
+
+    if llm_used && query_vector.is_none() {
+        return Ok((Vec::new(), Some("Semantic search unavailable. Workspace indexed without embeddings.".to_string())));
+    }
 
     // Inject the AI-generated semantic synonyms into our token pool
     for st in semantic_tokens {
@@ -761,17 +798,16 @@ mod min_confidence_tests {
         // "room" matches its own name exactly -> High (Exact Match).
         // "ChatRoom" contains "room" but doesn't start with it -> Medium (Contains Match).
         // "roof" is a 1-edit-distance fuzzy match with no substring overlap -> Low (Fuzzy Match).
-        let file_id = db.insert_file("rooms.ts", "fixturehash").unwrap();
+        let file_id = db.insert_file("components.ts", "fixturehash").unwrap();
         for name in ["room", "ChatRoom", "roof"] {
             db.insert_symbol(file_id, &graph::SymbolNode {
                 name: name.to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: 1,
                 end_line: 1,
                 start_byte: 0,
                 end_byte: 0,
-                signature: None, route_path: None, route_method: None,
+                signature: None, attributes: Vec::new(), metadata: None,
             }).unwrap();
         }
         db
@@ -800,7 +836,7 @@ mod min_confidence_tests {
     #[test]
     fn default_search_returns_all_confidence_tiers_unfiltered() {
         let db = setup_fixture();
-        let (results, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, None).unwrap();
+        let (results, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, None).unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"room"));
         assert!(names.contains(&"ChatRoom"));
@@ -810,7 +846,7 @@ mod min_confidence_tests {
     #[test]
     fn min_confidence_high_drops_medium_and_low_noise() {
         let db = setup_fixture();
-        let (results, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, Some("high")).unwrap();
+        let (results, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, Some("high")).unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["room"], "min_confidence: \"high\" must keep only the exact match");
     }
@@ -818,8 +854,8 @@ mod min_confidence_tests {
     #[test]
     fn min_confidence_filtering_does_not_change_result_count_when_unset() {
         let db = setup_fixture();
-        let (unfiltered, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, None).unwrap();
-        let (explicit_low, _) = search_symbols(&db, "room", &[], false, None, SearchMode::Symbol, false, Some("low")).unwrap();
+        let (unfiltered, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, None).unwrap();
+        let (explicit_low, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, Some("low")).unwrap();
         assert_eq!(unfiltered.len(), explicit_low.len(), "every tier here is >= Low, so min_confidence: \"low\" should be a no-op");
     }
 }
@@ -840,12 +876,11 @@ mod find_symbol_tests {
             db.insert_symbol(file_id, &graph::SymbolNode {
                 name: name.to_string(),
                 kind: "function".to_string(),
-                prop_type: None,
                 start_line: 1,
                 end_line: 1,
                 start_byte: 0,
                 end_byte: 0,
-                signature: None, route_path: None, route_method: None,
+                signature: None, attributes: Vec::new(), metadata: None,
             }).unwrap();
         }
 

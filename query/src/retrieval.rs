@@ -11,8 +11,8 @@ pub struct SymbolSourceResult {
     pub end_line: usize,
     pub source: String,
     pub directive: Option<String>,
-    pub route_path: Option<String>,
-    pub route_segment: Option<String>,
+    pub attributes: Vec<String>,
+    pub metadata: Option<String>,
     pub is_dependency: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_unavailable: Option<bool>,
@@ -52,7 +52,7 @@ pub fn read_symbol_source_scoped(
         file_hint
     {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.attributes, symbols.metadata, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 AND INSTR(files.path, ?2) > 0 LIMIT 5"
@@ -63,7 +63,7 @@ pub fn read_symbol_source_scoped(
         )
     } else {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, files.directive, files.route_path, files.route_segment, files.content_hash
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.attributes, symbols.metadata, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 LIMIT 5"
@@ -86,8 +86,9 @@ pub fn read_symbol_source_scoped(
         let start_byte: i64 = row.get(4).unwrap_or(0);
         let end_byte: i64 = row.get(5).unwrap_or(start_byte);
         let directive: Option<String> = row.get(6).unwrap_or(None);
-        let route_path: Option<String> = row.get(7).unwrap_or(None);
-        let route_segment: Option<String> = row.get(8).unwrap_or(None);
+        let attributes_str: Option<String> = row.get(7).unwrap_or(None);
+        let attributes = attributes_str.map(|s| serde_json::from_str(&s).unwrap_or_default()).unwrap_or_default();
+        let metadata: Option<String> = row.get(8).unwrap_or(None);
         let indexed_content_hash: Option<String> = row.get(9).unwrap_or(None);
 
         let mut source = String::new();
@@ -145,8 +146,8 @@ pub fn read_symbol_source_scoped(
             end_line: end_line as usize,
             source,
             directive,
-            route_path,
-            route_segment,
+            attributes,
+            metadata,
             is_dependency: false,
             source_unavailable,
             reason,

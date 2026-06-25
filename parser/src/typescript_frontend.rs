@@ -24,16 +24,8 @@ impl LanguageFrontend for TypeScriptFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let mut directive = None;
-        if source_code.contains("\"use client\"") || source_code.contains("'use client'") {
-            directive = Some("use client".to_string());
-        } else if source_code.contains("\"use server\"") || source_code.contains("'use server'") {
-            directive = Some("use server".to_string());
-        }
-
         let metadata = graph::models::FileMetadata {
-            directive,
-            ..Default::default()
+            metadata: None,
         };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
@@ -65,16 +57,8 @@ impl LanguageFrontend for TsxFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let mut directive = None;
-        if source_code.contains("\"use client\"") || source_code.contains("'use client'") {
-            directive = Some("use client".to_string());
-        } else if source_code.contains("\"use server\"") || source_code.contains("'use server'") {
-            directive = Some("use server".to_string());
-        }
-
         let metadata = graph::models::FileMetadata {
-            directive,
-            ..Default::default()
+            metadata: None,
         };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
@@ -147,7 +131,6 @@ fn extract_ts_symbols(
     while let Some(m) = matches.next() {
         let mut symbol_name = String::new();
         let mut symbol_kind = String::new();
-        let mut prop_type = None;
         let mut parent_node = None;
         let mut main_node = None;
 
@@ -163,8 +146,6 @@ fn extract_ts_symbols(
                     symbol_kind = capture_kind.to_string();
                     main_node = Some(node);
                     parent_node = Some(node.parent().unwrap_or(node));
-                } else if *capture_kind == "prop_type" {
-                    prop_type = Some(text.to_string());
                 }
             }
         }
@@ -175,62 +156,10 @@ fn extract_ts_symbols(
             parent_node,
         ) {
             let mut kind = symbol_kind;
-            let mut route_path = None;
-            let mut route_method = None;
 
             if kind == "jsx_render" {
                 name_str = "render".to_string();
                 kind = "jsx_element".to_string();
-            } else if kind == "function" {
-                // Next.js route handlers: a top-level exported GET/POST/etc.
-                // in a route.ts(x) file is the literal entrypoint for that
-                // API route — subsystem_stats relies on this "route" kind to
-                // populate its routes/entrypoints fields.
-                const HTTP_METHODS: [&str; 7] =
-                    ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
-                if filename == "route.ts" || filename == "route.tsx" {
-                    if HTTP_METHODS.contains(&name_str.as_str()) {
-                        kind = "route".to_string();
-
-                        let mut p = path.to_string();
-                        if p.starts_with("./src/app") {
-                            p = p.replacen("./src/app", "", 1);
-                        } else if p.starts_with("./app") {
-                            p = p.replacen("./app", "", 1);
-                        } else if p.starts_with("src/app") {
-                            p = p.replacen("src/app", "", 1);
-                        } else if p.starts_with("app") {
-                            p = p.replacen("app", "", 1);
-                        }
-
-                        if p.ends_with("/route.ts") {
-                            p = p.replacen("/route.ts", "", 1);
-                        } else if p.ends_with("/route.tsx") {
-                            p = p.replacen("/route.tsx", "", 1);
-                        }
-
-                        if p.is_empty() {
-                            p = "/".to_string();
-                        }
-                        if !p.starts_with('/') {
-                            p = format!("/{}", p);
-                        }
-
-                        route_path = Some(p);
-                        route_method = Some(name_str.clone());
-                    }
-                } else if name_str.starts_with("use") {
-                    kind = "hook".to_string();
-                } else if name_str.ends_with("Provider") {
-                    kind = "provider".to_string();
-                } else if is_tsx && name_str.chars().next().unwrap_or('a').is_uppercase() {
-                    kind = "component".to_string();
-                    if filename == "page.tsx" {
-                        kind = "page".to_string();
-                    } else if filename == "layout.tsx" {
-                        kind = "layout".to_string();
-                    }
-                }
             }
 
             let mut parent = parent;
@@ -318,14 +247,13 @@ fn extract_ts_symbols(
             symbols.push(SymbolNode {
                 name: name_str,
                 kind,
-                prop_type,
                 start_line: parent.start_position().row + 1,
                 end_line: parent.end_position().row + 1,
                 start_byte: parent.start_byte(),
                 end_byte: parent.end_byte(),
                 signature,
-                route_path,
-                route_method,
+                attributes: Vec::new(),
+                metadata: None,
             });
         }
     }
@@ -351,26 +279,6 @@ fn extract_ts_imports(
         )
         (call_expression function: (identifier) @call_name)
         (call_expression function: (member_expression property: (property_identifier) @method_call))
-        (string (string_fragment) @route_string)
-    ",
-    );
-
-    if is_tsx {
-        query_str.push_str(
-            "
-        (jsx_opening_element (identifier) @jsx_element)
-        (jsx_self_closing_element (identifier) @jsx_element)
-        (jsx_expression (identifier) @call_name)
-        (jsx_expression (member_expression property: (property_identifier) @method_call))
-        ",
-        );
-    }
-
-    query_str.push_str("
-        (call_expression 
-            function: [(identifier) @http_fn (member_expression property: (property_identifier) @http_fn)]
-            arguments: (arguments [(string (string_fragment) @http_route) (template_string (string_fragment) @http_route)])
-        )
         (member_expression property: (property_identifier) @member_access)
     ");
 
@@ -397,28 +305,13 @@ fn extract_ts_imports(
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "source" {
                     import_source = text.trim().to_string();
-                } else if *capture_kind == "jsx_element" {
-                    let name = text.trim().to_string();
-                    if name.chars().next().unwrap_or('a').is_uppercase() {
-                        import_name = name.clone();
-                        if name.ends_with("Provider") {
-                            import_kind = "renders_provider".to_string();
-                        } else {
-                            import_kind = "renders_component".to_string();
-                        }
-                        line_number = node.start_position().row + 1;
-                    }
                 } else if *capture_kind == "call_name" {
                     let name = text.trim().to_string();
                     if crate::utils::is_noisy_call_name(&name) {
                         continue;
                     }
                     import_name = name.clone();
-                    if name.starts_with("use") {
-                        import_kind = "consumes_hook".to_string();
-                    } else {
-                        import_kind = "calls".to_string();
-                    }
+                    import_kind = "calls".to_string();
                     line_number = node.start_position().row + 1;
                 } else if *capture_kind == "method_call" {
                     let name = text.trim().to_string();
@@ -435,60 +328,8 @@ fn extract_ts_imports(
                         import_kind = "MEMBER_ACCESS".to_string();
                         line_number = node.start_position().row + 1;
                     }
-                } else if *capture_kind == "http_fn" {
-                    let fn_name = text.trim().to_string();
-                    let is_http = fn_name == "fetch"
-                        || fn_name == "get"
-                        || fn_name == "post"
-                        || fn_name == "put"
-                        || fn_name == "delete"
-                        || fn_name == "patch"
-                        || fn_name == "request";
-                    if is_http {
-                        if let Some(route_node) = m
-                            .captures
-                            .iter()
-                            .find(|c| query.capture_names()[c.index as usize] == "http_route")
-                        {
-                            if let Ok(route) = route_node.node.utf8_text(source_code.as_bytes()) {
-                                let r = route.trim().to_string();
-                                if r.starts_with('/') {
-                                    import_name = r.clone();
-                                    import_kind = "HTTP_CALL".to_string();
-                                    line_number = node.start_position().row + 1;
-                                    let m = if fn_name == "fetch" || fn_name == "request" {
-                                        "GET"
-                                    } else {
-                                        &fn_name
-                                    };
-                                    import_source = m.to_uppercase();
-                                }
-                            }
-                        }
-                    }
-                } else if *capture_kind == "route_string" {
-                    let val = text.trim().to_string();
-                    if val.starts_with('/') && import_kind == "imports" {
-                        import_name = val;
-                        import_kind = "route_push".to_string();
-                        line_number = node.start_position().row + 1;
-                    }
                 }
             }
-        }
-
-        if import_kind == "HTTP_CALL" {
-            imports.push(ImportNode {
-                name: import_name.clone(),
-                source: if import_source.is_empty() {
-                    None
-                } else {
-                    Some(import_source.clone())
-                },
-                line_number,
-                kind: Some(import_kind.clone()),
-            });
-        } else if !import_name.is_empty() && import_kind != "imports" {
         }
 
         if !import_name.is_empty() {

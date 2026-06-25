@@ -190,82 +190,91 @@ fn generate_context_capsule(
     let _ = writeln!(md, "# CodeBroker Context Capsule\n");
     let _ = writeln!(md, "**Query:** {}\n", query);
 
-    // Discover: prefer exact-name matches, fall back to fuzzy/semantic search.
-    let mut pivots: Vec<(String, String)> = Vec::new();
-    if let Ok(candidates) = query::engine::find_symbol_candidates(db, query) {
-        for c in candidates.iter() {
-            if file_hint.map_or(true, |h| c.file_path.contains(h)) {
-                pivots.push((c.name.clone(), c.file_path.clone()));
-            }
-            if pivots.len() >= 3 {
-                break;
-            }
-        }
+    // 1. Fetch initial candidates via search_symbols
+    let (mut results, _reason) = query::engine::search_symbols(
+        db,
+        query,
+        semantic_tokens,
+        query_vector,
+        false,
+        file_hint,
+        query::engine::SearchMode::Both,
+        false,
+        None,
+    ).unwrap_or_else(|_| (vec![], None));
+
+    results.retain(|r| r.kind != "file" && r.kind != "text_match");
+
+    let is_conceptual = {
+        let mut words = query.split_whitespace();
+        words.any(|w| query::concepts::concepts_matching_term(w).is_empty() == false)
+    };
+    
+    let highest_conf = results.first().map(|r| r.confidence.as_str()).unwrap_or("Low");
+    if highest_conf.starts_with("Low") || highest_conf.starts_with("None") || highest_conf == "File Path Match" {
+        let mut md = String::new();
+        let _ = writeln!(md, "# CodeBroker Context Capsule\n\n**Query:** {}\n", query);
+        let _ = writeln!(md, "> [!WARNING]\n> **No confident matches found.** The retrieval engine did not find any highly relevant anchors to safely expand upon. To prevent hallucinations, Context Capsule graph expansion was aborted. Try using `search_codebase` directly.");
+        return md;
     }
-    // Concept pass: deterministic, no API key required, and runs BEFORE the
-    // blunter text-scan fallback below — not just when pivots are empty.
-    // Checks whether the query's own words map to a domain concept (auth,
-    // realtime, notifications, database) and pulls in symbols tagged with
-    // it. Running this ahead of the text-scan matters specifically when two
-    // conceptually distinct queries happen to share a generic literal word:
-    // "real-time collaboration between multiple users editing simultaneously"
-    // and "notification infrastructure for alerting users of events" both
-    // contain "users", which the text-scan would otherwise match to the same
-    // generic `User` interface / `user` local variable for both queries —
-    // exactly the "two different queries return identical results" bug
-    // benchmark run_005 found. Checking concepts first means "collaboration"
-    // routes to the realtime concept's symbols and "notification"/"alerting"
-    // routes to the notifications concept's symbols, independently, before
-    // either query gets a chance to collide on "users".
-    if pivots.is_empty() {
-        let mut concept_names: Vec<&'static str> = Vec::new();
-        for word in query.split_whitespace() {
-            for c in query::concepts::concepts_matching_term(word) {
-                if !concept_names.contains(&c) {
-                    concept_names.push(c);
+    
+    let needs_subsystem = is_conceptual; // Removed Low fallback since we bail out on Low now
+
+    let mut subsystem_files = std::collections::HashSet::new();
+    let mut subsystem_confidence = "Low".to_string();
+
+    if needs_subsystem {
+        if let Ok(stats) = query::subsystem::discover_subsystem(db, query, semantic_tokens, query_vector) {
+            subsystem_confidence = stats.confidence.clone();
+            for f in stats.files {
+                subsystem_files.insert(f);
+            }
+            // Boost existing results that are in subsystem
+            let routes_set: std::collections::HashSet<_> = stats.routes.iter().cloned().collect();
+            let symbols_set: std::collections::HashSet<_> = stats.symbols.iter().cloned().collect();
+            
+            for r in &mut results {
+                let mut boosted = false;
+                if routes_set.contains(&r.name) {
+                    r.score += 5000;
+                    r.confidence = "High (Subsystem Route)".to_string();
+                    boosted = true;
+                } else if symbols_set.contains(&r.name) {
+                    r.score += 3000;
+                    r.confidence = "High (Subsystem Core)".to_string();
+                    boosted = true;
+                } else if subsystem_files.contains(&r.path) {
+                    r.score += 1000;
+                    if !r.confidence.starts_with("High") {
+                        r.confidence = "Medium (Subsystem Peripheral)".to_string();
+                    }
+                    boosted = true;
+                }
+                
+                // Penalize massive generic UI components if we have a subsystem
+                // so they don't drown out focused backend services.
+                if boosted && r.path.contains("components/") || r.name == "Dashboard" {
+                    r.score -= 2000;
                 }
             }
-        }
-        'concept_search: for concept in concept_names {
-            if let Ok(matches) = query::concepts::symbols_for_concept(db, concept) {
-                for m in matches {
-                    if file_hint.map_or(true, |h| m.file_path.contains(h)) {
-                        pivots.push((m.symbol_name, m.file_path));
-                    }
-                    if pivots.len() >= 3 {
-                        break 'concept_search;
-                    }
-                }
-            }
+            results.sort_by(|a, b| b.score.cmp(&a.score));
         }
     }
 
-    if pivots.is_empty() {
-        // `Both` falls back to a raw text scan of file content when the
-        // symbol-name and concept passes above find nothing — this is still
-        // deterministic keyword/substring matching (with light
-        // suffix-stripping; see `stem_variants`), not embedding-based
-        // semantic search, but it catches natural-language queries whose
-        // words show up in code/comments rather than literally in a symbol
-        // name or mapping to a known concept.
-        if let Ok((results, _reason)) = query::engine::search_symbols(
-            db,
-            query,
-            semantic_tokens,
-            query_vector,
-            false,
-            file_hint,
-            query::engine::SearchMode::Both,
-            false,
-            None,
-        ) {
-            for r in results.iter().filter(|r| r.kind != "file") {
-                pivots.push((r.name.clone(), r.path.clone()));
-                if pivots.len() >= 3 {
-                    break;
-                }
-            }
-        }
+    let mut pivots = Vec::new();
+    for r in results.into_iter().take(3) {
+        let reason = if r.confidence.starts_with("High (Subsystem") {
+            "Anchor point discovered via graph expansion of the subsystem."
+        } else if r.confidence.starts_with("High (Semantic") {
+            "Strong semantic vector match for the conceptual query."
+        } else if r.confidence.starts_with("High") {
+            "Exact or highly confident lexical match."
+        } else if r.confidence.starts_with("Medium") {
+            "Partial semantic or lexical match."
+        } else {
+            "Fuzzy fallback match."
+        };
+        pivots.push((r.name.clone(), r.path.clone(), reason.to_string(), r.confidence.clone()));
     }
 
     if pivots.is_empty() {
@@ -276,13 +285,17 @@ fn generate_context_capsule(
         return md;
     }
 
+    // Capsule Confidence
+    let capsule_conf = pivots.iter().map(|p| p.3.clone()).max().unwrap_or("Low".to_string());
+    let capsule_conf = if subsystem_confidence.starts_with("High") { "High (Subsystem Validated)".to_string() } else { capsule_conf };
+    let _ = writeln!(md, "**Capsule Confidence:** {}\n", capsule_conf);
+
     let _ = writeln!(md, "## Pivot Symbols (Full Implementation)\n");
 
-    let mut seen_support: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    let mut support_sections: Vec<String> = Vec::new();
+    let mut seen_support: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut support_sections: Vec<(String, i32, String)> = Vec::new(); // (markdown, score, path)
 
-    for (name, hint) in &pivots {
+    for (name, hint, reason, _) in &pivots {
         let rel_hint = relative_hint(db, hint);
         let sources = query::retrieval::read_symbol_source_scoped(db, name, false, Some(rel_hint))
             .unwrap_or_default();
@@ -291,135 +304,131 @@ fn generate_context_capsule(
         };
 
         let _ = writeln!(md, "### `{}::{}`", src.file_path, src.symbol_name);
-        let _ = writeln!(md, "*Why:* Matched search query directly.\n");
+        let _ = writeln!(md, "*Selection Reasoning:* {}\n", reason);
 
-        // If the source file is JSON (e.g., package.json), we cannot extract a code body.
-        // Emit a placeholder instead of the raw source to avoid byte‑range errors.
         let src_body = if src.file_path.ends_with(".json") {
             "/* JSON symbol – no source body */".to_string()
         } else {
-            src.source.trim_end().to_string()
+            let lines: Vec<&str> = src.source.lines().collect();
+            let total = lines.len();
+            let max_lines = 100;
+            if total > max_lines {
+                let hidden = total - max_lines;
+                let mut out = lines[..max_lines].join("\n");
+                out.push_str(&format!("\n    ... // [{} lines hidden for token reduction]", hidden));
+                out
+            } else {
+                src.source.clone()
+            }
         };
 
-        let _ = writeln!(md, "```{}", lang_from_path(&src.file_path));
-        let _ = writeln!(md, "{}", src_body);
-        let _ = writeln!(md, "```\n");
+        let _ = writeln!(md, "```\n{}\n```\n", src_body);
+        seen_support.insert((src.symbol_name.clone(), src.file_path.clone()));
 
-        if let Ok(graph) =
-            query::graph::explore_graph(db, name, 1, query::graph::GraphDirection::Both, 30)
-        {
-            let root_id = graph
-                .nodes
-                .first()
-                .map(|n| n.id.clone())
-                .unwrap_or_default();
-            let root_kind = graph
-                .nodes
-                .first()
-                .map(|n| n.kind.clone())
-                .unwrap_or_default();
-            let mut scored_nodes = Vec::new();
-            for node in graph.nodes.iter().skip(1) {
-                let mut score = 0.0;
 
-                let q_lower = query.to_lowercase();
-                if node.name.to_lowercase().contains(&q_lower) {
-                    score += 5.0;
-                }
-                if node.file_path.to_lowercase().contains(&q_lower) {
-                    score += 3.0;
-                }
+        // Gather adjacent symbols for relevance scoring
+        if let Ok(Some(ctx)) = query::context::ContextObject::assemble_scoped(db, name, Some(rel_hint)) {
 
-                let root_dir = std::path::Path::new(&graph.nodes[0].file_path).parent();
-                let node_dir = std::path::Path::new(&node.file_path).parent();
-                if root_dir.is_some() && root_dir == node_dir {
-                    score += 2.0;
-                }
+            let mut candidates = Vec::new();
+            for d in ctx.forward_dependencies { candidates.push((d, "Forward Dependency")); }
+            for d in ctx.same_file_callers { candidates.push((d, "Same-File Caller")); }
+            for d in ctx.reverse_dependencies { candidates.push((d, "Reverse Dependency")); }
+            for d in ctx.callees { candidates.push((d, "Callee")); }
+            for d in ctx.callers { candidates.push((d, "Caller")); }
 
-                // Centrality: check edge count for the node
-                let mut degree = 0;
-                if let Ok(id_val) = node.id.replace("s", "").parse::<i64>() {
-                    let c: i64 = db.conn.query_row(
-                        "SELECT COUNT(*) FROM edges WHERE source_symbol_id = ?1 OR target_symbol_id = ?1",
-                        rusqlite::params![id_val],
-                        |r| r.get(0)
-                    ).unwrap_or(0);
-                    degree = c as usize;
-                }
-                score += (degree as f64) * 0.1;
 
-                scored_nodes.push((node, score));
-            }
-
-            scored_nodes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            for (node, _score) in scored_nodes.into_iter().take(8) {
-                let key = (node.file_path.clone(), node.name.clone());
-                if seen_support.contains(&key) {
-                    continue;
-                }
-                seen_support.insert(key);
-
-                // A class/interface ("type") on either end of the edge can't
-                // actually be CALLED — the edge kind on these is usually a
-                // byproduct of name-based linking (e.g. a prop/parameter type
-                // annotation), not a real call/reference. Relabel so the
-                // capsule doesn't claim a type "CALLS ->" or is "CALLS ->"-ed.
-                let is_type_relation = root_kind == "type" || node.kind == "type";
-                let display_kind = |kind: &str| -> String {
-                    if is_type_relation
-                        && (kind == "calls" || kind == "method_call" || kind == "imports")
-                    {
-                        "USES_TYPE".to_string()
-                    } else {
-                        kind.to_uppercase()
-                    }
-                };
-
-                let relation = graph
-                    .edges
-                    .iter()
-                    .find_map(|e| {
-                        if e.source == root_id && e.target == node.id {
-                            Some(format!("Pivot {} ->", display_kind(&e.kind)))
-                        } else if e.target == root_id && e.source == node.id {
-                            Some(format!("{} -> Pivot", display_kind(&e.kind)))
-                        } else {
-                            None
+            for (cand, rel_type) in candidates {
+                if let Ok(cand_sources) = query::retrieval::read_symbol_source_scoped(db, &cand, true, None) {
+                    for cand_src in cand_sources {
+                        if seen_support.contains(&(cand_src.symbol_name.clone(), cand_src.file_path.clone())) {
+                            continue;
                         }
-                    })
-                    .unwrap_or_else(|| "RELATED TO Pivot".to_string());
+                        
+                        // Compute Relevance Score
+                        let mut score = 0;
+                        if cand_src.file_path.contains(query) || cand_src.symbol_name.contains(query) {
+                            score += 500;
+                        }
+                        for t in semantic_tokens {
+                            if cand_src.symbol_name.contains(t) || cand_src.file_path.contains(t) {
+                                score += 100;
+                            }
+                        }
+                        // IMPORTANT: subsystem_files contains ABSOLUTE paths.
+                        // cand_src.file_path is ABSOLUTE.
+                        // db_path must be RELATIVE with ./ for SQL query.
+                        let rel_cand_path = relative_hint(db, &cand_src.file_path);
+                        let db_path = if rel_cand_path.starts_with("./") { rel_cand_path.to_string() } else { format!("./{}", rel_cand_path) };
+                        if subsystem_files.contains(&cand_src.file_path) {
+                            score += 1500; // High subsystem relevance
+                        }
+                        
+                        if let Some(qv) = query_vector {
+                            if let Ok(mut stmt) = db.conn.prepare("SELECT embedding FROM symbol_embeddings WHERE symbol_id = (SELECT id FROM symbols WHERE name = ?1 AND file_id = (SELECT id FROM files WHERE path = ?2) LIMIT 1)") {
+                                if let Ok(mut rows) = stmt.query(rusqlite::params![cand_src.symbol_name, db_path]) {
+                                    if let Ok(Some(row)) = rows.next() {
+                                        let blob: Vec<u8> = row.get(0).unwrap_or_default();
+                                        if !blob.is_empty() {
+                                            let s_vec = storage::blob_to_embedding(&blob);
+                                            let sim = storage::cosine_similarity(qv, &s_vec);
+                                            score += ((sim + 1.0) * 500.0) as i32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
-                let skeleton = signature_skeleton(db, &node.name, &node.file_path);
-                support_sections.push(format!(
-                    "### `{}::{}` — {}\n```{}\n{}\n```\n",
-                    node.file_path,
-                    node.name,
-                    relation,
-                    lang_from_path(&node.file_path),
-                    skeleton
-                ));
+                        if score > 200 {
+                            let md_block = format!(
+                                "### `{}::{}` (Skeleton)\n*Relationship to {}*: {}\n```\n{}\n```\n",
+                                cand_src.file_path, cand_src.symbol_name, src.symbol_name, rel_type, cand_src.source
+                            );
+                            support_sections.push((md_block, score, cand_src.file_path.clone()));
+                            seen_support.insert((cand_src.symbol_name.clone(), cand_src.file_path.clone()));
+                        }
+                    }
+                }
             }
         }
     }
 
-    if !support_sections.is_empty() {
-        let _ = writeln!(md, "## Supporting Context (Skeletons)\n");
-        for section in support_sections {
-            let _ = writeln!(md, "{}", section);
+    let _ = writeln!(md, "## Supporting Context (Relevant Adjacencies)\n");
+    if support_sections.is_empty() {
+        let _ = writeln!(md, "_No highly relevant supporting context found._");
+    } else {
+        // Apply diversity scoring: penalize items from the same file path
+        support_sections.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut final_support = Vec::new();
+        let mut path_counts = std::collections::HashMap::new();
+        let mut token_budget = 2000;
+
+        for (md_block, mut score, path) in support_sections {
+            let count = path_counts.entry(path.clone()).or_insert(0);
+            score -= *count * 200; // penalize 200 points per prior inclusion from same path
+            if score > 0 {
+                // insert and re-sort
+                final_support.push((md_block.clone(), score));
+                *count += 1;
+            }
+        }
+        
+        final_support.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (md_block, _) in final_support {
+            let approx_tokens = md_block.split_whitespace().count();
+            if token_budget >= approx_tokens {
+                let _ = write!(md, "{}", md_block);
+                token_budget -= approx_tokens;
+            }
+            if token_budget <= 0 {
+                break;
+            }
         }
     }
 
     md
 }
 
-/// Adds an approximate `response_size_hint` field to a JSON object response,
-/// so a calling agent can decide whether to drill deeper or stop without
-/// guessing from raw JSON length. Deliberately cheap (char_count / 4, the
-/// same heuristic `TokenAccounting::estimate_tokens` already uses for the
-/// delivered_token_count analytics field) — not a real tokenizer, just an
-/// order-of-magnitude estimate. Computed from the response as it stands
-/// before this field is added, so the hint doesn't include its own size.
 fn add_response_size_hint(value: &mut serde_json::Value) {
     let char_count = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
     let approx_tokens = analytics::accounting::TokenAccounting::estimate_tokens(char_count);
@@ -1561,6 +1570,7 @@ Treat native tools as the repository's implementation layer."#;
                                                                 kind: m.symbol_kind,
                                                                 score: 150,
                                                                 confidence: format!("Concept Match ({})", m.concept),
+                                                                explanation: format!("Matched conceptual tag '{}'", m.concept),
                                                                 line: None,
                                                             });
                                                             concept_added += 1;

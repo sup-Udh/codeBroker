@@ -30,48 +30,45 @@ impl LanguageFrontend for ConfigFrontend {
                 if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
                     for (k, _) in deps {
                         symbols.push(SymbolNode {
-                            route_path: None,
-                            route_method: None,
                             name: k.clone(),
                             kind: "dependency".to_string(),
-                            prop_type: None,
                             start_line: 0,
                             end_line: 0,
                             start_byte: 0,
                             end_byte: 0,
                             signature: None,
+                            attributes: Vec::new(),
+                            metadata: None,
                         });
                     }
                 }
                 if let Some(dev_deps) = json.get("devDependencies").and_then(|d| d.as_object()) {
                     for (k, _) in dev_deps {
                         symbols.push(SymbolNode {
-                            route_path: None,
-                            route_method: None,
                             name: k.clone(),
                             kind: "devDependency".to_string(),
-                            prop_type: None,
                             start_line: 0,
                             end_line: 0,
                             start_byte: 0,
                             end_byte: 0,
                             signature: None,
+                            attributes: Vec::new(),
+                            metadata: None,
                         });
                     }
                 }
                 if let Some(scripts) = json.get("scripts").and_then(|d| d.as_object()) {
                     for (k, _) in scripts {
                         symbols.push(SymbolNode {
-                            route_path: None,
-                            route_method: None,
                             name: k.clone(),
                             kind: "script".to_string(),
-                            prop_type: None,
                             start_line: 0,
                             end_line: 0,
                             start_byte: 0,
                             end_byte: 0,
                             signature: None,
+                            attributes: Vec::new(),
+                            metadata: None,
                         });
                     }
                 }

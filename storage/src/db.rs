@@ -177,16 +177,13 @@ impl Database {
         );
         let _ = self
             .conn
-            .execute("ALTER TABLE symbols ADD COLUMN prop_type TEXT;", []);
+            .execute("ALTER TABLE symbols ADD COLUMN attributes TEXT;", []);
         let _ = self
             .conn
-            .execute("ALTER TABLE files ADD COLUMN directive TEXT;", []);
+            .execute("ALTER TABLE symbols ADD COLUMN metadata TEXT;", []);
         let _ = self
             .conn
-            .execute("ALTER TABLE files ADD COLUMN route_path TEXT;", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE files ADD COLUMN route_segment TEXT;", []);
+            .execute("ALTER TABLE files ADD COLUMN metadata TEXT;", []);
         let _ = self
             .conn
             .execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
@@ -271,22 +268,25 @@ impl Database {
     pub fn update_file_metadata(
         &self,
         file_id: i64,
-        directive: Option<&str>,
-        route_path: Option<&str>,
-        route_segment: Option<&str>,
+        metadata: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE files SET directive = ?1, route_path = ?2, route_segment = ?3 WHERE id = ?4",
-            params![directive, route_path, route_segment, file_id],
+            "UPDATE files SET metadata = ?1 WHERE id = ?2",
+            params![metadata, file_id],
         )?;
         Ok(())
     }
 
     /// Inserts a symbol attached to a specific file
     pub fn insert_symbol(&self, file_id: i64, symbol: &SymbolNode) -> Result<i64> {
+        let attributes_json = if symbol.attributes.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&symbol.attributes).ok()
+        };
         self.conn.execute(
-            "INSERT INTO symbols (file_id, name, kind, prop_type, start_line, end_line, start_byte, end_byte, signature) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![file_id, symbol.name, symbol.kind, symbol.prop_type, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64, symbol.signature],
+            "INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature, attributes, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![file_id, symbol.name, symbol.kind, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64, symbol.signature, attributes_json, symbol.metadata],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -294,12 +294,11 @@ impl Database {
     pub fn insert_entrypoint(
         &self,
         symbol_id: i64,
-        route_path: &str,
-        method: &str,
+        reason: &str,
     ) -> Result<(), rusqlite::Error> {
         self.conn.execute(
-            "INSERT INTO entrypoints (symbol_id, route_path, method) VALUES (?1, ?2, ?3)",
-            rusqlite::params![symbol_id, route_path, method],
+            "INSERT INTO entrypoints (symbol_id, reason) VALUES (?1, ?2)",
+            rusqlite::params![symbol_id, reason],
         )?;
         Ok(())
     }

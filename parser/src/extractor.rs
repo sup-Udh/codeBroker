@@ -38,16 +38,15 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
                 let parent = node.parent().unwrap_or(node);
                 let end_line = parent.end_position().row + 1;
                 symbols.push(SymbolNode {
-                    route_path: None,
-                    route_method: None,
                     name: name.to_string(),
                     kind: capture_kind.to_string(),
-                    prop_type: None,
                     start_line: node.start_position().row + 1,
                     end_line,
                     start_byte: parent.start_byte(),
                     end_byte: parent.end_byte(),
                     signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
                 });
             }
         }
