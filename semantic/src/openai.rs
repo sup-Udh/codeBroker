@@ -306,6 +306,7 @@ impl LlmProvider for OpenAiProvider {
 
         #[derive(serde::Deserialize)]
         struct QueryExpansionResponse {
+            #[serde(alias = "synonyms")]
             tokens: Vec<String>,
         }
 
