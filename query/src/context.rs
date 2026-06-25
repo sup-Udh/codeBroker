@@ -38,6 +38,7 @@ pub struct ContextResponseBuilder<'a> {
     pub graph_indexed: bool,
     pub stale: bool,
     pub file_id: i64,
+    pub symbol_id: Option<i64>,
     pub symbol_name: String,
     pub profile: ResponseProfile,
     pub budget: TokenBudget,
@@ -52,7 +53,7 @@ impl<'a> ContextResponseBuilder<'a> {
     ) -> Result<Option<Self>> {
         let mut target_info = if let Some(scope) = path_scope {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
+                "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
@@ -60,44 +61,46 @@ impl<'a> ContextResponseBuilder<'a> {
             let like_scope = format!("%{}%", scope);
             stmt.query_row(rusqlite::params![symbol_name, like_scope], |row| {
                 Ok((
-                    row.get::<_, String>(0)?, // name
-                    row.get::<_, String>(1)?, // kind
-                    row.get::<_, String>(2)?, // path
-                    row.get::<_, i64>(3)?,    // line_number
-                    row.get::<_, i64>(4)?,    // file_id
-                    row.get::<_, Option<String>>(5)?, // signature
-                    row.get::<_, Option<String>>(6)?, // directive
-                    row.get::<_, Option<String>>(7)?, // content_hash
+                    row.get::<_, i64>(0)?,    // id
+                    row.get::<_, String>(1)?, // name
+                    row.get::<_, String>(2)?, // kind
+                    row.get::<_, String>(3)?, // path
+                    row.get::<_, i64>(4)?,    // line_number
+                    row.get::<_, i64>(5)?,    // file_id
+                    row.get::<_, Option<String>>(6)?, // signature
+                    row.get::<_, Option<String>>(7)?, // directive
+                    row.get::<_, Option<String>>(8)?, // content_hash
                 ))
             })
         } else {
             let mut stmt = db.conn.prepare(
-                "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
+                "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
                  FROM symbols
                  JOIN files ON symbols.file_id = files.id
                  WHERE symbols.name = ?1 LIMIT 1"
             )?;
             stmt.query_row(rusqlite::params![symbol_name], |row| {
                 Ok((
-                    row.get::<_, String>(0)?, // name
-                    row.get::<_, String>(1)?, // kind
-                    row.get::<_, String>(2)?, // path
-                    row.get::<_, i64>(3)?,    // line_number
-                    row.get::<_, i64>(4)?,    // file_id
-                    row.get::<_, Option<String>>(5)?, // signature
-                    row.get::<_, Option<String>>(6)?, // directive
-                    row.get::<_, Option<String>>(7)?, // content_hash
+                    row.get::<_, i64>(0)?,    // id
+                    row.get::<_, String>(1)?, // name
+                    row.get::<_, String>(2)?, // kind
+                    row.get::<_, String>(3)?, // path
+                    row.get::<_, i64>(4)?,    // line_number
+                    row.get::<_, i64>(5)?,    // file_id
+                    row.get::<_, Option<String>>(6)?, // signature
+                    row.get::<_, Option<String>>(7)?, // directive
+                    row.get::<_, Option<String>>(8)?, // content_hash
                 ))
             })
         };
 
-        let (name, kind, path, line_number, file_id, signature, directive, indexed_content_hash) = match target_info {
-            Ok(info) => info,
+        let (sym_id, name, kind, path, line_number, file_id, signature, directive, indexed_content_hash) = match target_info {
+            Ok(info) => (Some(info.0), info.1, info.2, info.3, info.4, info.5, info.6, info.7, info.8),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let mut file_stmt = db.conn.prepare("SELECT id, path, metadata, content_hash FROM files WHERE path LIKE ?1 LIMIT 1")?;
                 let file_search = format!("%{}%", symbol_name);
                 if let Ok((f_id, f_path, f_dir, f_hash)) = file_stmt.query_row(rusqlite::params![file_search], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?))) {
-                    (symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir, f_hash)
+                    (None, symbol_name.to_string(), "file".to_string(), db.resolve_path(&f_path), 1, f_id, None, f_dir, f_hash)
                 } else {
                     return Ok(None);
                 }
@@ -145,54 +148,40 @@ impl<'a> ContextResponseBuilder<'a> {
             graph_indexed,
             stale,
             file_id,
-            symbol_name: name,
+            symbol_id: sym_id,
+            symbol_name: name.clone(),
             budget: TokenBudget::new(profile),
             profile,
         }))
     }
 
     pub fn fetch_reverse_dependencies(&self) -> Result<Vec<String>> {
-        let mut rev_deps_stmt = self.db.conn.prepare(
-            "SELECT files.path 
-             FROM edges
-             JOIN files ON edges.source_file_id = files.id
-             WHERE edges.target_symbol_id = (SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1)
-             AND edges.kind = 'imports'"
-        )?;
-        let mut rev_deps_rows = rev_deps_stmt.query(rusqlite::params![self.file_id, self.symbol_name])?;
-        let mut rev_deps = Vec::new();
-        while let Some(row) = rev_deps_rows.next()? {
-            let p: String = row.get(0)?;
-            rev_deps.push(self.db.resolve_path(&p));
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_incoming_edges(self.db, id, Some("imports"))
+        } else {
+            Ok(Vec::new())
         }
-        rev_deps.sort();
-        rev_deps.dedup();
-        Ok(rev_deps)
     }
 
     pub fn fetch_same_file_callers(&self) -> Result<Vec<String>> {
-        let mut callers = Vec::new();
-        let mut siblings_stmt = self.db.conn.prepare(
-            "SELECT name, start_byte, end_byte FROM symbols WHERE file_id = ?1 AND name != ?2"
-        )?;
-        let mut siblings_rows = siblings_stmt.query(rusqlite::params![self.file_id, self.symbol_name])?;
-        if let Ok(content_bytes) = std::fs::read(&self.defining_file) {
-            let content_str = String::from_utf8_lossy(&content_bytes);
-            while let Some(row) = siblings_rows.next()? {
-                let sib_name: String = row.get(0)?;
-                let start: i64 = row.get(1)?;
-                let end: i64 = row.get(2)?;
-                if start >= 0 && end > start && (end as usize) <= content_str.len() {
-                    let body = &content_str[(start as usize)..(end as usize)];
-                    if contains_call(body, &self.symbol_name) {
-                        callers.push(sib_name);
+        if let Some(id) = self.symbol_id {
+            let callers = crate::graph::get_incoming_edges(self.db, id, Some("calls"))?;
+            let mut same_file = Vec::new();
+            for c in callers {
+                if let Ok(fid) = self.db.conn.query_row(
+                    "SELECT file_id FROM symbols WHERE name = ?1 LIMIT 1",
+                    rusqlite::params![c],
+                    |r| r.get::<_, i64>(0),
+                ) {
+                    if fid == self.file_id {
+                        same_file.push(c);
                     }
                 }
             }
+            Ok(same_file)
+        } else {
+            Ok(Vec::new())
         }
-        callers.sort();
-        callers.dedup();
-        Ok(callers)
     }
 
     pub fn fetch_siblings(&self) -> Result<Vec<String>> {
@@ -210,20 +199,11 @@ impl<'a> ContextResponseBuilder<'a> {
     }
 
     pub fn fetch_forward_dependencies(&self) -> Result<Vec<String>> {
-        let mut fwd_deps_stmt = self.db.conn.prepare(
-            "SELECT symbols.name
-             FROM edges
-             JOIN symbols ON edges.target_symbol_id = symbols.id
-             WHERE edges.source_file_id = ?1 AND edges.kind = 'imports'"
-        )?;
-        let mut fwd_deps_rows = fwd_deps_stmt.query(rusqlite::params![self.file_id])?;
-        let mut fwd_deps = Vec::new();
-        while let Some(row) = fwd_deps_rows.next()? {
-            fwd_deps.push(row.get::<_, String>(0)?);
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_outgoing_edges(self.db, id, Some("imports"))
+        } else {
+            Ok(Vec::new())
         }
-        fwd_deps.sort();
-        fwd_deps.dedup();
-        Ok(fwd_deps)
     }
 
     pub fn fetch_external_imports(&self) -> Result<Vec<String>> {
@@ -241,39 +221,19 @@ impl<'a> ContextResponseBuilder<'a> {
     }
 
     pub fn fetch_callers(&self) -> Result<Vec<String>> {
-        let mut callers_stmt = self.db.conn.prepare(
-            "SELECT files.path
-             FROM edges
-             JOIN files ON edges.source_file_id = files.id
-             WHERE edges.target_symbol_id = (SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1)
-             AND edges.kind = 'calls'"
-        )?;
-        let mut callers_rows = callers_stmt.query(rusqlite::params![self.file_id, self.symbol_name])?;
-        let mut callers = Vec::new();
-        while let Some(row) = callers_rows.next()? {
-            let path: String = row.get(0)?;
-            callers.push(self.db.resolve_path(&path));
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_incoming_edges(self.db, id, Some("calls"))
+        } else {
+            Ok(Vec::new())
         }
-        callers.sort();
-        callers.dedup();
-        Ok(callers)
     }
 
     pub fn fetch_callees(&self) -> Result<Vec<String>> {
-        let mut callees_stmt = self.db.conn.prepare(
-            "SELECT symbols.name
-             FROM edges
-             JOIN symbols ON edges.target_symbol_id = symbols.id
-             WHERE edges.source_file_id = ?1 AND edges.kind = 'calls'"
-        )?;
-        let mut callees_rows = callees_stmt.query(rusqlite::params![self.file_id])?;
-        let mut callees = Vec::new();
-        while let Some(row) = callees_rows.next()? {
-            callees.push(row.get::<_, String>(0)?);
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_outgoing_edges(self.db, id, Some("calls"))
+        } else {
+            Ok(Vec::new())
         }
-        callees.sort();
-        callees.dedup();
-        Ok(callees)
     }
     
     pub fn fetch_prop_interfaces(&self) -> Result<Vec<crate::retrieval::SymbolSourceResult>> {
@@ -294,53 +254,27 @@ impl<'a> ContextResponseBuilder<'a> {
     }
 
     pub fn fetch_wrapped_by(&self) -> Result<Vec<String>> {
-        let mut wrap_stmt = self.db.conn.prepare(
-            "SELECT files.path
-             FROM edges
-             JOIN files ON edges.source_file_id = files.id
-             WHERE edges.target_symbol_id = (SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1)
-             AND edges.kind = 'wraps_route'"
-        )?;
-        let mut wrap_rows = wrap_stmt.query(rusqlite::params![self.file_id, self.symbol_name])?;
-        let mut wrapped_by = Vec::new();
-        while let Some(row) = wrap_rows.next()? {
-            let path: String = row.get(0)?;
-            wrapped_by.push(self.db.resolve_path(&path));
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_incoming_edges(self.db, id, Some("wraps_route"))
+        } else {
+            Ok(Vec::new())
         }
-        wrapped_by.sort();
-        wrapped_by.dedup();
-        Ok(wrapped_by)
     }
 
     pub fn fetch_renders_components(&self) -> Result<Vec<String>> {
-        let mut render_stmt = self.db.conn.prepare(
-            "SELECT symbols.name
-             FROM edges
-             JOIN symbols ON edges.target_symbol_id = symbols.id
-             WHERE edges.source_file_id = ?1 AND edges.kind = 'renders_component'"
-        )?;
-        let mut render_rows = render_stmt.query(rusqlite::params![self.file_id])?;
-        let mut renders = Vec::new();
-        while let Some(row) = render_rows.next()? {
-            renders.push(row.get::<_, String>(0)?);
+        if let Some(id) = self.symbol_id {
+            crate::graph::get_outgoing_edges(self.db, id, Some("renders_component"))
+        } else {
+            Ok(Vec::new())
         }
-        renders.sort();
-        renders.dedup();
-        Ok(renders)
     }
     
     pub fn fetch_consumes_hooks(&self) -> Result<Vec<String>> {
-        let mut hook_stmt = self.db.conn.prepare(
-            "SELECT symbols.name
-             FROM edges
-             JOIN symbols ON edges.target_symbol_id = symbols.id
-             WHERE edges.source_file_id = ?1 AND edges.kind = 'consumes_hook'"
-        )?;
-        let mut hook_rows = hook_stmt.query(rusqlite::params![self.file_id])?;
-        let mut consumes = Vec::new();
-        while let Some(row) = hook_rows.next()? {
-            consumes.push(row.get::<_, String>(0)?);
-        }
+        let mut consumes = if let Some(id) = self.symbol_id {
+            crate::graph::get_outgoing_edges(self.db, id, Some("consumes_hook"))?
+        } else {
+            Vec::new()
+        };
 
         let mut raw_hook_stmt = self.db.conn.prepare(
             "SELECT name FROM raw_imports WHERE file_id = ?1 AND kind = 'consumes_hook'"

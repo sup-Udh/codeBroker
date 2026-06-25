@@ -46,10 +46,10 @@ pub fn list_entrypoints(
     let mut stmt = db
         .conn
         .prepare(
-            "SELECT symbols.name, symbols.kind, files.path
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
              FROM symbols
              JOIN files ON symbols.file_id = files.id
-             WHERE symbols.kind IN ('route', 'endpoint', 'page', 'layout')",
+             WHERE symbols.kind IN ('route', 'endpoint', 'page', 'layout', 'function', 'method')",
         )
         .map_err(|e| e.to_string())?;
 
@@ -57,23 +57,30 @@ pub fn list_entrypoints(
     let mut routes = Vec::new();
     let mut pages = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let name: String = row.get(0).unwrap_or_default();
-        let kind: String = row.get(1).unwrap_or_default();
-        let path: String = row.get(2).unwrap_or_default();
+        let id: i64 = row.get(0).unwrap_or(0);
+        let name: String = row.get(1).unwrap_or_default();
+        let kind: String = row.get(2).unwrap_or_default();
+        let path: String = row.get(3).unwrap_or_default();
+        
         if let Some(scope) = path_scope {
             if !path.contains(scope) {
                 continue;
             }
         }
-        let entry = EntrypointEntry {
-            name,
-            kind: kind.clone(),
-            file_path: db.resolve_path(&path),
-        };
-        if kind == "route" || kind == "endpoint" {
-            routes.push(entry);
-        } else {
-            pages.push(entry);
+
+        if let Ok(score) = calculate_entrypoint_score(db, id) {
+            if score >= 50 {
+                let entry = EntrypointEntry {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    file_path: db.resolve_path(&path),
+                };
+                if kind == "page" || kind == "layout" || name.to_lowercase().contains("page") {
+                    pages.push(entry);
+                } else {
+                    routes.push(entry);
+                }
+            }
         }
     }
 
@@ -246,16 +253,10 @@ pub fn discover_subsystem(
             while let Ok(Some(row)) = edge_rows.next() {
                 let source_id: i64 = row.get(0).map_err(|e| e.to_string())?;
                 if !matched_symbol_ids.contains(&source_id) {
-                    let kind: String = db
-                        .conn
-                        .query_row(
-                            "SELECT kind FROM symbols WHERE id = ?1",
-                            rusqlite::params![source_id],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or_default();
-                    if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
-                        new_symbols.insert(source_id);
+                    if let Ok(score) = calculate_entrypoint_score(db, source_id) {
+                        if score >= 50 {
+                            new_symbols.insert(source_id);
+                        }
                     }
                 }
             }
@@ -322,11 +323,14 @@ pub fn discover_subsystem(
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
         ) {
             symbols.push(s_name.clone());
-            if kind == "route" || kind == "endpoint" {
-                routes.push(s_name.clone());
-            }
-            if kind == "page" || kind == "layout" {
-                page_entrypoints.push(s_name);
+            if let Ok(score) = calculate_entrypoint_score(db, s_id) {
+                if score >= 50 {
+                    if kind == "page" || kind == "layout" || s_name.to_lowercase().contains("page") {
+                        page_entrypoints.push(s_name.clone());
+                    } else {
+                        routes.push(s_name.clone());
+                    }
+                }
             }
             if let Ok(path) = db.conn.query_row(
                 "SELECT path FROM files WHERE id = ?1",
@@ -485,4 +489,71 @@ pub fn discover_subsystem(
         subsystem_hash,
         confidence: confidence_val,
     })
+}
+
+/// Computes a heuristic score for whether a symbol acts as an entrypoint.
+/// High scores indicate a strong likelihood of being an entrypoint.
+pub fn calculate_entrypoint_score(db: &Database, symbol_id: i64) -> Result<i32, String> {
+    let mut score = 0;
+
+    let (name, kind, attributes): (String, String, Option<String>) = db.conn.query_row(
+        "SELECT name, kind, attributes FROM symbols WHERE id = ?1",
+        rusqlite::params![symbol_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    ).map_err(|e| e.to_string())?;
+
+    // 1. Kind signals
+    if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
+        score += 50;
+    } else if kind != "function" && kind != "method" {
+        // Unlikely to be an entrypoint if it's a class or interface
+        return Ok(-100);
+    }
+
+    // 2. Attributes/Decorators
+    if let Some(attr) = attributes {
+        let attr_lower = attr.to_lowercase();
+        if attr_lower.contains("get") || attr_lower.contains("post") || 
+           attr_lower.contains("put") || attr_lower.contains("delete") || 
+           attr_lower.contains("route") || attr_lower.contains("mapping") || 
+           attr_lower.contains("endpoint") {
+            score += 40;
+        } else if !attr.is_empty() {
+            score += 10;
+        }
+    }
+
+    // 3. Incoming Edges
+    let incoming_calls: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE target_symbol_id = ?1 AND source_symbol_id IS NOT NULL AND kind = 'calls'",
+        rusqlite::params![symbol_id],
+        |r| r.get(0)
+    ).unwrap_or(0);
+
+    if incoming_calls == 0 {
+        score += 30; // lack of incoming static calls is a strong entrypoint signal
+    } else {
+        score -= 20 * (incoming_calls as i32); // penalize heavily if it's called statically
+    }
+    
+    // 4. Outgoing Edges
+    let outgoing_calls: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE source_symbol_id = ?1 AND kind = 'calls'",
+        rusqlite::params![symbol_id],
+        |r| r.get(0)
+    ).unwrap_or(0);
+    
+    if outgoing_calls > 0 {
+        score += 10; // entrypoints usually call other things to do work
+    }
+
+    // 5. Name heuristics (low weight)
+    let name_lower = name.to_lowercase();
+    if name_lower.contains("handle") || name_lower.contains("route") || 
+       name_lower.contains("controller") || name_lower.contains("page") || 
+       name_lower.contains("main") {
+        score += 10;
+    }
+
+    Ok(score)
 }

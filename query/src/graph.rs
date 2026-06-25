@@ -1968,3 +1968,79 @@ mod dependency_cycles_tests {
         );
     }
 }
+
+/// Unified symbol-level API for depth=1 outgoing edges.
+/// Filters out self-loops unless explicitly recursive (self-loop where source == target).
+/// If `edge_kind` is Some, filters by that edge kind.
+pub fn get_outgoing_edges(
+    db: &storage::Database,
+    symbol_id: i64,
+    edge_kind: Option<&str>,
+) -> Result<Vec<String>> {
+    let query = if let Some(kind) = edge_kind {
+        format!(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.target_symbol_id = symbols.id 
+             WHERE edges.source_symbol_id = ?1 
+             AND edges.kind = '{}' 
+             AND edges.target_symbol_id != edges.source_symbol_id",
+            kind
+        )
+    } else {
+        "SELECT symbols.name 
+         FROM edges 
+         JOIN symbols ON edges.target_symbol_id = symbols.id 
+         WHERE edges.source_symbol_id = ?1 
+         AND edges.target_symbol_id != edges.source_symbol_id".to_string()
+    };
+
+    let mut stmt = db.conn.prepare(&query)?;
+    let mut rows = stmt.query(rusqlite::params![symbol_id])?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next()? {
+        results.push(row.get::<_, String>(0)?);
+    }
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+/// Unified symbol-level API for depth=1 incoming edges.
+/// Filters out self-loops.
+/// If `edge_kind` is Some, filters by that edge kind.
+pub fn get_incoming_edges(
+    db: &storage::Database,
+    symbol_id: i64,
+    edge_kind: Option<&str>,
+) -> Result<Vec<String>> {
+    let query = if let Some(kind) = edge_kind {
+        format!(
+            "SELECT symbols.name 
+             FROM edges 
+             JOIN symbols ON edges.source_symbol_id = symbols.id 
+             WHERE edges.target_symbol_id = ?1 
+             AND edges.source_symbol_id IS NOT NULL 
+             AND edges.kind = '{}' 
+             AND edges.source_symbol_id != edges.target_symbol_id",
+            kind
+        )
+    } else {
+        "SELECT symbols.name 
+         FROM edges 
+         JOIN symbols ON edges.source_symbol_id = symbols.id 
+         WHERE edges.target_symbol_id = ?1 
+         AND edges.source_symbol_id IS NOT NULL 
+         AND edges.source_symbol_id != edges.target_symbol_id".to_string()
+    };
+
+    let mut stmt = db.conn.prepare(&query)?;
+    let mut rows = stmt.query(rusqlite::params![symbol_id])?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next()? {
+        results.push(row.get::<_, String>(0)?);
+    }
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
