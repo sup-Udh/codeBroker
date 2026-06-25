@@ -138,6 +138,33 @@ impl GraphResponse {
         }
         md
     }
+
+    pub fn build_json(&self, profile: crate::response::ResponseProfile) -> serde_json::Value {
+        let mut nodes = Vec::new();
+        for n in &self.nodes {
+            nodes.push(serde_json::json!([n.id, n.name, n.kind, n.file_path]));
+        }
+        let mut edges = Vec::new();
+        for e in &self.edges {
+            if matches!(profile, crate::response::ResponseProfile::Verbose) {
+                edges.push(serde_json::json!([e.source, e.target, e.kind, e.edge_type]));
+            } else {
+                edges.push(serde_json::json!([e.source, e.target, e.kind]));
+            }
+        }
+        
+        let mut map = serde_json::Map::new();
+        map.insert("root".to_string(), serde_json::json!(self.root));
+        map.insert("depth".to_string(), serde_json::json!(self.depth));
+        map.insert("truncated".to_string(), serde_json::json!(self.truncated));
+        if let Some(w) = &self.dominant_file_warning {
+            map.insert("dominant_file_warning".to_string(), serde_json::json!(w));
+        }
+        map.insert("nodes".to_string(), serde_json::json!(nodes));
+        map.insert("edges".to_string(), serde_json::json!(edges));
+        
+        serde_json::Value::Object(map)
+    }
 }
 
 pub fn explore_graph(
@@ -1334,6 +1361,35 @@ impl GraphSubtreeResponse {
             ));
         }
         md
+    }
+
+    pub fn build_json(&self, profile: crate::response::ResponseProfile) -> serde_json::Value {
+        let mut nodes = Vec::new();
+        for n in &self.nodes {
+            nodes.push(serde_json::json!([n.name, n.kind, n.file_path]));
+        }
+        let mut edges = Vec::new();
+        for e in &self.edges {
+            if matches!(profile, crate::response::ResponseProfile::Verbose) {
+                edges.push(serde_json::json!([e.source, e.target, e.edge_kind, e.edge_type]));
+            } else {
+                edges.push(serde_json::json!([e.source, e.target, e.edge_kind]));
+            }
+        }
+        
+        let mut map = serde_json::Map::new();
+        map.insert("root".to_string(), serde_json::json!(self.root));
+        map.insert("depth".to_string(), serde_json::json!(self.depth));
+        map.insert("node_count".to_string(), serde_json::json!(self.node_count));
+        map.insert("edge_count".to_string(), serde_json::json!(self.edge_count));
+        map.insert("truncated".to_string(), serde_json::json!(self.truncated));
+        if let Some(w) = &self.dominant_file_warning {
+            map.insert("dominant_file_warning".to_string(), serde_json::json!(w));
+        }
+        map.insert("nodes".to_string(), serde_json::json!(nodes));
+        map.insert("edges".to_string(), serde_json::json!(edges));
+        
+        serde_json::Value::Object(map)
     }
 }
 

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":3,"result":{"content":[{"text":"{\n  \"root\": \"search_symbols\",\n  \"depth\": 2,\n  \"truncated\": false,\n  \"dominant_file_warning\": null,\n  \"nodes\": [],\n  \"edges\": []\n}","type":"text"}]}}

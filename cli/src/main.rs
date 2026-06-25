@@ -544,12 +544,13 @@ fn main() {
         Commands::Context { symbol } => {
             let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
 
-            println!("Assembling context bject for '{}'...\n", symbol);
+            println!("Assembling context object for '{}'...\n", symbol);
             // Call our new assembly engine!
-            match query::context::ContextObject::assemble(&db, symbol) {
-                Ok(Some(context_obj)) => {
+            let profile = query::response::ResponseProfile::Standard;
+            match query::context::ContextResponseBuilder::new(&db, symbol, None, profile) {
+                Ok(Some(builder)) => {
                     // This is the magic: We convert our rich graph structs into clean JSON
-                    let json_payload = serde_json::to_string_pretty(&context_obj).unwrap();
+                    let json_payload = serde_json::to_string_pretty(&builder.build_json().unwrap()).unwrap();
                     println!("{}", json_payload);
                 }
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),

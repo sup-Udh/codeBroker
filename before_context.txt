@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"Symbol 'explore_graph' not found in database.","type":"text"}]}}

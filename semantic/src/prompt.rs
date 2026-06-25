@@ -1,12 +1,9 @@
-use query::context::ContextObject;
-
 pub fn build_prompt(
     symbol_name: &str,
     source_code: &str,
-    context: &ContextObject,
+    json_context: &str,
     config_files_text: &str,
 ) -> String {
-    let json_context = serde_json::to_string_pretty(context).unwrap_or_default();
 
     // We construct a massive, highly structured string using the format! macro
     format!(

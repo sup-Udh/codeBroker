@@ -1,6 +1,5 @@
 use crate::prompt::build_prompt;
 use crate::provider::LlmProvider;
-use query::context::ContextObject;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -72,11 +71,11 @@ impl<'a> SummaryGenerator<'a> {
         let abs_file_path = self.db.resolve_path(&file_path);
         let source_code = fs::read_to_string(&abs_file_path).unwrap_or_default();
 
-        // 3. Assemble the ContextObject
-        let context = ContextObject::assemble_scoped(self.db, symbol_name, file_hint)
+        // 3. Assemble the ContextResponseBuilder
+        let builder = query::context::ContextResponseBuilder::new(self.db, symbol_name, file_hint, query::response::ResponseProfile::Verbose)
             .map_err(|e| e.to_string())?
             .ok_or("Failed to assemble context")?;
-        let graph_indexed = context.graph_indexed;
+        let graph_indexed = builder.graph_indexed;
 
         // 3.5. Fetch config files
         let mut config_text = String::new();
@@ -92,9 +91,8 @@ impl<'a> SummaryGenerator<'a> {
             }
         }
 
-        // 4. Calculate Hashes
         let source_hash = calculate_hash(&source_code);
-        let context_json = serde_json::to_string(&context).unwrap_or_default();
+        let context_json = serde_json::to_string(&builder.build_json().unwrap_or_default()).unwrap_or_default();
         let context_hash = calculate_hash(&context_json);
         let model_name = self.provider.model_name();
 
@@ -117,7 +115,7 @@ impl<'a> SummaryGenerator<'a> {
         }
 
         // 6. Build Prompt & Call AI (with latency tracking!)
-        let prompt = build_prompt(symbol_name, &source_code, &context, &config_text);
+        let prompt = build_prompt(symbol_name, &source_code, &context_json, &config_text);
 
         let start_time = std::time::Instant::now();
         let (summary, token_count) = self.provider.generate_summary(&prompt, 30, 2048)?;

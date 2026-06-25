@@ -101,31 +101,6 @@ fn use_cheap_impact_path(
     total_dependencies < risk_threshold || !has_openai_key
 }
 
-/// Maps a file extension to a Markdown fenced-code-block language tag, so
-/// capsule output gets syntax highlighting in agents that render Markdown.
-fn lang_from_path(path: &str) -> &'static str {
-    if path.ends_with(".rs") {
-        "rust"
-    } else if path.ends_with(".py") {
-        "python"
-    } else if path.ends_with(".tsx") {
-        "tsx"
-    } else if path.ends_with(".ts") {
-        "typescript"
-    } else if path.ends_with(".jsx") {
-        "jsx"
-    } else if path.ends_with(".js") {
-        "javascript"
-    } else if path.ends_with(".vue") {
-        "vue"
-    } else if path.ends_with(".toml") {
-        "toml"
-    } else if path.ends_with(".json") {
-        "json"
-    } else {
-        ""
-    }
-}
 
 /// find_symbol_candidates/search_symbols resolve paths to absolute (via
 /// db.resolve_path) before returning, but read_symbol_source_scoped's
@@ -141,37 +116,6 @@ fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str 
         .unwrap_or(absolute_path)
 }
 
-/// Collapses a symbol's source down to its signature line(s) plus a
-/// `[N lines hidden]` marker, for the "Supporting Context" section of
-/// generate_context_capsule — callers/callees are shown structurally
-/// (so the agent knows they exist and how they connect) without paying
-/// the token cost of their full bodies.
-fn signature_skeleton(db: &storage::Database, name: &str, file_path: &str) -> String {
-    match query::retrieval::read_symbol_source_scoped(db, name, false, Some(file_path)) {
-        Ok(results) => match results.into_iter().next() {
-            Some(r) => {
-                let lines: Vec<&str> = r.source.lines().collect();
-                if lines.is_empty() {
-                    return format!("// {} (source unavailable)", name);
-                }
-                let total = lines.len();
-                let sig_end = lines.iter().position(|l| l.contains('{')).unwrap_or(0);
-                let sig_end = sig_end.min(total.saturating_sub(1));
-                let mut out = lines[..=sig_end].join("\n");
-                let hidden = total - (sig_end + 1);
-                if hidden > 0 {
-                    out.push_str(&format!(
-                        "\n    ... // [{} lines hidden for token reduction]",
-                        hidden
-                    ));
-                }
-                out
-            }
-            None => format!("// {} (source unavailable)", name),
-        },
-        Err(_) => format!("// {} (source unavailable)", name),
-    }
-}
 
 /// Orchestrates the one-shot "Context Capsule" workflow: discover the 1-3
 /// pivot symbols matching `query`, fetch their full implementation, expand
@@ -327,14 +271,14 @@ fn generate_context_capsule(
 
 
         // Gather adjacent symbols for relevance scoring
-        if let Ok(Some(ctx)) = query::context::ContextObject::assemble_scoped(db, name, Some(rel_hint)) {
+        if let Ok(Some(ctx)) = query::context::ContextResponseBuilder::new(db, name, Some(rel_hint), query::response::ResponseProfile::Verbose) {
 
             let mut candidates = Vec::new();
-            for d in ctx.forward_dependencies { candidates.push((d, "Forward Dependency")); }
-            for d in ctx.same_file_callers { candidates.push((d, "Same-File Caller")); }
-            for d in ctx.reverse_dependencies { candidates.push((d, "Reverse Dependency")); }
-            for d in ctx.callees { candidates.push((d, "Callee")); }
-            for d in ctx.callers { candidates.push((d, "Caller")); }
+            if let Ok(deps) = ctx.fetch_forward_dependencies() { for d in deps { candidates.push((d, "Forward Dependency")); } }
+            if let Ok(deps) = ctx.fetch_same_file_callers() { for d in deps { candidates.push((d, "Same-File Caller")); } }
+            if let Ok(deps) = ctx.fetch_reverse_dependencies() { for d in deps { candidates.push((d, "Reverse Dependency")); } }
+            if let Ok(deps) = ctx.fetch_callees() { for d in deps { candidates.push((d, "Callee")); } }
+            if let Ok(deps) = ctx.fetch_callers() { for d in deps { candidates.push((d, "Caller")); } }
 
 
             for (cand, rel_type) in candidates {
@@ -1356,14 +1300,16 @@ Treat native tools as the repository's implementation layer."#;
                                             // or silently flagging stale data — see
                                             // semantic::staleness for why this matters for the
                                             // "edit, then immediately ask about it" workflow.
-                                            match query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).map_err(|e| e.to_string())
-                                                .and_then(|opt| match opt {
-                                                    Some(c) if c.stale => semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint),
-                                                    other => Ok(other),
-                                                }) {
+                                            let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("standard");
+                                            let profile = match profile_str {
+                                                "compact" => query::response::ResponseProfile::Compact,
+                                                "verbose" => query::response::ResponseProfile::Verbose,
+                                                _ => query::response::ResponseProfile::Standard,
+                                            };
+                                            match semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, profile).map_err(|e| e.to_string()) {
                                                 Ok(Some(context)) => {
                                                     if format_opt == "markdown" {
-                                                        let mut md = format!("### Context for {}\n\n```json\n{}\n```\n", symbol, serde_json::to_string_pretty(&context).unwrap_or_default());
+                                                        let mut md = context.build_markdown().unwrap_or_else(|_| "Error building markdown".to_string());
                                                         if include_source {
                                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                                             if !source.is_empty() {
@@ -1375,16 +1321,14 @@ Treat native tools as the repository's implementation layer."#;
                                                         }
                                                         md
                                                     } else {
+                                                        let mut value = context.build_json().unwrap_or(serde_json::json!({}));
                                                         if include_source {
                                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
-                                                            let mut value = serde_json::to_value(&context).unwrap_or_default();
                                                             if let Some(obj) = value.as_object_mut() {
                                                                 obj.insert("source".to_string(), serde_json::to_value(&source).unwrap_or_default());
                                                             }
-                                                            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing context JSON".to_string())
-                                                        } else {
-                                                            serde_json::to_string_pretty(&context).unwrap_or_else(|_| "Error serializing context JSON".to_string())
                                                         }
+                                                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing context JSON".to_string())
                                                     }
                                                 }
                                                 Ok(None) => format!("Symbol '{}' not found in database.", symbol),
@@ -1420,28 +1364,21 @@ Treat native tools as the repository's implementation layer."#;
                                             // the incremental reindex itself fails, falls back to
                                             // the stale context with a loud warning rather than
                                             // erroring outright.
-                                            let first_pass = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
-                                            let was_stale = first_pass.as_ref().map(|c| c.stale).unwrap_or(false);
-                                            let context = if was_stale {
-                                                semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint)
-                                                    .unwrap_or_else(|_| first_pass.clone())
-                                            } else {
-                                                first_pass
-                                            };
+                                            let context = semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
-                                            let stale_warning = (was_stale && still_stale).then(|| format!(
+                                            let stale_warning = still_stale.then(|| format!(
                                                 "WARNING: '{}' has been modified on disk since it was indexed, and the automatic incremental reindex failed. The dependency data below may be computed against stale symbol boundaries. Run reindex_workspace before trusting this analysis.\n\n",
                                                 symbol
                                             ));
                                             if format == "structured" || format == "json" {
-                                                let mut out = serde_json::to_string_pretty(&context).unwrap_or_default();
+                                                let mut out = context.as_ref().map(|c| serde_json::to_string_pretty(&c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or_default()).unwrap_or_default();
                                                 if let Some(w) = &stale_warning {
                                                     out = format!("{}{}", w, out);
                                                 }
                                                 out
                                             } else {
-                                                let fwd = context.as_ref().map(|c| c.forward_dependencies.len()).unwrap_or(0);
-                                                let rev = context.as_ref().map(|c| c.reverse_dependencies.len()).unwrap_or(0);
+                                                let fwd = context.as_ref().map(|c| c.fetch_forward_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
+                                                let rev = context.as_ref().map(|c| c.fetch_reverse_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
                                                 let total_dependencies = fwd + rev;
                                                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
 
@@ -1462,10 +1399,10 @@ Treat native tools as the repository's implementation layer."#;
                                                         "risk_level": "LOW",
                                                         "total_dependencies": total_dependencies,
                                                         "threshold": risk_threshold,
-                                                        "callers": context.as_ref().map(|c| c.callers.clone()).unwrap_or_default(),
-                                                        "callees": context.as_ref().map(|c| c.callees.clone()).unwrap_or_default(),
-                                                        "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
-                                                        "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
+                                                        "callers": context.as_ref().map(|c| c.fetch_callers().unwrap_or_default()).unwrap_or_default(),
+                                                        "callees": context.as_ref().map(|c| c.fetch_callees().unwrap_or_default()).unwrap_or_default(),
+                                                        "forward_dependencies": context.as_ref().map(|c| c.fetch_forward_dependencies().unwrap_or_default()).unwrap_or_default(),
+                                                        "reverse_dependencies": context.as_ref().map(|c| c.fetch_reverse_dependencies().unwrap_or_default()).unwrap_or_default(),
                                                         "llm_used": false,
                                                         "reason": reason,
                                                     });
@@ -1499,7 +1436,7 @@ Treat native tools as the repository's implementation layer."#;
                                 let mode = query::engine::SearchMode::from(mode_str);
                                 let whole_word = arguments.get("whole_word").and_then(|b| b.as_bool()).unwrap_or(false);
                                 let min_confidence = arguments.get("min_confidence").and_then(|s| s.as_str());
-                                let include_source = arguments.get("include_source").and_then(|b| b.as_bool()).unwrap_or(false);
+                                let _include_source = arguments.get("include_source").and_then(|b| b.as_bool()).unwrap_or(false);
 
                                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
                                 let mut llm_used = false;
@@ -1528,7 +1465,7 @@ Treat native tools as the repository's implementation layer."#;
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
                                         match query::engine::search_symbols(&db, keyword, &semantic_tokens, query_vector.as_deref(), llm_used, path_scope, mode, whole_word, min_confidence) {
-                                            Ok((mut results, mut reason)) => {
+                                            Ok((mut results, reason)) => {
                                                 // Semantic search removed per architectural upgrade instructions.
                                                 // Concept augmentation: independent of how weak/strong
                                                 // the literal keyword match was, also check whether the
@@ -1895,7 +1832,9 @@ Treat native tools as the repository's implementation layer."#;
                                                 if format_opt == "markdown" {
                                                     res.to_markdown()
                                                 } else {
-                                                    serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph".to_string())
+                                                    let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
+                                                    let profile = query::response::ResponseProfile::from(profile_str);
+                                                    serde_json::to_string_pretty(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph".to_string())
                                                 }
                                             },
                                             Err(e) => format!("Error exploring graph: {}", e),
@@ -2032,7 +1971,9 @@ Treat native tools as the repository's implementation layer."#;
                                                 if format_opt == "markdown" {
                                                     res.to_markdown()
                                                 } else {
-                                                    serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
+                                                    let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
+                                                    let profile = query::response::ResponseProfile::from(profile_str);
+                                                    serde_json::to_string_pretty(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
                                                 }
                                             },
                                     Err(e) => format!("Error exploring graph subtree: {}", e),
@@ -2063,10 +2004,10 @@ Treat native tools as the repository's implementation layer."#;
                                             amb
                                         } else {
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
-                                            let context = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
+                                            let context = query::context::ContextResponseBuilder::new(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let implementation = serde_json::json!({
                                                 "symbol_source": source,
-                                                "context": context
+                                                "context": context.map(|c| c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or(serde_json::json!({}))
                                             });
                                             serde_json::to_string_pretty(&implementation).unwrap_or_default()
                                         }
@@ -2087,21 +2028,14 @@ Treat native tools as the repository's implementation layer."#;
                                             // is re-read AFTER any reindex too, since edit context
                                             // is exactly the case where stale start_line/end_line
                                             // boundaries are most dangerous to act on.
-                                            let first_pass = query::context::ContextObject::assemble_scoped(&db, symbol, file_hint).unwrap_or_default();
-                                            let was_stale = first_pass.as_ref().map(|c| c.stale).unwrap_or(false);
-                                            let context = if was_stale {
-                                                semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint)
-                                                    .unwrap_or_else(|_| first_pass.clone())
-                                            } else {
-                                                first_pass
-                                            };
+                                            let context = semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                             let mut edit_context = serde_json::json!({
                                                 "target_implementation": source,
-                                                "forward_dependencies": context.as_ref().map(|c| c.forward_dependencies.clone()).unwrap_or_default(),
-                                                "reverse_dependencies": context.as_ref().map(|c| c.reverse_dependencies.clone()).unwrap_or_default(),
-                                                "same_file_callers": context.as_ref().map(|c| c.same_file_callers.clone()).unwrap_or_default(),
+                                                "forward_dependencies": context.as_ref().map(|c| c.fetch_forward_dependencies().unwrap_or_default()).unwrap_or_default(),
+                                                "reverse_dependencies": context.as_ref().map(|c| c.fetch_reverse_dependencies().unwrap_or_default()).unwrap_or_default(),
+                                                "same_file_callers": context.as_ref().map(|c| c.fetch_same_file_callers().unwrap_or_default()).unwrap_or_default(),
                                                 "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
                                             });
                                             if still_stale {

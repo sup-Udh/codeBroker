@@ -1,0 +1,33 @@
+--- query/src/context.rs
++++ query/src/context.rs
+@@ -1,7 +1,8 @@
+ use serde::{Serialize, Deserialize};
+ use storage::Database;
+ use rusqlite::Result;
++use crate::response::{ResponseProfile, TokenBudget};
+ 
+ #[derive(Debug, Serialize, Deserialize, Clone)]
+ pub struct ContextObject {
+@@ -99,6 +100,24 @@
+ }
+ 
++pub struct ContextResponseBuilder<'a> {
++    db: &'a Database,
++    pub target_name: String,
++    pub target_kind: String,
++    pub defining_file: String,
++    pub line_number: usize,
++    pub signature: Option<String>,
++    pub directive: Option<String>,
++    pub decorators: Vec<String>,
++    pub graph_indexed: bool,
++    pub stale: bool,
++    file_id: i64,
++    symbol_name: String,
++    profile: ResponseProfile,
++    budget: TokenBudget,
++}
++
+ impl ContextObject {
+     pub fn assemble(db: &Database, symbol_name: &str) -> Result<Option<Self>> {
+         Self::assemble_scoped(db, symbol_name, None)

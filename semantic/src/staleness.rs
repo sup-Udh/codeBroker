@@ -1,5 +1,6 @@
-use query::context::ContextObject;
 use storage::Database;
+use query::context::ContextResponseBuilder;
+use query::response::ResponseProfile;
 
 /// Assembles context for `symbol`, transparently incrementally reindexing
 /// the defining file and re-assembling once if the first assembly reports
@@ -13,13 +14,14 @@ use storage::Database;
 /// anyway rather than refusing. This makes the common "edit, then
 /// immediately ask about it" workflow correct by default instead of relying
 /// on the caller to remember a manual step.
-pub fn assemble_context_self_healing(
-    db: &Database,
+pub fn assemble_context_self_healing<'a>(
+    db: &'a Database,
     symbol: &str,
     file_hint: Option<&str>,
-) -> Result<Option<ContextObject>, String> {
+    profile: ResponseProfile,
+) -> Result<Option<ContextResponseBuilder<'a>>, String> {
     let context =
-        ContextObject::assemble_scoped(db, symbol, file_hint).map_err(|e| e.to_string())?;
+        ContextResponseBuilder::new(db, symbol, file_hint, profile).map_err(|e| e.to_string())?;
     let context = match context {
         Some(c) => c,
         None => return Ok(None),
@@ -42,7 +44,7 @@ pub fn assemble_context_self_healing(
     }
 
     let refreshed =
-        ContextObject::assemble_scoped(db, symbol, file_hint).map_err(|e| e.to_string())?;
+        ContextResponseBuilder::new(db, symbol, file_hint, profile).map_err(|e| e.to_string())?;
     Ok(refreshed.or(Some(context)))
 }
 
@@ -80,13 +82,13 @@ mod tests {
             "export function greet(name) {\n  return `Hello, ${name}`;\n}\n\nfunction extra() {}\n";
         std::fs::write(project_root.join("greet.ts"), edited_source).unwrap();
 
-        let stale_check = ContextObject::assemble(&db, "greet").unwrap().unwrap();
+        let stale_check = ContextResponseBuilder::new(&db, "greet", None, ResponseProfile::Verbose).unwrap().unwrap();
         assert!(
             stale_check.stale,
             "expected the unreindexed edit to be flagged stale"
         );
 
-        let healed = assemble_context_self_healing(&db, "greet", None)
+        let healed = assemble_context_self_healing(&db, "greet", None, ResponseProfile::Verbose)
             .unwrap()
             .expect("symbol should still resolve after self-heal");
         assert!(
