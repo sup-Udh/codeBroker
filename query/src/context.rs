@@ -465,7 +465,7 @@ mod tests {
             metadata: None,
         }).unwrap();
 
-        db.insert_edge_attributed(file_id, Some(get_id), gen_id, "CALL").unwrap();
+        db.insert_edge_attributed(file_id, Some(get_id), gen_id, "calls").unwrap();
 
         (db, project_root)
     }
