@@ -77,9 +77,10 @@ fn query_symbols_by_name(
 fn rows_to_entity(
     db: &Database,
     query: &str,
-    rows: Vec<SymbolRow>,
+    mut rows: Vec<SymbolRow>,
     confidence: Confidence,
     hint: &str,
+    line_hint: Option<i64>,
 ) -> Option<ResolvedEntity> {
     match rows.len() {
         0 => None,
@@ -95,20 +96,50 @@ fn rows_to_entity(
                 confidence,
             }))
         }
-        _ => Some(ResolvedEntity::Ambiguous(AmbiguousMatch {
-            query: query.to_string(),
-            candidates: rows
-                .into_iter()
-                .map(|r| Candidate {
-                    entity_type: EntityType::Symbol,
-                    name: r.name,
-                    kind: r.kind,
-                    file_path: db.resolve_path(&r.path),
-                    start_line: r.start_line,
-                })
-                .collect(),
-            hint: hint.to_string(),
-        })),
+        _ => {
+            // When the caller supplies a line number, try to narrow within-file
+            // candidates to the definition that encloses that line: keep only
+            // rows whose start_line ≤ line_hint, then pick the one with the
+            // largest start_line (closest preceding definition). This resolves
+            // the common case of a file that defines the same name at multiple
+            // scopes (e.g. a module-level variable shadowed by a local inside a
+            // function, or two class-level constants with the same name).
+            if let Some(line) = line_hint {
+                let mut before: Vec<SymbolRow> =
+                    rows.drain(..).filter(|r| r.start_line <= line).collect();
+                if !before.is_empty() {
+                    before.sort_by_key(|r| std::cmp::Reverse(r.start_line));
+                    let r = &before[0];
+                    return Some(ResolvedEntity::Symbol(ResolvedSymbol {
+                        name: r.name.clone(),
+                        kind: r.kind.clone(),
+                        file_path: db.resolve_path(&r.path),
+                        start_line: r.start_line,
+                        end_line: r.end_line,
+                        is_entrypoint: r.is_entrypoint,
+                        confidence,
+                    }));
+                }
+                // All candidates start after the hint line — fall through to
+                // Ambiguous with the original rows restored from before.
+                rows = before; // empty at this point; Ambiguous will show 0 candidates but
+                               // this path is practically unreachable for sane line hints
+            }
+            Some(ResolvedEntity::Ambiguous(AmbiguousMatch {
+                query: query.to_string(),
+                candidates: rows
+                    .into_iter()
+                    .map(|r| Candidate {
+                        entity_type: EntityType::Symbol,
+                        name: r.name,
+                        kind: r.kind,
+                        file_path: db.resolve_path(&r.path),
+                        start_line: r.start_line,
+                    })
+                    .collect(),
+                hint: hint.to_string(),
+            }))
+        }
     }
 }
 
@@ -117,6 +148,7 @@ fn stage_exact_symbol(
     db: &Database,
     query: &str,
     file_hint: Option<&str>,
+    line_hint: Option<i64>,
 ) -> Option<ResolvedEntity> {
     let rows = query_symbols_by_name(db, "symbols.name = ?1", query, file_hint).ok()?;
     rows_to_entity(
@@ -124,7 +156,8 @@ fn stage_exact_symbol(
         query,
         rows,
         Confidence::exact("Exact symbol name match"),
-        "Multiple symbols share this exact name. Re-run with `file_path` set to a substring of the file you mean (see `candidates`) to disambiguate.",
+        "Multiple symbols share this exact name. Re-run with `file_path` set to a substring of the file you mean (see `candidates`) to disambiguate, or add `line` to pinpoint the definition.",
+        line_hint,
     )
 }
 
@@ -134,6 +167,7 @@ fn stage_canonical_symbol(
     db: &Database,
     query: &str,
     file_hint: Option<&str>,
+    line_hint: Option<i64>,
 ) -> Option<ResolvedEntity> {
     let rows =
         query_symbols_by_name(db, "LOWER(symbols.name) = LOWER(?1)", query, file_hint).ok()?;
@@ -142,7 +176,8 @@ fn stage_canonical_symbol(
         query,
         rows,
         Confidence::high(85, "Case-insensitive symbol name match"),
-        "Multiple symbols share this name (case-insensitive). Re-run with `file_path` set to disambiguate.",
+        "Multiple symbols share this name (case-insensitive). Re-run with `file_path` set to disambiguate, or add `line` to pinpoint the definition.",
+        line_hint,
     )
 }
 
@@ -236,16 +271,17 @@ pub fn resolve_symbol(
     query: &str,
     file_hint: Option<&str>,
     query_vector: Option<&[f32]>,
+    line_hint: Option<i64>,
 ) -> ResolvedEntity {
     let mut stages_tried = Vec::new();
 
     stages_tried.push("exact_symbol".to_string());
-    if let Some(r) = stage_exact_symbol(db, query, file_hint) {
+    if let Some(r) = stage_exact_symbol(db, query, file_hint, line_hint) {
         return r;
     }
 
     stages_tried.push("canonical_symbol".to_string());
-    if let Some(r) = stage_canonical_symbol(db, query, file_hint) {
+    if let Some(r) = stage_canonical_symbol(db, query, file_hint, line_hint) {
         return r;
     }
 
@@ -526,11 +562,11 @@ pub fn resolve_any(
     let mut stages_tried = Vec::new();
 
     stages_tried.push("exact_symbol".to_string());
-    if let Some(r) = stage_exact_symbol(db, query, file_hint) {
+    if let Some(r) = stage_exact_symbol(db, query, file_hint, None) {
         return r;
     }
     stages_tried.push("canonical_symbol".to_string());
-    if let Some(r) = stage_canonical_symbol(db, query, file_hint) {
+    if let Some(r) = stage_canonical_symbol(db, query, file_hint, None) {
         return r;
     }
     // Alias stage intentionally absent: CodeBroker has no alias table today.
@@ -632,7 +668,7 @@ mod tests {
         let f = db.insert_file("./a.py", "h1").unwrap();
         insert_symbol(&db, f, "simulate", "function");
 
-        let result = resolve_symbol(&db, "simulate", None, None);
+        let result = resolve_symbol(&db, "simulate", None, None, None);
         match result {
             ResolvedEntity::Symbol(s) => assert_eq!(s.name, "simulate"),
             other => panic!("expected Symbol, got {:?}", other),
@@ -648,7 +684,7 @@ mod tests {
         insert_symbol(&db, f1, "SOFTWARE_REGISTRY", "variable");
         insert_symbol(&db, f2, "SOFTWARE_REGISTRY", "variable");
 
-        let result = resolve_symbol(&db, "SOFTWARE_REGISTRY", None, None);
+        let result = resolve_symbol(&db, "SOFTWARE_REGISTRY", None, None, None);
         assert!(
             result.is_ambiguous(),
             "expected Ambiguous, got {:?}",
@@ -668,7 +704,7 @@ mod tests {
         insert_symbol(&db, f1, "createClient", "function");
         insert_symbol(&db, f2, "createClient", "function");
 
-        let result = resolve_symbol(&db, "createClient", Some("b.py"), None);
+        let result = resolve_symbol(&db, "createClient", Some("b.py"), None, None);
         match result {
             ResolvedEntity::Symbol(s) => assert!(s.file_path.ends_with("b.py")),
             other => panic!("expected Symbol, got {:?}", other),
@@ -681,7 +717,7 @@ mod tests {
         let (db, root) = test_db();
         db.insert_file("./a.py", "h1").unwrap();
 
-        let result = resolve_symbol(&db, "totallyMadeUpName", None, None);
+        let result = resolve_symbol(&db, "totallyMadeUpName", None, None, None);
         assert!(result.is_not_found(), "expected NotFound, got {:?}", result);
         std::fs::remove_dir_all(&root).ok();
     }

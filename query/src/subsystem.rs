@@ -29,6 +29,9 @@ pub struct EntrypointReport {
     pub total: usize,
     pub routes: Vec<EntrypointEntry>,
     pub pages: Vec<EntrypointEntry>,
+    pub cli: Vec<EntrypointEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Repo-wide entrypoint enumeration: every `route`/`endpoint` (API handlers)
@@ -57,6 +60,7 @@ pub fn list_entrypoints(
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     let mut routes = Vec::new();
     let mut pages = Vec::new();
+    let mut cli = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let _id: i64 = row.get(0).unwrap_or(0);
         let name: String = row.get(1).unwrap_or_default();
@@ -75,8 +79,8 @@ pub fn list_entrypoints(
             kind: kind.clone(),
             file_path: db.resolve_path(&path),
         };
-        // Route vs page is decided by the same shared classifier that set
-        // is_entrypoint, so the split can never disagree with detection.
+        // Route/page/cli split uses the same shared classifier that set
+        // is_entrypoint, so the bucket assignment can never disagree with detection.
         match storage::entrypoints::classify_entrypoint_json(
             &name,
             &kind,
@@ -84,17 +88,28 @@ pub fn list_entrypoints(
             attributes.as_deref(),
         ) {
             Some(storage::entrypoints::EntrypointClass::Page) => pages.push(entry),
+            Some(storage::entrypoints::EntrypointClass::Cli) => cli.push(entry),
             _ => routes.push(entry),
         }
     }
 
     routes.sort_by(|a, b| a.file_path.cmp(&b.file_path));
     pages.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+    cli.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+
+    let total = routes.len() + pages.len() + cli.len();
+    let note = if total == 0 {
+        Some("No entrypoints detected. This tool recognises FastAPI/Flask routes, Next.js pages, and Python CLI entry functions (def main / __main__.py). Other frameworks or languages are not yet covered.".to_string())
+    } else {
+        None
+    };
 
     Ok(EntrypointReport {
-        total: routes.len() + pages.len(),
+        total,
         routes,
         pages,
+        cli,
+        note,
     })
 }
 

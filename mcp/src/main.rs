@@ -591,8 +591,9 @@ fn resolve_symbol_for_tool(
     db: &storage::Database,
     symbol: &str,
     file_hint: Option<&str>,
+    line_hint: Option<i64>,
 ) -> Result<resolver::ResolvedSymbol, String> {
-    match resolver::resolve_symbol(db, symbol, file_hint, None) {
+    match resolver::resolve_symbol(db, symbol, file_hint, None, line_hint) {
         resolver::ResolvedEntity::Symbol(s) => Ok(s),
         other => Err(other.to_json_string()),
     }
@@ -1174,6 +1175,7 @@ Treat native tools as the repository's implementation layer."#;
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "Symbol name to analyze." },
                                                 "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." },
+                                                "line": { "type": "number", "description": "Optional 1-based line number. When a file contains multiple definitions with the same name, picks the definition whose start_line is closest to (and not after) this line." },
                                                 "format": { "type": "string", "enum": ["prose", "structured", "json"], "description": "Default \"prose\". \"structured\"/\"json\" always return the deterministic graph data, skipping the LLM." },
                                                 "risk_threshold": { "type": "number", "description": "Default 5. Total dependency count below which the cheap deterministic path is used instead of an LLM call." }
                                             },
@@ -1377,7 +1379,7 @@ Treat native tools as the repository's implementation layer."#;
                                 let format_opt = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("json");
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                             let symbol = resolved.name.as_str();
@@ -1439,9 +1441,10 @@ Treat native tools as the repository's implementation layer."#;
                                 // and zero model cost. Larger symbols still get the LLM narrative.
                                 let format = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("prose");
                                 let risk_threshold = arguments.get("risk_threshold").and_then(|n| n.as_u64()).unwrap_or(5) as usize;
+                                let line_hint = arguments.get("line").and_then(|n| n.as_i64());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, line_hint) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                             let symbol = resolved.name.as_str();
@@ -1674,7 +1677,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 // exact-match-count check), so `find_symbol`'s
                                                 // ambiguity verdict can never disagree with
                                                 // `get_context`/`impact_analysis`/etc.
-                                                let ambiguous = resolver::resolve_symbol(&db, symbol, path_scope, None).is_ambiguous();
+                                                let ambiguous = resolver::resolve_symbol(&db, symbol, path_scope, None, None).is_ambiguous();
 
                                                 let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
@@ -1788,7 +1791,7 @@ Treat native tools as the repository's implementation layer."#;
                                             let mut problems: Vec<serde_json::Value> = Vec::new();
                                             let mut resolved_targets: Vec<(String, Option<String>)> = Vec::new();
                                             for symbol in &targets {
-                                                match resolver::resolve_symbol(&db, symbol, file_hint, None) {
+                                                match resolver::resolve_symbol(&db, symbol, file_hint, None, None) {
                                                     resolver::ResolvedEntity::Symbol(s) => {
                                                         let hint = relative_hint(&db, &s.file_path).to_string();
                                                         resolved_targets.push((s.name, Some(hint)));
@@ -1956,7 +1959,7 @@ Treat native tools as the repository's implementation layer."#;
                                         // the original bug report as a gap to audit) — root
                                         // resolution now goes through the same shared resolver
                                         // every other symbol-keyed tool uses.
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                         let hint = relative_hint(&db, &resolved.file_path);
@@ -1992,10 +1995,10 @@ Treat native tools as the repository's implementation layer."#;
                                         // same-named symbol the DB happened to return first — a
                                         // real path could otherwise look like `found: false`
                                         // purely because the wrong node was searched from/to.
-                                        match resolve_symbol_for_tool(&db, from_symbol, from_file_hint) {
+                                        match resolve_symbol_for_tool(&db, from_symbol, from_file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(from_resolved) => {
-                                        match resolve_symbol_for_tool(&db, to_symbol, to_file_hint) {
+                                        match resolve_symbol_for_tool(&db, to_symbol, to_file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(to_resolved) => {
                                             let from_hint = relative_hint(&db, &from_resolved.file_path);
@@ -2125,7 +2128,7 @@ Treat native tools as the repository's implementation layer."#;
                                         // Root resolved through the shared resolver instead of
                                         // silently picking whichever same-named symbol sorts
                                         // first and reporting it as an isolated node.
-                                        match resolve_symbol_for_tool(&db, root_symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, root_symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                         let hint = relative_hint(&db, &resolved.file_path);
@@ -2188,7 +2191,7 @@ Treat native tools as the repository's implementation layer."#;
                                 let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                             let symbol = resolved.name.as_str();
@@ -2211,7 +2214,7 @@ Treat native tools as the repository's implementation layer."#;
                                 let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                             let symbol = resolved.name.as_str();

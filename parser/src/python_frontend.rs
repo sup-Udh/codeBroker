@@ -246,6 +246,7 @@ fn extract_py_imports(
         (typed_default_parameter type: (type (subscript (identifier) @type_ref)))
         (function_definition return_type: (type (identifier) @type_ref))
         (function_definition return_type: (type (subscript (identifier) @type_ref)))
+        (global_statement (identifier) @global_ref)
     ";
 
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -301,6 +302,17 @@ fn extract_py_imports(
                         import_name = name.clone();
                         line_number = node.start_position().row + 1;
                         import_kind = Some("type_ref".to_string());
+                    }
+                } else if *capture_kind == "global_ref" {
+                    // `global x` inside a function body explicitly declares that
+                    // the function reads/writes the module-level variable `x`.
+                    // This is real coupling that impact_analysis must count —
+                    // functions sharing globals are coupled even with no call edges.
+                    let name = text.trim().to_string();
+                    if !crate::utils::is_noisy_call_name(&name) {
+                        import_name = name;
+                        line_number = node.start_position().row + 1;
+                        import_kind = Some("global_ref".to_string());
                     }
                 }
             }

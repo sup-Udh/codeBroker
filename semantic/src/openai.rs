@@ -125,15 +125,20 @@ impl OpenAiProvider {
             }
         };
 
-        let text = match response.text() {
-            Ok(t) => t,
+        // Use bytes() + from_slice() instead of text() + from_str() to skip
+        // charset detection entirely. This is more efficient for large payloads
+        // and avoids "error decoding response body" when a proxy sends a
+        // Content-Encoding: gzip response that reqwest hasn't yet decompressed
+        // (raw gzip bytes are not valid UTF-8).
+        let bytes = match response.bytes() {
+            Ok(b) => b,
             Err(e) => {
                 self.record_failure();
                 return Err(format!("Failed to read body: {}", e));
             }
         };
 
-        let json_resp: serde_json::Value = match serde_json::from_str(&text) {
+        let json_resp: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(j) => j,
             Err(e) => {
                 self.record_failure();
@@ -176,7 +181,7 @@ impl OpenAiProvider {
             self.record_failure();
             return Err(format!(
                 "Could not extract message content. Raw response: {}",
-                text
+                String::from_utf8_lossy(&bytes)
             ));
         }
 
@@ -200,7 +205,7 @@ impl OpenAiProvider {
         let response = match self
             .client
             .post(url)
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(120))
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()
@@ -212,15 +217,15 @@ impl OpenAiProvider {
             }
         };
 
-        let text = match response.text() {
-            Ok(t) => t,
+        let bytes = match response.bytes() {
+            Ok(b) => b,
             Err(e) => {
                 self.record_failure();
                 return Err(format!("Failed to read body: {}", e));
             }
         };
 
-        let json_resp: serde_json::Value = match serde_json::from_str(&text) {
+        let json_resp: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(j) => j,
             Err(e) => {
                 self.record_failure();
@@ -241,7 +246,10 @@ impl OpenAiProvider {
             Some(d) => d,
             None => {
                 self.record_failure();
-                return Err(format!("Malformed embeddings response: {}", text));
+                return Err(format!(
+                    "Malformed embeddings response: {}",
+                    String::from_utf8_lossy(&bytes)
+                ));
             }
         };
 

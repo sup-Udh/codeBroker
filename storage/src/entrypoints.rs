@@ -22,6 +22,9 @@ pub enum EntrypointClass {
     /// A user-facing page/layout component (Next.js App Router `page`/`layout`,
     /// Pages Router page, or an explicitly-parsed `page`/`layout` kind).
     Page,
+    /// A CLI/desktop application entrypoint: Python `__main__.py` convention or
+    /// a module-level function named `main` in a Python script.
+    Cli,
 }
 
 impl EntrypointClass {
@@ -29,6 +32,7 @@ impl EntrypointClass {
         match self {
             EntrypointClass::Route => "route",
             EntrypointClass::Page => "page",
+            EntrypointClass::Cli => "cli",
         }
     }
 }
@@ -208,7 +212,23 @@ pub fn classify_entrypoint(
     }
 
     // 3. Framework file conventions (Next.js App Router / Pages Router).
-    nextjs_class(path, name, &kind_lower)
+    if let Some(c) = nextjs_class(path, name, &kind_lower) {
+        return Some(c);
+    }
+
+    // 4. CLI/desktop entrypoints (Python only).
+    //    `__main__.py` is the Python package entry-point convention: any
+    //    top-level callable or class in that file is an application entrypoint.
+    if path.ends_with("__main__.py") && (is_callable_kind(&kind_lower) || kind_lower == "class") {
+        return Some(EntrypointClass::Cli);
+    }
+    //    `def main(...)` at module level in any .py file is the conventional
+    //    CLI entry function (typically called under `if __name__ == "__main__"`).
+    if kind_lower == "function" && name == "main" && path.ends_with(".py") {
+        return Some(EntrypointClass::Cli);
+    }
+
+    None
 }
 
 /// Convenience wrapper that parses a JSON-encoded attribute list (the form

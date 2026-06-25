@@ -2053,6 +2053,7 @@ pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
     "interaction",
     "component_use",
     "type_ref",
+    "global_ref",
 ];
 
 /// SQL fragment `'calls', 'imports', ...` for embedding the canonical set in an
