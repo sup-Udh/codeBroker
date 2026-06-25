@@ -27,21 +27,15 @@ pub struct DuplicateLogicReport {
     pub groups: Vec<DuplicateGroup>,
 }
 
-/// Collapses all whitespace runs to single spaces. This catches near-verbatim
-/// copy-pasted logic across files even when indentation/line breaks differ,
-/// without requiring an actual call/import edge between the two copies (the
-/// dependency graph only links things that reference each other; copy-pasted
-/// logic with no shared call site is invisible to it). It will NOT catch
-/// duplicates that were copy-pasted with renamed variables — that needs
-/// AST-level comparison, which is out of scope here.
-fn normalize(source: &str) -> String {
-    source.split_whitespace().collect::<Vec<_>>().join(" ")
+fn normalize(source: &str, file_path: &str) -> String {
+    let extension = std::path::Path::new(file_path).extension().and_then(|s| s.to_str()).unwrap_or("");
+    if let Some(ast_normalized) = parser::normalize::normalize_snippet(source, extension) {
+        ast_normalized
+    } else {
+        // Fallback for unsupported languages
+        source.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
 }
-
-/// Scans all indexed symbols for near-duplicate logic: function/component
-/// bodies whose normalized source text is byte-identical but which live in
-/// different files. `min_normalized_len` filters out trivial bodies (e.g.
-/// one-line getters) that would otherwise produce noisy false positives.
 pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope: Option<&str>) -> Result<DuplicateLogicReport, String> {
     let mut stmt = db.conn.prepare(
         "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte
@@ -87,7 +81,7 @@ pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope
         }
 
         let source = String::from_utf8_lossy(&content[s..e]).to_string();
-        let normalized = normalize(&source);
+        let normalized = normalize(&source, &abs_path);
         if normalized.len() < min_normalized_len {
             continue;
         }

@@ -241,33 +241,34 @@ fn search_symbol_names(
         let name_lower = name.to_lowercase();
         let path_lower = path.to_lowercase();
 
-        let mut base_score = 0;
+        let mut name_score = 0;
+        let mut path_score = 0;
 
         // 1. Symbol Name Match
         let mut expl = Vec::new();
 
-        if name_lower == query_lower { base_score += 1000; expl.push(format!("Exact lexical match")); }
-        else if name_lower.starts_with(query_lower) { base_score += 500; expl.push(format!("Prefix lexical match")); }
-        else if name_lower.contains(query_lower) { base_score += 250; expl.push(format!("Substring lexical match")); }
+        if name_lower == query_lower { name_score += 1000; expl.push(format!("Exact lexical match")); }
+        else if name_lower.starts_with(query_lower) { name_score += 500; expl.push(format!("Prefix lexical match")); }
+        else if name_lower.contains(query_lower) { name_score += 250; expl.push(format!("Substring lexical match")); }
 
         for token in query_tokens {
             let weight = token_weight(token);
-            if name_lower == *token { base_score += weight; expl.push(format!("Token match '{}'", token)); }
+            if name_lower == *token { name_score += weight; expl.push(format!("Token match '{}'", token)); }
             else {
                 let dist = levenshtein(&name_lower, token);
                 if dist <= 1 && token.len() > 3 {
-                    base_score += weight / 2; expl.push(format!("Fuzzy match '{}'", token));
+                    name_score += weight / 2; expl.push(format!("Fuzzy match '{}'", token));
                 } else if dist == 2 && token.len() > 5 {
-                    base_score += weight / 4; expl.push(format!("Weak fuzzy match '{}'", token));
+                    name_score += weight / 4; expl.push(format!("Weak fuzzy match '{}'", token));
                 }
             }
         }
 
         // 2. Full Path Match
-        if path_lower.contains(query_lower) { base_score += 200; expl.push(format!("Path contains query")); }
+        if path_lower.contains(query_lower) { path_score += 200; expl.push(format!("Path contains query")); }
         for token in query_tokens {
             let weight = token_weight(token);
-            if path_lower.contains(token) { base_score += weight / 2; expl.push(format!("Path contains '{}'", token)); }
+            if path_lower.contains(token) { path_score += weight / 2; expl.push(format!("Path contains '{}'", token)); }
         }
 
         let mut semantic_score = 0;
@@ -281,35 +282,34 @@ fn search_symbol_names(
             }
         }
 
-        if base_score == 0 && semantic_score < 1250 { // If no lexical match, only include if semantic is reasonably strong
+        if name_score == 0 && path_score == 0 && semantic_score < 1250 { // If no lexical match, only include if semantic is reasonably strong
             continue;
         }
 
-        let mut relevance_score = base_score + semantic_score;
+        let mut relevance_score = name_score + path_score + semantic_score;
 
         // 3. Entrypoint Bonuses
         if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
-            relevance_score += 200;
+            name_score += 200;
             expl.push(format!("Entrypoint bonus"));
         } else if kind == "function" && (name_lower == "get" || name_lower == "post" || name_lower == "put" || name_lower == "delete") {
-            relevance_score += 100;
+            name_score += 100;
             expl.push(format!("Handler bonus"));
         }
 
         // 4. Production Path Boosts
         let path_parts: Vec<&str> = path_lower.split('/').collect();
         if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
-            relevance_score += 150;
+            path_score += 150;
             expl.push(format!("Production path bonus"));
         }
 
         // 5. Scratch/Test Penalties
         if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
-            relevance_score -= 300;
+            path_score -= 300;
             expl.push(format!("Test/scratch penalty"));
         }
 
-        // Confidence MUST be derived purely from relevance_score (lexical + semantic + path)
         let confidence = if semantic_score > 1350 { "High (Semantic Match)".to_string() }
         else if relevance_score >= 1000 { "High (Exact Match)".to_string() }
         else if relevance_score >= 500 { "High (Prefix Match)".to_string() }
@@ -319,10 +319,11 @@ fn search_symbol_names(
         else if relevance_score >= 50 { "Low (Fuzzy Match)".to_string() }
         else { "Low (Weak Fuzzy)".to_string() };
 
-        // 6. Graph Centrality Scoring (Only breaks ties, does not create relevance!)
-        // e.g. relevance_score is multiplied by 1000, graph_score is added.
         let graph_score = (in_edges * 15) as i32 + (out_edges * 5) as i32;
-        let final_score = relevance_score * 1000 + graph_score;
+        
+        // Reverse scoring logic: semantic > graph > keyword > path
+        let final_score = (semantic_score * 100_000) + (graph_score * 10_000) + (name_score * 100) + path_score;
+        
         if graph_score > 0 {
             expl.push(format!("Graph score {}", graph_score));
         }

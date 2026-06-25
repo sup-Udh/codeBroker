@@ -449,6 +449,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM symbols
              WHERE file_id = ?1 AND start_line <= ?2 AND end_line >= ?2
+             AND kind NOT IN ('variable', 'constant', 'parameter', 'local', 'property', 'field', 'import')
              ORDER BY (end_line - start_line) ASC
              LIMIT 1",
         )?;

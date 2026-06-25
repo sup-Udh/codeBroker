@@ -8,3 +8,4 @@ pub mod treesitter;
 pub mod typescript_frontend;
 pub mod utils;
 pub mod vue_frontend;
+pub mod normalize;

@@ -361,13 +361,6 @@ pub fn skeletonize_file(
     file_path: &str,
     target_symbol: Option<&str>,
 ) -> Result<String, String> {
-    let abs_file_path = db.resolve_path(file_path);
-    let abs_path_obj = std::path::Path::new(&abs_file_path);
-    if abs_path_obj.is_dir() {
-        return Err(directory_hint_error(abs_path_obj));
-    }
-    let content = fs::read(&abs_file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-
     // Find file_id by resolving paths to absolute and comparing
     let mut files_stmt = db
         .conn
@@ -376,12 +369,20 @@ pub fn skeletonize_file(
     let mut files_rows = files_stmt.query([]).map_err(|e| e.to_string())?;
     let mut file_id = 0;
     let mut indexed_content_hash: Option<String> = None;
+    let mut actual_abs_path = String::new();
+    
+    let target_path_str = file_path.trim_start_matches("./");
+
     while let Some(row) = files_rows.next().unwrap_or(None) {
         let id: i64 = row.get(0).unwrap();
         let path: String = row.get(1).unwrap();
-        if db.resolve_path(&path) == abs_file_path {
+        let abs = db.resolve_path(&path);
+        
+        // Flexible matching: exact absolute, exact stored relative, or ends with the given path segment
+        if abs == file_path || path == file_path || path.ends_with(target_path_str) || abs.ends_with(target_path_str) {
             file_id = id;
             indexed_content_hash = row.get(2).unwrap_or(None);
+            actual_abs_path = abs;
             break;
         }
     }
@@ -389,6 +390,13 @@ pub fn skeletonize_file(
     if file_id == 0 {
         return Err(format!("File '{}' not found in index.", file_path));
     }
+
+    let abs_path_obj = std::path::Path::new(&actual_abs_path);
+    if abs_path_obj.is_dir() {
+        return Err(directory_hint_error(abs_path_obj));
+    }
+    let content = fs::read(&actual_abs_path).map_err(|e| format!("Failed to read file: {}", e))?;
+
 
     // The skeleton is built by walking stored start_byte/end_byte offsets
     // against `content` read just above. If the file changed since indexing,
