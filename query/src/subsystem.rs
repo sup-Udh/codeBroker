@@ -46,10 +46,11 @@ pub fn list_entrypoints(
     let mut stmt = db
         .conn
         .prepare(
-            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path 
              FROM symbols
              JOIN files ON symbols.file_id = files.id
-             WHERE symbols.kind IN ('route', 'endpoint', 'page', 'layout', 'function', 'method')",
+             JOIN symbol_features f ON symbols.id = f.symbol_id
+             WHERE f.is_entrypoint = 1",
         )
         .map_err(|e| e.to_string())?;
 
@@ -68,19 +69,15 @@ pub fn list_entrypoints(
             }
         }
 
-        if let Ok(score) = calculate_entrypoint_score(db, id) {
-            if score >= 50 {
-                let entry = EntrypointEntry {
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file_path: db.resolve_path(&path),
-                };
-                if kind == "page" || kind == "layout" || name.to_lowercase().contains("page") {
-                    pages.push(entry);
-                } else {
-                    routes.push(entry);
-                }
-            }
+        let entry = EntrypointEntry {
+            name: name.clone(),
+            kind: kind.clone(),
+            file_path: db.resolve_path(&path),
+        };
+        if kind == "page" || kind == "layout" || name.to_lowercase().contains("page") {
+            pages.push(entry);
+        } else {
+            routes.push(entry);
         }
     }
 
@@ -239,75 +236,80 @@ pub fn discover_subsystem(
         }
     }
 
-    // 2. Graph-Based Expansion
-    for _ in 0..2 {
-        let mut new_symbols = HashSet::new();
-
-        // A) Route Ownership Expansion
-        for &s_id in &matched_symbol_ids {
-            let mut edge_stmt = db
-                .conn
-                .prepare("SELECT source_symbol_id FROM edges WHERE target_symbol_id = ?1 AND source_symbol_id IS NOT NULL")
-                .map_err(|e| e.to_string())?;
-            let mut edge_rows = edge_stmt.query(rusqlite::params![s_id]).map_err(|e| e.to_string())?;
-            while let Ok(Some(row)) = edge_rows.next() {
-                let source_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                if !matched_symbol_ids.contains(&source_id) {
-                    if let Ok(score) = calculate_entrypoint_score(db, source_id) {
-                        if score >= 50 {
-                            new_symbols.insert(source_id);
-                        }
+    // 2. Graph-Based Expansion (Cohesion-Driven Localized Traversal)
+    // Expand from seeds to adjacent nodes that are tightly coupled to the subsystem.
+    let mut current_frontier = matched_symbol_ids.clone();
+    
+    // We expand for a maximum of 3 hops to prevent unbounded sprawling
+    for _hop in 0..3 {
+        let mut next_candidates = HashSet::new();
+        
+        // Gather all immediate neighbors of the current frontier
+        for &s_id in &current_frontier {
+            if let Ok(mut stmt) = db.conn.prepare("SELECT target_symbol_id FROM edges WHERE source_symbol_id = ?1") {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![s_id]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        let tgt: i64 = row.get(0).unwrap();
+                        if !matched_symbol_ids.contains(&tgt) { next_candidates.insert(tgt); }
+                    }
+                }
+            }
+            if let Ok(mut stmt) = db.conn.prepare("SELECT source_symbol_id FROM edges WHERE target_symbol_id = ?1 AND source_symbol_id IS NOT NULL") {
+                if let Ok(mut rows) = stmt.query(rusqlite::params![s_id]) {
+                    while let Ok(Some(row)) = rows.next() {
+                        let src: i64 = row.get(0).unwrap();
+                        if !matched_symbol_ids.contains(&src) { next_candidates.insert(src); }
                     }
                 }
             }
         }
-
-        // B) Shared Dependency Expansion
-        let mut dependency_counts: std::collections::HashMap<i64, i32> = std::collections::HashMap::new();
-        for &s_id in &matched_symbol_ids {
-            let mut edge_stmt = db
-                .conn
-                .prepare("SELECT target_symbol_id FROM edges WHERE source_symbol_id = ?1")
-                .map_err(|e| e.to_string())?;
-            let mut edge_rows = edge_stmt.query(rusqlite::params![s_id]).map_err(|e| e.to_string())?;
-            while let Ok(Some(row)) = edge_rows.next() {
-                let target_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                if !matched_symbol_ids.contains(&target_id) {
-                    *dependency_counts.entry(target_id).or_insert(0) += 1;
-                }
-            }
-        }
-
-        for (target_id, count) in dependency_counts {
-            let total_in: i64 = db
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM edges WHERE target_symbol_id = ?1",
-                    rusqlite::params![target_id],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if total_in > 0 && (count as f64 / total_in as f64) >= 0.5 {
-                new_symbols.insert(target_id);
-            } else if count >= 2 {
-                new_symbols.insert(target_id);
-            }
-        }
-
-        if new_symbols.is_empty() {
+        
+        if next_candidates.is_empty() {
             break;
         }
 
-        for &ns in &new_symbols {
-            matched_symbol_ids.insert(ns);
-            if let Ok(f_id) = db.conn.query_row(
-                "SELECT file_id FROM symbols WHERE id = ?1",
-                rusqlite::params![ns],
-                |r| r.get::<_, i64>(0),
-            ) {
-                matched_file_ids.insert(f_id);
+        let matched_list = matched_symbol_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+        let query_str = format!("SELECT COUNT(*) FROM edges WHERE (source_symbol_id = ?1 AND target_symbol_id IN ({})) OR (source_symbol_id IN ({}) AND target_symbol_id = ?1)", matched_list, matched_list);
+        
+        let mut next_frontier = HashSet::new();
+        let mut added_any = false;
+        
+        for &cand_id in &next_candidates {
+            let cohesive_edges: i64 = db.conn.query_row(&query_str, rusqlite::params![cand_id], |r| r.get(0)).unwrap_or(0);
+            
+            let total_edges: i64 = db.conn.query_row(
+                "SELECT fan_in + fan_out FROM symbol_features WHERE symbol_id = ?1",
+                rusqlite::params![cand_id],
+                |r| r.get(0)
+            ).unwrap_or(1);
+            
+            let is_local: bool = db.conn.query_row(
+                "SELECT is_local FROM symbol_features WHERE symbol_id = ?1",
+                rusqlite::params![cand_id],
+                |r| r.get(0)
+            ).unwrap_or(false);
+
+            if is_local {
+                continue; // Skip pure local variables from expanding the subsystem boundaries
+            }
+            
+            let cohesion_ratio = cohesive_edges as f64 / (total_edges as f64).max(1.0);
+            
+            // If the candidate commits at least 30% of its connectivity to the subsystem, OR it's deeply connected (>2 edges)
+            if cohesion_ratio >= 0.3 || cohesive_edges >= 3 {
+                matched_symbol_ids.insert(cand_id);
+                next_frontier.insert(cand_id);
+                added_any = true;
+                if let Ok(f_id) = db.conn.query_row("SELECT file_id FROM symbols WHERE id = ?1", rusqlite::params![cand_id], |r| r.get::<_, i64>(0)) {
+                    matched_file_ids.insert(f_id);
+                }
             }
         }
+        
+        if !added_any {
+            break; // Cohesion dropped, subsystem boundary found
+        }
+        current_frontier = next_frontier;
     }
 
     // 3. Formatting Output
@@ -323,8 +325,12 @@ pub fn discover_subsystem(
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
         ) {
             symbols.push(s_name.clone());
-            if let Ok(score) = calculate_entrypoint_score(db, s_id) {
-                if score >= 50 {
+            if let Ok(Some(is_ep)) = db.conn.query_row(
+                "SELECT is_entrypoint FROM symbol_features WHERE symbol_id = ?1",
+                rusqlite::params![s_id],
+                |r| r.get::<_, Option<bool>>(0),
+            ) {
+                if is_ep {
                     if kind == "page" || kind == "layout" || s_name.to_lowercase().contains("page") {
                         page_entrypoints.push(s_name.clone());
                     } else {
@@ -489,71 +495,4 @@ pub fn discover_subsystem(
         subsystem_hash,
         confidence: confidence_val,
     })
-}
-
-/// Computes a heuristic score for whether a symbol acts as an entrypoint.
-/// High scores indicate a strong likelihood of being an entrypoint.
-pub fn calculate_entrypoint_score(db: &Database, symbol_id: i64) -> Result<i32, String> {
-    let mut score = 0;
-
-    let (name, kind, attributes): (String, String, Option<String>) = db.conn.query_row(
-        "SELECT name, kind, attributes FROM symbols WHERE id = ?1",
-        rusqlite::params![symbol_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-    ).map_err(|e| e.to_string())?;
-
-    // 1. Kind signals
-    if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
-        score += 50;
-    } else if kind != "function" && kind != "method" {
-        // Unlikely to be an entrypoint if it's a class or interface
-        return Ok(-100);
-    }
-
-    // 2. Attributes/Decorators
-    if let Some(attr) = attributes {
-        let attr_lower = attr.to_lowercase();
-        if attr_lower.contains("get") || attr_lower.contains("post") || 
-           attr_lower.contains("put") || attr_lower.contains("delete") || 
-           attr_lower.contains("route") || attr_lower.contains("mapping") || 
-           attr_lower.contains("endpoint") {
-            score += 40;
-        } else if !attr.is_empty() {
-            score += 10;
-        }
-    }
-
-    // 3. Incoming Edges
-    let incoming_calls: i64 = db.conn.query_row(
-        "SELECT COUNT(*) FROM edges WHERE target_symbol_id = ?1 AND source_symbol_id IS NOT NULL AND kind = 'calls'",
-        rusqlite::params![symbol_id],
-        |r| r.get(0)
-    ).unwrap_or(0);
-
-    if incoming_calls == 0 {
-        score += 30; // lack of incoming static calls is a strong entrypoint signal
-    } else {
-        score -= 20 * (incoming_calls as i32); // penalize heavily if it's called statically
-    }
-    
-    // 4. Outgoing Edges
-    let outgoing_calls: i64 = db.conn.query_row(
-        "SELECT COUNT(*) FROM edges WHERE source_symbol_id = ?1 AND kind = 'calls'",
-        rusqlite::params![symbol_id],
-        |r| r.get(0)
-    ).unwrap_or(0);
-    
-    if outgoing_calls > 0 {
-        score += 10; // entrypoints usually call other things to do work
-    }
-
-    // 5. Name heuristics (low weight)
-    let name_lower = name.to_lowercase();
-    if name_lower.contains("handle") || name_lower.contains("route") || 
-       name_lower.contains("controller") || name_lower.contains("page") || 
-       name_lower.contains("main") {
-        score += 10;
-    }
-
-    Ok(score)
 }

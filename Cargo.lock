@@ -911,6 +911,7 @@ dependencies = [
  "graph",
  "ignore",
  "parser",
+ "rusqlite",
  "storage",
 ]
 

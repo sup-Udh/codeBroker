@@ -189,6 +189,48 @@ fn min_confidence_level(min_confidence: Option<&str>) -> u8 {
     }
 }
 
+pub struct RankingFeatures {
+    pub semantic_similarity: f64, // -1.0 to 1.0 (cosine sim)
+    pub lexical_score: i32,
+    pub path_score: i32,
+    pub pagerank: f64,
+    pub fan_in: i64,
+    pub fan_out: i64,
+    pub is_entrypoint: bool,
+    pub is_callable: bool,
+    pub is_local: bool,
+}
+
+pub fn compute_retrieval_score(features: &RankingFeatures) -> i32 {
+    let mut base_score = features.lexical_score + features.path_score;
+    // Base semantic score contribution. If sim > 0.0, we add up to 2000 points.
+    // This makes semantic score comparable to a strong exact match (1000).
+    if features.semantic_similarity > 0.0 {
+        base_score += (features.semantic_similarity * 2000.0) as i32;
+    }
+    
+    // Structural Multipliers
+    let mut multiplier = 1.0;
+    if features.is_entrypoint {
+        multiplier *= 1.5;
+    } else if features.is_callable {
+        multiplier *= 1.1;
+    }
+    
+    if features.is_local {
+        multiplier *= 0.3; // Heavy penalty for locals
+    }
+    
+    // Graph Centrality Multiplier (pagerank typically around 1.0, could be up to 10.0+ for central nodes)
+    let pr_factor = 1.0 + (features.pagerank * 0.1);
+    multiplier *= pr_factor.min(2.5); // Cap multiplier at 2.5
+    
+    // Edge count minor boosts
+    let edge_bonus = (features.fan_in * 2) + features.fan_out;
+    
+    ((base_score as f64 * multiplier) as i32) + edge_bonus as i32
+}
+
 fn search_symbol_names(
     db: &Database,
     query_lower: &str,
@@ -216,11 +258,16 @@ fn search_symbol_names(
             files.path, 
             symbols.name, 
             symbols.kind,
-            (SELECT COUNT(*) FROM edges WHERE target_symbol_id = symbols.id) as in_edges,
-            (SELECT COUNT(*) FROM edges WHERE source_symbol_id = symbols.id) as out_edges,
-            symbols.id
+            f.fan_in,
+            f.fan_out,
+            symbols.id,
+            f.pagerank,
+            f.is_entrypoint,
+            f.is_callable,
+            f.is_local
         FROM symbols
         JOIN files ON symbols.file_id = files.id
+        LEFT JOIN symbol_features f ON symbols.id = f.symbol_id
     ";
     let mut stmt = db.conn.prepare(query_str)?;
     let mut rows = stmt.query([])?;
@@ -237,6 +284,10 @@ fn search_symbol_names(
         let in_edges: i64 = row.get(3).unwrap_or(0);
         let out_edges: i64 = row.get(4).unwrap_or(0);
         let s_id: i64 = row.get(5)?;
+        let pagerank: f64 = row.get(6).unwrap_or(0.0);
+        let is_entrypoint: bool = row.get(7).unwrap_or(false);
+        let is_callable: bool = row.get(8).unwrap_or(false);
+        let is_local: bool = row.get(9).unwrap_or(false);
 
         let name_lower = name.to_lowercase();
         let path_lower = path.to_lowercase();
@@ -271,30 +322,18 @@ fn search_symbol_names(
             if path_lower.contains(token) { path_score += weight / 2; expl.push(format!("Path contains '{}'", token)); }
         }
 
-        let mut semantic_score = 0;
+        let mut semantic_sim = -1.0;
         if let Some(q_vec) = query_vector {
             if let Some(s_vec) = symbol_embeddings.get(&s_id) {
-                let sim = storage::cosine_similarity(q_vec, s_vec);
-                semantic_score = ((sim + 1.0) * 1000.0) as i32;
-                if semantic_score > 1250 {
-                    expl.push(format!("Semantic similarity {:.2}", sim));
+                semantic_sim = storage::cosine_similarity(q_vec, s_vec);
+                if semantic_sim > 0.25 {
+                    expl.push(format!("Semantic similarity {:.2}", semantic_sim));
                 }
             }
         }
 
-        if name_score == 0 && path_score == 0 && semantic_score < 1250 { // If no lexical match, only include if semantic is reasonably strong
+        if name_score == 0 && path_score == 0 && semantic_sim < 0.25 { 
             continue;
-        }
-
-        let mut relevance_score = name_score + path_score + semantic_score;
-
-        // 3. Entrypoint Bonuses
-        if kind == "route" || kind == "endpoint" || kind == "page" || kind == "layout" {
-            name_score += 200;
-            expl.push(format!("Entrypoint bonus"));
-        } else if kind == "function" && (name_lower == "get" || name_lower == "post" || name_lower == "put" || name_lower == "delete") {
-            name_score += 100;
-            expl.push(format!("Handler bonus"));
         }
 
         // 4. Production Path Boosts
@@ -310,28 +349,60 @@ fn search_symbol_names(
             expl.push(format!("Test/scratch penalty"));
         }
 
-        let confidence = if semantic_score > 1350 { "High (Semantic Match)".to_string() }
-        else if relevance_score >= 1000 { "High (Exact Match)".to_string() }
-        else if relevance_score >= 500 { "High (Prefix Match)".to_string() }
-        else if semantic_score > 1250 { "Medium (Semantic Match)".to_string() }
-        else if relevance_score >= 250 { "Medium (Contains Match)".to_string() }
-        else if relevance_score >= 100 { "Medium (Token Match)".to_string() }
-        else if relevance_score >= 50 { "Low (Fuzzy Match)".to_string() }
-        else { "Low (Weak Fuzzy)".to_string() };
+        let features = RankingFeatures {
+            semantic_similarity: semantic_sim as f64,
+            lexical_score: name_score,
+            path_score,
+            pagerank,
+            fan_in: in_edges,
+            fan_out: out_edges,
+            is_entrypoint,
+            is_callable,
+            is_local,
+        };
 
-        let graph_score = (in_edges * 15) as i32 + (out_edges * 5) as i32;
-        
-        // Reverse scoring logic: semantic > graph > keyword > path
-        let final_score = (semantic_score * 100_000) + (graph_score * 10_000) + (name_score * 100) + path_score;
-        
-        if graph_score > 0 {
-            expl.push(format!("Graph score {}", graph_score));
-        }
+        let final_score = compute_retrieval_score(&features);
+
+        let confidence = if semantic_sim > 0.35 { "High (Semantic Match)".to_string() }
+        else if name_score >= 1000 { "High (Exact Match)".to_string() }
+        else if name_score >= 500 { "High (Prefix Match)".to_string() }
+        else if semantic_sim > 0.25 { "Medium (Semantic Match)".to_string() }
+        else if name_score >= 250 { "Medium (Contains Match)".to_string() }
+        else if name_score >= 100 { "Medium (Token Match)".to_string() }
+        else if name_score >= 50 { "Low (Fuzzy Match)".to_string() }
+        else { "Low (Weak Fuzzy)".to_string() };
 
         if final_score > 0 {
             results.push(SearchResult { path: db.resolve_path(&path), name, kind, score: final_score, confidence, explanation: expl.join(", "), line: None });
         }
     }
+
+    // 6. Ambiguity Resolution (Group by exact name, sort, demote duplicates)
+    // We group by symbol name to treat ambiguity as a ranking problem.
+    let mut groups: std::collections::HashMap<String, Vec<SearchResult>> = std::collections::HashMap::new();
+    for res in results.into_iter() {
+        groups.entry(res.name.clone()).or_default().push(res);
+    }
+    
+    let mut resolved_results = Vec::new();
+    for (_name, mut group) in groups {
+        group.sort_by(|a, b| b.score.cmp(&a.score));
+        
+        // The strongest candidate keeps its score. 
+        // Remaining candidates are demoted to ensure the canonical definition sits on top.
+        for (i, mut res) in group.into_iter().enumerate() {
+            if i > 0 {
+                res.score = (res.score as f64 * 0.7) as i32; // Penalty for ambiguous duplicate
+                if res.confidence.starts_with("High") {
+                    res.confidence = res.confidence.replace("High", "Medium");
+                }
+                res.explanation.push_str(" (Ambiguous duplicate demoted)");
+            }
+            resolved_results.push(res);
+        }
+    }
+    
+    let mut results = resolved_results;
 
     // 7. Check isolated files table
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
@@ -382,9 +453,9 @@ fn search_symbol_names(
             let confidence = if relevance_score >= 800 { "High (Exact File Match)".to_string() }
             else if relevance_score >= 250 { "Medium (File Substring Match)".to_string() }
             else if relevance_score >= 100 { "Low (Token File Match)".to_string() }
-            else { "File Path Match".to_string() };
+            else { "Low (File Path Match)".to_string() };
 
-            let final_score = relevance_score * 1000;
+            let final_score = relevance_score;
             results.push(SearchResult {
                 path: db.resolve_path(&path),
                 name: std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string(),

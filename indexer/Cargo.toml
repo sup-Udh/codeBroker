@@ -10,3 +10,4 @@ graph = { path = "../graph" }
 parser = { path = "../parser" }
 storage = { path = "../storage" }
 ignore="0.4"
+rusqlite = { version = "0.40.1", features = ["bundled"] }

@@ -221,6 +221,12 @@ pub fn reindex_paths(
         }
     }
 
+    // 3. Infer logical interactions
+    let _ = crate::interactions::infer_interactions(db);
+
+    // 4. Extract and precompute graph features
+    let _ = crate::features::extract_features(db);
+
     Ok(stats)
 }
 

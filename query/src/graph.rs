@@ -631,7 +631,7 @@ pub fn detect_logical_edges(db: &Database) -> Result<usize> {
                 )
                 .ok();
             if let Some((route_symbol_id, _route_path)) = found {
-                db.insert_logical_edge(file_id, Some(symbol_id), route_symbol_id, "fetches")?;
+                db.insert_interaction_edge(file_id, Some(symbol_id), route_symbol_id, "{\"kind\":\"http\",\"method\":\"fetch\"}", 0.7)?;
                 inserted += 1;
             }
         }

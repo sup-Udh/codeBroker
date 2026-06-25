@@ -32,8 +32,12 @@ pub const INIT_SQL: &str = "
     CREATE TABLE IF NOT EXISTS edges (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         source_file_id INTEGER NOT NULL,
+        source_symbol_id INTEGER,
         target_symbol_id INTEGER NOT NULL,
         kind TEXT NOT NULL,
+        edge_type TEXT NOT NULL DEFAULT 'static',
+        metadata TEXT,
+        confidence REAL DEFAULT 1.0,
         FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
         FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
@@ -60,6 +64,24 @@ pub const INIT_SQL: &str = "
         embedding BLOB NOT NULL,
         model TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS symbol_features (
+        symbol_id INTEGER PRIMARY KEY,
+        pagerank REAL NOT NULL DEFAULT 0.0,
+        fan_in INTEGER NOT NULL DEFAULT 0,
+        fan_out INTEGER NOT NULL DEFAULT 0,
+        interaction_count INTEGER NOT NULL DEFAULT 0,
+        community_id INTEGER,
+        is_entrypoint BOOLEAN NOT NULL DEFAULT 0,
+        is_exported BOOLEAN NOT NULL DEFAULT 0,
+        is_public BOOLEAN NOT NULL DEFAULT 0,
+        is_callable BOOLEAN NOT NULL DEFAULT 0,
+        is_type BOOLEAN NOT NULL DEFAULT 0,
+        is_constant BOOLEAN NOT NULL DEFAULT 0,
+        is_local BOOLEAN NOT NULL DEFAULT 0,
+        is_generated BOOLEAN NOT NULL DEFAULT 0,
         FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
 

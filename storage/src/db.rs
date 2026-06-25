@@ -214,6 +214,14 @@ impl Database {
             "ALTER TABLE edges ADD COLUMN edge_type TEXT NOT NULL DEFAULT 'static';",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE edges ADD COLUMN metadata TEXT;",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0;",
+            [],
+        );
 
         Ok(())
     }
@@ -610,24 +618,25 @@ impl Database {
     /// the symbol that handles it, rather than found by walking syntax. Same
     /// dedup contract as `insert_edge_attributed`: a (source_symbol_id,
     /// target_symbol_id, kind) triple is only ever stored once.
-    pub fn insert_logical_edge(
+    pub fn insert_interaction_edge(
         &self,
         source_file_id: i64,
         source_symbol_id: Option<i64>,
         target_symbol_id: i64,
-        kind: &str,
+        metadata: &str,
+        confidence: f64,
     ) -> Result<()> {
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_symbol_id IS ?1 AND target_symbol_id = ?2 AND kind = ?3 AND edge_type = 'logical')",
-            params![source_symbol_id, target_symbol_id, kind],
+            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_symbol_id IS ?1 AND target_symbol_id = ?2 AND kind = 'interaction' AND edge_type = 'logical')",
+            params![source_symbol_id, target_symbol_id],
             |row| row.get(0),
         )?;
         if exists {
             return Ok(());
         }
         self.conn.execute(
-            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, edge_type) VALUES (?1, ?2, ?3, ?4, 'logical')",
-            params![source_file_id, source_symbol_id, target_symbol_id, kind],
+            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, edge_type, metadata, confidence) VALUES (?1, ?2, ?3, 'interaction', 'logical', ?4, ?5)",
+            params![source_file_id, source_symbol_id, target_symbol_id, metadata, confidence],
         )?;
         Ok(())
     }
