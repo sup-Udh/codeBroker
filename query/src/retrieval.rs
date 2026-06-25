@@ -87,7 +87,9 @@ pub fn read_symbol_source_scoped(
         let end_byte: i64 = row.get(5).unwrap_or(start_byte);
         let directive: Option<String> = row.get(6).unwrap_or(None);
         let attributes_str: Option<String> = row.get(7).unwrap_or(None);
-        let attributes = attributes_str.map(|s| serde_json::from_str(&s).unwrap_or_default()).unwrap_or_default();
+        let attributes = attributes_str
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())
+            .unwrap_or_default();
         let metadata: Option<String> = row.get(8).unwrap_or(None);
         let indexed_content_hash: Option<String> = row.get(9).unwrap_or(None);
 
@@ -338,20 +340,38 @@ pub fn read_file_snippet(
     }
     let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    // Validate the requested range against the real file length instead of
+    // silently returning an empty `source` for an out-of-range request — an
+    // empty string was indistinguishable from "this region really is blank",
+    // which could mislead a caller into thinking a file region was empty.
+    if start_line == 0 {
+        return Err("start_line is 1-based; it must be >= 1.".to_string());
+    }
+    if start_line > total_lines {
+        return Err(format!(
+            "start_line {} exceeds file length ({} lines) for '{}'.",
+            start_line, total_lines, path
+        ));
+    }
+    if end_line < start_line {
+        return Err(format!(
+            "end_line {} is before start_line {} for '{}'.",
+            end_line, start_line, path
+        ));
+    }
 
     let s_idx = start_line.saturating_sub(1);
-    let e_idx = end_line.min(lines.len());
-
-    let source = if s_idx < lines.len() {
-        lines[s_idx..e_idx].join("\n")
-    } else {
-        String::new()
-    };
+    let e_idx = end_line.min(total_lines);
+    let source = lines[s_idx..e_idx].join("\n");
 
     Ok(FileSnippetResult {
         file_path: path.to_string(),
+        // Report the line actually returned, clamped to the file, so a caller
+        // that over-asked (e.g. end_line past EOF) sees what it really got.
         start_line,
-        end_line,
+        end_line: e_idx,
         source,
     })
 }
@@ -370,16 +390,20 @@ pub fn skeletonize_file(
     let mut file_id = 0;
     let mut indexed_content_hash: Option<String> = None;
     let mut actual_abs_path = String::new();
-    
+
     let target_path_str = file_path.trim_start_matches("./");
 
     while let Some(row) = files_rows.next().unwrap_or(None) {
         let id: i64 = row.get(0).unwrap();
         let path: String = row.get(1).unwrap();
         let abs = db.resolve_path(&path);
-        
+
         // Flexible matching: exact absolute, exact stored relative, or ends with the given path segment
-        if abs == file_path || path == file_path || path.ends_with(target_path_str) || abs.ends_with(target_path_str) {
+        if abs == file_path
+            || path == file_path
+            || path.ends_with(target_path_str)
+            || abs.ends_with(target_path_str)
+        {
             file_id = id;
             indexed_content_hash = row.get(2).unwrap_or(None);
             actual_abs_path = abs;
@@ -388,6 +412,54 @@ pub fn skeletonize_file(
     }
 
     if file_id == 0 {
+        // The caller may have passed a directory (e.g. a Next.js segment like
+        // "frontend/app") rather than a file. The directory may be nested below
+        // the project root (here `frontend/app` actually lives at
+        // `OrcaAI/frontend/app`), so resolving the literal string against the
+        // root won't find it. Instead, treat the input as a directory segment
+        // and list the INDEXED files that live directly inside it — more useful
+        // than a raw filesystem listing because it only names files CodeBroker
+        // can actually skeletonize.
+        let seg = target_path_str.trim_matches('/');
+        if !seg.is_empty() {
+            let mut children: Vec<String> = Vec::new();
+            let mut all_stmt = db
+                .conn
+                .prepare("SELECT path FROM files")
+                .map_err(|e| e.to_string())?;
+            let mut all_rows = all_stmt.query([]).map_err(|e| e.to_string())?;
+            while let Some(row) = all_rows.next().map_err(|e| e.to_string())? {
+                let p: String = row.get(0).unwrap_or_default();
+                let norm = p.trim_start_matches("./");
+                if let Some(parent) = std::path::Path::new(norm).parent() {
+                    let parent = parent.to_string_lossy();
+                    if parent == seg || parent.ends_with(&format!("/{}", seg)) {
+                        if let Some(fname) = std::path::Path::new(norm)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                        {
+                            children.push(fname.to_string());
+                        }
+                    }
+                }
+            }
+            if !children.is_empty() {
+                children.sort();
+                children.dedup();
+                return Err(format!(
+                    "'{}' is a directory, not a file. Indexed files in it: {}. Pass one of these as the file path.",
+                    file_path,
+                    children.join(", ")
+                ));
+            }
+        }
+        // Last resort: a real on-disk directory with no indexed children.
+        for candidate in [db.resolve_path(target_path_str), file_path.to_string()] {
+            let p = std::path::Path::new(&candidate);
+            if p.is_dir() {
+                return Err(directory_hint_error(p));
+            }
+        }
         return Err(format!("File '{}' not found in index.", file_path));
     }
 
@@ -396,7 +468,6 @@ pub fn skeletonize_file(
         return Err(directory_hint_error(abs_path_obj));
     }
     let content = fs::read(&actual_abs_path).map_err(|e| format!("Failed to read file: {}", e))?;
-
 
     // The skeleton is built by walking stored start_byte/end_byte offsets
     // against `content` read just above. If the file changed since indexing,

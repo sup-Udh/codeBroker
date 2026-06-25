@@ -214,10 +214,9 @@ impl Database {
             "ALTER TABLE edges ADD COLUMN edge_type TEXT NOT NULL DEFAULT 'static';",
             [],
         );
-        let _ = self.conn.execute(
-            "ALTER TABLE edges ADD COLUMN metadata TEXT;",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE edges ADD COLUMN metadata TEXT;", []);
         let _ = self.conn.execute(
             "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0;",
             [],
@@ -273,11 +272,7 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn update_file_metadata(
-        &self,
-        file_id: i64,
-        metadata: Option<&str>,
-    ) -> Result<()> {
+    pub fn update_file_metadata(&self, file_id: i64, metadata: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE files SET metadata = ?1 WHERE id = ?2",
             params![metadata, file_id],
@@ -299,11 +294,7 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn insert_entrypoint(
-        &self,
-        symbol_id: i64,
-        reason: &str,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn insert_entrypoint(&self, symbol_id: i64, reason: &str) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO entrypoints (symbol_id, reason) VALUES (?1, ?2)",
             rusqlite::params![symbol_id, reason],

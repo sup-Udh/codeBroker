@@ -1,6 +1,7 @@
 // public api of the storage crate
 
 pub mod db;
+pub mod entrypoints;
 pub mod schema;
 
 // reimporting everything so that it could use it as `storage::Database` by the other crates

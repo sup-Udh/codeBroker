@@ -98,7 +98,9 @@ mod tests {
                     end_line: 1,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, attributes: Vec::new(), metadata: None,
+                    signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
                 },
             )
             .unwrap();
@@ -133,7 +135,9 @@ mod tests {
                     end_line: 1,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, attributes: Vec::new(), metadata: None,
+                    signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
                 },
             )
             .unwrap();
@@ -147,7 +151,9 @@ mod tests {
                     end_line: 2,
                     start_byte: 0,
                     end_byte: 0,
-                    signature: None, attributes: Vec::new(), metadata: None,
+                    signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
                 },
             )
             .unwrap();

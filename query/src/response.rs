@@ -1,6 +1,6 @@
+use rusqlite::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use rusqlite::Result;
 use storage::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -42,9 +42,21 @@ impl Default for TokenBudget {
 impl TokenBudget {
     pub fn new(profile: ResponseProfile) -> Self {
         match profile {
-            ResponseProfile::Compact => Self { max_items: 10, truncate_strings: true, current_items: 0 },
-            ResponseProfile::Standard => Self { max_items: 50, truncate_strings: false, current_items: 0 },
-            ResponseProfile::Verbose => Self { max_items: 500, truncate_strings: false, current_items: 0 },
+            ResponseProfile::Compact => Self {
+                max_items: 10,
+                truncate_strings: true,
+                current_items: 0,
+            },
+            ResponseProfile::Standard => Self {
+                max_items: 50,
+                truncate_strings: false,
+                current_items: 0,
+            },
+            ResponseProfile::Verbose => Self {
+                max_items: 500,
+                truncate_strings: false,
+                current_items: 0,
+            },
         }
     }
 

@@ -24,9 +24,7 @@ impl LanguageFrontend for JavaScriptFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let metadata = graph::models::FileMetadata {
-            metadata: None,
-        };
+        let metadata = graph::models::FileMetadata { metadata: None };
 
         let symbols = extract_js_symbols(&tree, source_code, language.clone(), _path);
         let imports = extract_js_imports(&tree, source_code, language);

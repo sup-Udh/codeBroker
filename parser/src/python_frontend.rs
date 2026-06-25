@@ -165,6 +165,66 @@ fn extract_py_symbols(
     symbols
 }
 
+#[cfg(test)]
+mod type_ref_tests {
+    use super::*;
+    use crate::frontend::LanguageFrontend;
+
+    // Regression for the impact-analysis inversion bug: a function whose
+    // parameter is annotated with a class (`topology: Topology`) must produce a
+    // real reference edge to that class, while a same-named parameter with a
+    // different annotation (`topology: dict`) must NOT — the dependency is the
+    // resolved type, not the parameter identifier.
+    #[test]
+    fn typed_parameter_emits_type_ref_for_the_annotation_only() {
+        let src = "\
+class Topology:
+    pass
+
+def simulate(topology: Topology):
+    return topology
+
+def analyze(topology: dict):
+    return topology
+";
+        let (_m, _syms, imports) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
+
+        let type_refs: Vec<&str> = imports
+            .iter()
+            .filter(|i| i.kind.as_deref() == Some("type_ref"))
+            .map(|i| i.name.as_str())
+            .collect();
+
+        assert!(
+            type_refs.contains(&"Topology"),
+            "`simulate(topology: Topology)` must reference the Topology type, got {type_refs:?}"
+        );
+        // The plain-`dict` parameter must not masquerade as a Topology reference.
+        assert!(
+            !type_refs.contains(&"topology"),
+            "the parameter identifier must never be treated as a type reference"
+        );
+    }
+
+    #[test]
+    fn return_type_annotation_emits_type_ref() {
+        let src = "\
+class Result:
+    pass
+
+def run() -> Result:
+    return Result()
+";
+        let (_m, _syms, imports) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.kind.as_deref() == Some("type_ref") && i.name == "Result"),
+            "return-type annotation should produce a type_ref to Result"
+        );
+    }
+}
+
 fn extract_py_imports(
     tree: &Tree,
     source_code: &str,
@@ -180,6 +240,12 @@ fn extract_py_imports(
         (call function: (identifier) @call_name)
         (call function: (attribute attribute: (identifier) @call_name))
         (attribute attribute: (identifier) @member_access)
+        (typed_parameter type: (type (identifier) @type_ref))
+        (typed_default_parameter type: (type (identifier) @type_ref))
+        (typed_parameter type: (type (subscript (identifier) @type_ref)))
+        (typed_default_parameter type: (type (subscript (identifier) @type_ref)))
+        (function_definition return_type: (type (identifier) @type_ref))
+        (function_definition return_type: (type (subscript (identifier) @type_ref)))
     ";
 
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -223,6 +289,18 @@ fn extract_py_imports(
                         import_name = name.clone();
                         line_number = node.start_position().row + 1;
                         import_kind = Some("MEMBER_ACCESS".to_string());
+                    }
+                } else if *capture_kind == "type_ref" {
+                    // A type annotation on a parameter or return value
+                    // (`def simulate(topology: Topology)`). This is a genuine
+                    // dependency on the annotated type — the edge the old
+                    // parser missed entirely, leaving impact-analysis to rely
+                    // on phantom name-fragment matches instead.
+                    let name = text.trim().to_string();
+                    if !crate::utils::is_noisy_call_name(&name) {
+                        import_name = name.clone();
+                        line_number = node.start_position().row + 1;
+                        import_kind = Some("type_ref".to_string());
                     }
                 }
             }

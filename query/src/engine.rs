@@ -1,6 +1,6 @@
-use storage::Database;
 use rusqlite::params;
 use std::time::Instant;
+use storage::Database;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SymbolCandidate {
@@ -16,12 +16,15 @@ pub struct SymbolCandidate {
 /// (insertion order) when a common name like "GET" or "handler" is defined
 /// in many files — that's a real correctness risk, not just a precision nit,
 /// because the caller has no way to know they got the wrong file's symbol.
-pub fn find_symbol_candidates(db: &Database, name: &str) -> Result<Vec<SymbolCandidate>, rusqlite::Error> {
+pub fn find_symbol_candidates(
+    db: &Database,
+    name: &str,
+) -> Result<Vec<SymbolCandidate>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT symbols.name, symbols.kind, files.path, symbols.start_line
          FROM symbols
          JOIN files ON symbols.file_id = files.id
-         WHERE symbols.name = ?1"
+         WHERE symbols.name = ?1",
     )?;
     let mut rows = stmt.query(params![name])?;
     let mut out = Vec::new();
@@ -37,10 +40,15 @@ pub fn find_symbol_candidates(db: &Database, name: &str) -> Result<Vec<SymbolCan
     Ok(out)
 }
 
-pub fn find_dependents(db: &Database, target_symbol_name: &str) ->
-Result<Vec<String>, rusqlite::Error> {
+pub fn find_dependents(
+    db: &Database,
+    target_symbol_name: &str,
+) -> Result<Vec<String>, rusqlite::Error> {
     let parent_class = if target_symbol_name.contains('.') {
-        target_symbol_name.split('.').next().unwrap_or(target_symbol_name)
+        target_symbol_name
+            .split('.')
+            .next()
+            .unwrap_or(target_symbol_name)
     } else {
         target_symbol_name
     };
@@ -50,7 +58,7 @@ Result<Vec<String>, rusqlite::Error> {
         FROM edges
         JOIN symbols ON edges.target_symbol_id = symbols.id
         JOIN files ON edges.source_file_id = files.id
-        WHERE (symbols.name = ?1 OR symbols.name = ?2) AND edges.kind = 'imports'"
+        WHERE (symbols.name = ?1 OR symbols.name = ?2) AND edges.kind = 'imports'",
     )?;
 
     let mut rows = stmt.query(params![target_symbol_name, parent_class])?;
@@ -103,8 +111,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
     let mut dp = vec![vec![0; len_b + 1]; len_a + 1];
 
-    for i in 0..=len_a { dp[i][0] = i; }
-    for j in 0..=len_b { dp[0][j] = j; }
+    for i in 0..=len_a {
+        dp[i][0] = i;
+    }
+    for j in 0..=len_b {
+        dp[0][j] = j;
+    }
 
     for i in 1..=len_a {
         for j in 1..=len_b {
@@ -119,8 +131,12 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 fn deterministic_query_expansion(keyword: &str) -> Vec<String> {
     let query_lower = keyword.to_lowercase();
-    let stopwords = ["a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by", "of", "from", "system", "feature", "code", "run", "user", "users", "use", "using", "used"];
-    let mut tokens: Vec<String> = query_lower.split(|c: char| !c.is_alphanumeric())
+    let stopwords = [
+        "a", "an", "the", "and", "or", "in", "on", "at", "to", "for", "with", "by", "of", "from",
+        "system", "feature", "code", "run", "user", "users", "use", "using", "used",
+    ];
+    let mut tokens: Vec<String> = query_lower
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty() && !stopwords.contains(s))
         .map(|s| s.to_string())
         .collect();
@@ -130,7 +146,23 @@ fn deterministic_query_expansion(keyword: &str) -> Vec<String> {
 }
 
 fn token_weight(token: &str) -> i32 {
-    let high_value = ["notification", "notifications", "judge", "awareness", "cursor", "execution", "auth", "authentication", "collaborate", "collaboration", "sync", "presence", "websocket", "realtime", "api"];
+    let high_value = [
+        "notification",
+        "notifications",
+        "judge",
+        "awareness",
+        "cursor",
+        "execution",
+        "auth",
+        "authentication",
+        "collaborate",
+        "collaboration",
+        "sync",
+        "presence",
+        "websocket",
+        "realtime",
+        "api",
+    ];
     if high_value.contains(&token) {
         return 300;
     }
@@ -172,9 +204,13 @@ impl From<&str> for SearchMode {
 /// under-classifying is safer here than accidentally letting a weak match
 /// through a `min_confidence: "medium"` filter.
 fn confidence_level(confidence: &str) -> u8 {
-    if confidence.starts_with("High") { 3 }
-    else if confidence.starts_with("Medium") { 2 }
-    else { 1 }
+    if confidence.starts_with("High") {
+        3
+    } else if confidence.starts_with("Medium") {
+        2
+    } else {
+        1
+    }
 }
 
 /// Parses the `min_confidence` tool param ("high" | "medium" | "low") into the
@@ -208,7 +244,7 @@ pub fn compute_retrieval_score(features: &RankingFeatures) -> i32 {
     if features.semantic_similarity > 0.0 {
         base_score += (features.semantic_similarity * 2000.0) as i32;
     }
-    
+
     // Structural Multipliers
     let mut multiplier = 1.0;
     if features.is_entrypoint {
@@ -216,18 +252,18 @@ pub fn compute_retrieval_score(features: &RankingFeatures) -> i32 {
     } else if features.is_callable {
         multiplier *= 1.1;
     }
-    
+
     if features.is_local {
         multiplier *= 0.3; // Heavy penalty for locals
     }
-    
+
     // Graph Centrality Multiplier (pagerank typically around 1.0, could be up to 10.0+ for central nodes)
     let pr_factor = 1.0 + (features.pagerank * 0.1);
     multiplier *= pr_factor.min(2.5); // Cap multiplier at 2.5
-    
+
     // Edge count minor boosts
     let edge_bonus = (features.fan_in * 2) + features.fan_out;
-    
+
     ((base_score as f64 * multiplier) as i32) + edge_bonus as i32
 }
 
@@ -241,9 +277,12 @@ fn search_symbol_names(
     let mut results = Vec::new();
 
     // 1. Fetch all symbol embeddings first if we have a query vector
-    let mut symbol_embeddings: std::collections::HashMap<i64, Vec<f32>> = std::collections::HashMap::new();
+    let mut symbol_embeddings: std::collections::HashMap<i64, Vec<f32>> =
+        std::collections::HashMap::new();
     if let Some(_) = query_vector {
-        let mut embed_stmt = db.conn.prepare("SELECT symbol_id, embedding FROM symbol_embeddings")?;
+        let mut embed_stmt = db
+            .conn
+            .prepare("SELECT symbol_id, embedding FROM symbol_embeddings")?;
         let mut embed_rows = embed_stmt.query([])?;
         while let Some(row) = embed_rows.next()? {
             let s_id: i64 = row.get(0)?;
@@ -298,28 +337,45 @@ fn search_symbol_names(
         // 1. Symbol Name Match
         let mut expl = Vec::new();
 
-        if name_lower == query_lower { name_score += 1000; expl.push(format!("Exact lexical match")); }
-        else if name_lower.starts_with(query_lower) { name_score += 500; expl.push(format!("Prefix lexical match")); }
-        else if name_lower.contains(query_lower) { name_score += 250; expl.push(format!("Substring lexical match")); }
+        if name_lower == query_lower {
+            name_score += 1000;
+            expl.push(format!("Exact lexical match"));
+        } else if name_lower.starts_with(query_lower) {
+            name_score += 500;
+            expl.push(format!("Prefix lexical match"));
+        } else if name_lower.contains(query_lower) {
+            name_score += 250;
+            expl.push(format!("Substring lexical match"));
+        }
 
         for token in query_tokens {
             let weight = token_weight(token);
-            if name_lower == *token { name_score += weight; expl.push(format!("Token match '{}'", token)); }
-            else {
+            if name_lower == *token {
+                name_score += weight;
+                expl.push(format!("Token match '{}'", token));
+            } else {
                 let dist = levenshtein(&name_lower, token);
                 if dist <= 1 && token.len() > 3 {
-                    name_score += weight / 2; expl.push(format!("Fuzzy match '{}'", token));
+                    name_score += weight / 2;
+                    expl.push(format!("Fuzzy match '{}'", token));
                 } else if dist == 2 && token.len() > 5 {
-                    name_score += weight / 4; expl.push(format!("Weak fuzzy match '{}'", token));
+                    name_score += weight / 4;
+                    expl.push(format!("Weak fuzzy match '{}'", token));
                 }
             }
         }
 
         // 2. Full Path Match
-        if path_lower.contains(query_lower) { path_score += 200; expl.push(format!("Path contains query")); }
+        if path_lower.contains(query_lower) {
+            path_score += 200;
+            expl.push(format!("Path contains query"));
+        }
         for token in query_tokens {
             let weight = token_weight(token);
-            if path_lower.contains(token) { path_score += weight / 2; expl.push(format!("Path contains '{}'", token)); }
+            if path_lower.contains(token) {
+                path_score += weight / 2;
+                expl.push(format!("Path contains '{}'", token));
+            }
         }
 
         let mut semantic_sim = -1.0;
@@ -332,19 +388,31 @@ fn search_symbol_names(
             }
         }
 
-        if name_score == 0 && path_score == 0 && semantic_sim < 0.25 { 
+        if name_score == 0 && path_score == 0 && semantic_sim < 0.25 {
             continue;
         }
 
         // 4. Production Path Boosts
         let path_parts: Vec<&str> = path_lower.split('/').collect();
-        if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
+        if path_parts.contains(&"app")
+            || path_parts.contains(&"src")
+            || path_parts.contains(&"server")
+            || path_parts.contains(&"backend")
+            || path_parts.contains(&"core")
+            || path_parts.contains(&"api")
+        {
             path_score += 150;
             expl.push(format!("Production path bonus"));
         }
 
         // 5. Scratch/Test Penalties
-        if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
+        if path_parts.contains(&"scratch")
+            || path_parts.contains(&"sandbox")
+            || path_parts.contains(&"tmp")
+            || path_parts.contains(&"examples")
+            || path_parts.contains(&"test")
+            || path_parts.contains(&"tests")
+        {
             path_score -= 300;
             expl.push(format!("Test/scratch penalty"));
         }
@@ -363,32 +431,50 @@ fn search_symbol_names(
 
         let final_score = compute_retrieval_score(&features);
 
-        let confidence = if semantic_sim > 0.35 { "High (Semantic Match)".to_string() }
-        else if name_score >= 1000 { "High (Exact Match)".to_string() }
-        else if name_score >= 500 { "High (Prefix Match)".to_string() }
-        else if semantic_sim > 0.25 { "Medium (Semantic Match)".to_string() }
-        else if name_score >= 250 { "Medium (Contains Match)".to_string() }
-        else if name_score >= 100 { "Medium (Token Match)".to_string() }
-        else if name_score >= 50 { "Low (Fuzzy Match)".to_string() }
-        else { "Low (Weak Fuzzy)".to_string() };
+        let confidence = if semantic_sim > 0.35 {
+            "High (Semantic Match)".to_string()
+        } else if name_score >= 1000 {
+            "High (Exact Match)".to_string()
+        } else if name_score >= 500 {
+            "High (Prefix Match)".to_string()
+        } else if semantic_sim > 0.25 {
+            "Medium (Semantic Match)".to_string()
+        } else if name_score >= 250 {
+            "Medium (Contains Match)".to_string()
+        } else if name_score >= 100 {
+            "Medium (Token Match)".to_string()
+        } else if name_score >= 50 {
+            "Low (Fuzzy Match)".to_string()
+        } else {
+            "Low (Weak Fuzzy)".to_string()
+        };
 
         if final_score > 0 {
-            results.push(SearchResult { path: db.resolve_path(&path), name, kind, score: final_score, confidence, explanation: expl.join(", "), line: None });
+            results.push(SearchResult {
+                path: db.resolve_path(&path),
+                name,
+                kind,
+                score: final_score,
+                confidence,
+                explanation: expl.join(", "),
+                line: None,
+            });
         }
     }
 
     // 6. Ambiguity Resolution (Group by exact name, sort, demote duplicates)
     // We group by symbol name to treat ambiguity as a ranking problem.
-    let mut groups: std::collections::HashMap<String, Vec<SearchResult>> = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, Vec<SearchResult>> =
+        std::collections::HashMap::new();
     for res in results.into_iter() {
         groups.entry(res.name.clone()).or_default().push(res);
     }
-    
+
     let mut resolved_results = Vec::new();
     for (_name, mut group) in groups {
         group.sort_by(|a, b| b.score.cmp(&a.score));
-        
-        // The strongest candidate keeps its score. 
+
+        // The strongest candidate keeps its score.
         // Remaining candidates are demoted to ensure the canonical definition sits on top.
         for (i, mut res) in group.into_iter().enumerate() {
             if i > 0 {
@@ -401,7 +487,7 @@ fn search_symbol_names(
             resolved_results.push(res);
         }
     }
-    
+
     let mut results = resolved_results;
 
     // 7. Check isolated files table
@@ -416,49 +502,89 @@ fn search_symbol_names(
         }
 
         let path_lower = path.to_lowercase();
-        let filename = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_lowercase();
-        
+        let filename = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_lowercase();
+
         let mut expl = Vec::new();
         let mut base_score = 0;
 
-        if filename == query_lower { base_score += 800; expl.push(format!("Exact file match")); }
-        else if filename.contains(query_lower) { base_score += 250; expl.push(format!("File substring match")); }
-        
-        if path_lower.contains(query_lower) && !filename.contains(query_lower) { base_score += 100; expl.push(format!("Path contains query")); }
+        if filename == query_lower {
+            base_score += 800;
+            expl.push(format!("Exact file match"));
+        } else if filename.contains(query_lower) {
+            base_score += 250;
+            expl.push(format!("File substring match"));
+        }
+
+        if path_lower.contains(query_lower) && !filename.contains(query_lower) {
+            base_score += 100;
+            expl.push(format!("Path contains query"));
+        }
 
         for token in query_tokens {
             let weight = token_weight(token);
-            if filename == *token { base_score += weight; expl.push(format!("Token file match '{}'", token)); }
-            else if filename.contains(token) { base_score += weight / 2; expl.push(format!("File fuzzy match '{}'", token)); }
-            else if path_lower.contains(token) { base_score += weight / 4; expl.push(format!("Path token match '{}'", token)); }
+            if filename == *token {
+                base_score += weight;
+                expl.push(format!("Token file match '{}'", token));
+            } else if filename.contains(token) {
+                base_score += weight / 2;
+                expl.push(format!("File fuzzy match '{}'", token));
+            } else if path_lower.contains(token) {
+                base_score += weight / 4;
+                expl.push(format!("Path token match '{}'", token));
+            }
         }
 
         if base_score == 0 {
             continue;
         }
-        
+
         let mut relevance_score = base_score;
 
         let path_parts: Vec<&str> = path_lower.split('/').collect();
-        if path_parts.contains(&"app") || path_parts.contains(&"src") || path_parts.contains(&"server") || path_parts.contains(&"backend") || path_parts.contains(&"core") || path_parts.contains(&"api") {
+        if path_parts.contains(&"app")
+            || path_parts.contains(&"src")
+            || path_parts.contains(&"server")
+            || path_parts.contains(&"backend")
+            || path_parts.contains(&"core")
+            || path_parts.contains(&"api")
+        {
             relevance_score += 150;
             expl.push(format!("Production path bonus"));
         }
-        if path_parts.contains(&"scratch") || path_parts.contains(&"sandbox") || path_parts.contains(&"tmp") || path_parts.contains(&"examples") || path_parts.contains(&"test") || path_parts.contains(&"tests") {
+        if path_parts.contains(&"scratch")
+            || path_parts.contains(&"sandbox")
+            || path_parts.contains(&"tmp")
+            || path_parts.contains(&"examples")
+            || path_parts.contains(&"test")
+            || path_parts.contains(&"tests")
+        {
             relevance_score -= 300;
             expl.push(format!("Test/scratch penalty"));
         }
 
         if relevance_score > 0 {
-            let confidence = if relevance_score >= 800 { "High (Exact File Match)".to_string() }
-            else if relevance_score >= 250 { "Medium (File Substring Match)".to_string() }
-            else if relevance_score >= 100 { "Low (Token File Match)".to_string() }
-            else { "Low (File Path Match)".to_string() };
+            let confidence = if relevance_score >= 800 {
+                "High (Exact File Match)".to_string()
+            } else if relevance_score >= 250 {
+                "Medium (File Substring Match)".to_string()
+            } else if relevance_score >= 100 {
+                "Low (Token File Match)".to_string()
+            } else {
+                "Low (File Path Match)".to_string()
+            };
 
             let final_score = relevance_score;
             results.push(SearchResult {
                 path: db.resolve_path(&path),
-                name: std::path::Path::new(&path).file_name().and_then(|n| n.to_str()).unwrap_or(&path).to_string(),
+                name: std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&path)
+                    .to_string(),
                 kind: "file".to_string(),
                 score: final_score,
                 confidence,
@@ -587,7 +713,10 @@ pub fn search_symbols(
     let mut query_tokens = deterministic_query_expansion(keyword);
 
     if llm_used && query_vector.is_none() {
-        return Ok((Vec::new(), Some("Semantic search unavailable. Workspace indexed without embeddings.".to_string())));
+        return Ok((
+            Vec::new(),
+            Some("Semantic search unavailable. Workspace indexed without embeddings.".to_string()),
+        ));
     }
 
     // Inject the AI-generated semantic synonyms into our token pool
@@ -598,12 +727,20 @@ pub fn search_symbols(
     }
 
     let mut results = match mode {
-        SearchMode::Symbol => search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?,
+        SearchMode::Symbol => {
+            search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?
+        }
         SearchMode::Text => search_file_contents(db, &query_lower, path_scope, whole_word)?,
         SearchMode::Both => {
-            let mut symbol_results = search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?;
+            let mut symbol_results =
+                search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?;
             if symbol_results.is_empty() {
-                symbol_results.extend(search_file_contents(db, &query_lower, path_scope, whole_word)?);
+                symbol_results.extend(search_file_contents(
+                    db,
+                    &query_lower,
+                    path_scope,
+                    whole_word,
+                )?);
             }
             symbol_results
         }
@@ -614,7 +751,8 @@ pub fn search_symbols(
     if required_level > 0 {
         results.retain(|r| confidence_level(&r.confidence) >= required_level);
     }
-    let filtered_out_by_confidence = required_level > 0 && results.is_empty() && pre_filter_count > 0;
+    let filtered_out_by_confidence =
+        required_level > 0 && results.is_empty() && pre_filter_count > 0;
 
     results.sort_by(|a, b| b.score.cmp(&a.score));
     results.truncate(50);
@@ -624,7 +762,11 @@ pub fn search_symbols(
     let result_count = results.len() as i64;
     let top_result = results.first().map(|r| r.name.clone());
     let fallback_used = !llm_used;
-    let search_mode_label = if llm_used { "semantic_boost" } else { "deterministic" };
+    let search_mode_label = if llm_used {
+        "semantic_boost"
+    } else {
+        "deterministic"
+    };
 
     let _ = db.conn.execute(
         "INSERT INTO search_events (query, result_count, latency_ms, fallback_used, llm_used, top_result, search_mode)
@@ -635,7 +777,9 @@ pub fn search_symbols(
     let reason = if filtered_out_by_confidence {
         Some(format!(
             "Found {} match(es) for \"{}\" but none met min_confidence: \"{}\". Lower min_confidence or omit it to see them.",
-            pre_filter_count, keyword, min_confidence.unwrap_or("")
+            pre_filter_count,
+            keyword,
+            min_confidence.unwrap_or("")
         ))
     } else if results.is_empty() {
         let scoped_symbol_count: i64 = if let Some(scope) = path_scope {
@@ -646,7 +790,9 @@ pub fn search_symbols(
                 |r| r.get(0),
             ).unwrap_or(0)
         } else {
-            db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0)
+            db.conn
+                .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
+                .unwrap_or(0)
         };
         let mode_hint = match mode {
             SearchMode::Symbol => " Try mode: \"text\" or \"both\" to also search file content/string literals, not just symbol names.".to_string(),
@@ -661,7 +807,11 @@ pub fn search_symbols(
         Some(format!(
             "No matches for \"{}\" in mode \"{}\"; {} indexed symbols in scope.{}{}",
             keyword,
-            match mode { SearchMode::Symbol => "symbol", SearchMode::Text => "text", SearchMode::Both => "both" },
+            match mode {
+                SearchMode::Symbol => "symbol",
+                SearchMode::Text => "text",
+                SearchMode::Both => "both",
+            },
             scoped_symbol_count,
             mode_hint,
             whole_word_hint,
@@ -673,14 +823,18 @@ pub fn search_symbols(
     Ok((results, reason))
 }
 
-pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
+pub fn find_symbol_exact(
+    db: &Database,
+    name: &str,
+    context_lines: usize,
+) -> Result<Vec<(String, String, i64, String)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line 
          FROM symbols 
          JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name = ?1 LIMIT 5"
+         WHERE symbols.name = ?1 LIMIT 5",
     )?;
-    
+
     let mut rows = stmt.query(params![name])?;
     let mut results = Vec::new();
     while let Some(row) = rows.next()? {
@@ -688,7 +842,7 @@ pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Res
         let kind: String = row.get(1)?;
         let start_line: i64 = row.get(2)?;
         let end_line: i64 = row.get(3).unwrap_or(start_line);
-        
+
         let abs_path = db.resolve_path(&path);
         let mut preview = String::new();
         if let Ok(content) = std::fs::read_to_string(&abs_path) {
@@ -699,7 +853,7 @@ pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Res
                 preview = lines[start..end].join("\n");
             }
         }
-        
+
         results.push((abs_path, kind, start_line, preview));
     }
     Ok(results)
@@ -709,11 +863,16 @@ pub fn find_symbol_exact(db: &Database, name: &str, context_lines: usize) -> Res
 /// `(name, abs_path, kind, start_line, preview, score)`. `name` is the matched
 /// symbol's own name (NOT the query) — callers use it to separate exact hits
 /// from fuzzy ones, since `find_symbol` deliberately blends both by score.
-pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope: Option<&str>) -> Result<Vec<(String, String, String, i64, String, i32)>, rusqlite::Error> {
+pub fn find_symbol(
+    db: &Database,
+    query: &str,
+    context_lines: usize,
+    path_scope: Option<&str>,
+) -> Result<Vec<(String, String, String, i64, String, i32)>, rusqlite::Error> {
     let mut stmt = db.conn.prepare(
         "SELECT files.path, symbols.name, symbols.kind, symbols.start_line, symbols.end_line
          FROM symbols
-         JOIN files ON symbols.file_id = files.id"
+         JOIN files ON symbols.file_id = files.id",
     )?;
 
     let mut rows = stmt.query([])?;
@@ -731,10 +890,10 @@ pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope:
         let kind: String = row.get(2)?;
         let start_line: i64 = row.get(3)?;
         let end_line: i64 = row.get(4).unwrap_or(start_line);
-        
+
         let name_lower = name.to_lowercase();
         let mut score = 0;
-        
+
         if name_lower == query_lower {
             score += 1000;
         } else if name_lower.starts_with(&query_lower) {
@@ -749,15 +908,15 @@ pub fn find_symbol(db: &Database, query: &str, context_lines: usize, path_scope:
                 score += 50;
             }
         }
-        
+
         if score > 0 {
             candidates.push((score, path, name, kind, start_line, end_line));
         }
     }
-    
+
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     candidates.truncate(10); // Return top 10 best matches
-    
+
     let mut results = Vec::new();
     for (score, path, name, kind, start_line, end_line) in candidates {
         let abs_path = db.resolve_path(&path);
@@ -790,7 +949,10 @@ pub fn build_project_overview(db: &Database) -> Result<ProjectOverview, rusqlite
 /// path contains that substring. This is what makes `repository_stats`
 /// usable as a pre-check ("is this one directory worth querying") instead of
 /// only ever reporting global totals.
-pub fn build_project_overview_scoped(db: &Database, path_scope: Option<&str>) -> Result<ProjectOverview, rusqlite::Error> {
+pub fn build_project_overview_scoped(
+    db: &Database,
+    path_scope: Option<&str>,
+) -> Result<ProjectOverview, rusqlite::Error> {
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
     let mut file_rows = file_stmt.query([])?;
     let mut file_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -804,7 +966,10 @@ pub fn build_project_overview_scoped(db: &Database, path_scope: Option<&str>) ->
             }
         }
         total_files += 1;
-        if let Some(ext) = std::path::Path::new(&path).extension().and_then(|e| e.to_str()) {
+        if let Some(ext) = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
             *languages.entry(ext.to_string()).or_insert(0) += 1;
         }
         if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -813,11 +978,12 @@ pub fn build_project_overview_scoped(db: &Database, path_scope: Option<&str>) ->
         }
     }
 
-    let mut sym_stmt = db.conn.prepare(
-        "SELECT files.path FROM symbols JOIN files ON symbols.file_id = files.id"
-    )?;
+    let mut sym_stmt = db
+        .conn
+        .prepare("SELECT files.path FROM symbols JOIN files ON symbols.file_id = files.id")?;
     let mut sym_rows = sym_stmt.query([])?;
-    let mut symbol_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut symbol_counts: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     let mut total_symbols: i64 = 0;
     while let Some(row) = sym_rows.next()? {
         let path: String = row.get(0)?;
@@ -841,13 +1007,22 @@ pub fn build_project_overview_scoped(db: &Database, path_scope: Option<&str>) ->
             |r| r.get(0),
         ).unwrap_or(0)
     } else {
-        db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0)
+        db.conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap_or(0)
     };
 
-    let mut dirs_vec: Vec<DirectoryStats> = file_counts.into_iter().map(|(path, file_count)| {
-        let symbol_count = *symbol_counts.get(&path).unwrap_or(&0);
-        DirectoryStats { path, file_count, symbol_count }
-    }).collect();
+    let mut dirs_vec: Vec<DirectoryStats> = file_counts
+        .into_iter()
+        .map(|(path, file_count)| {
+            let symbol_count = *symbol_counts.get(&path).unwrap_or(&0);
+            DirectoryStats {
+                path,
+                file_count,
+                symbol_count,
+            }
+        })
+        .collect();
     dirs_vec.sort_by(|a, b| b.file_count.cmp(&a.file_count));
 
     Ok(ProjectOverview {
@@ -872,15 +1047,21 @@ mod min_confidence_tests {
         // "roof" is a 1-edit-distance fuzzy match with no substring overlap -> Low (Fuzzy Match).
         let file_id = db.insert_file("components.ts", "fixturehash").unwrap();
         for name in ["room", "ChatRoom", "roof"] {
-            db.insert_symbol(file_id, &graph::SymbolNode {
-                name: name.to_string(),
-                kind: "function".to_string(),
-                start_line: 1,
-                end_line: 1,
-                start_byte: 0,
-                end_byte: 0,
-                signature: None, attributes: Vec::new(), metadata: None,
-            }).unwrap();
+            db.insert_symbol(
+                file_id,
+                &graph::SymbolNode {
+                    name: name.to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_byte: 0,
+                    end_byte: 0,
+                    signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
         }
         db
     }
@@ -908,27 +1089,83 @@ mod min_confidence_tests {
     #[test]
     fn default_search_returns_all_confidence_tiers_unfiltered() {
         let db = setup_fixture();
-        let (results, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, None).unwrap();
+        let (results, _) = search_symbols(
+            &db,
+            "room",
+            &[],
+            None,
+            false,
+            None,
+            SearchMode::Symbol,
+            false,
+            None,
+        )
+        .unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"room"));
         assert!(names.contains(&"ChatRoom"));
-        assert!(names.contains(&"roof"), "default (no min_confidence) must not drop any tier, got: {:?}", names);
+        assert!(
+            names.contains(&"roof"),
+            "default (no min_confidence) must not drop any tier, got: {:?}",
+            names
+        );
     }
 
     #[test]
     fn min_confidence_high_drops_medium_and_low_noise() {
         let db = setup_fixture();
-        let (results, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, Some("high")).unwrap();
+        let (results, _) = search_symbols(
+            &db,
+            "room",
+            &[],
+            None,
+            false,
+            None,
+            SearchMode::Symbol,
+            false,
+            Some("high"),
+        )
+        .unwrap();
         let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["room"], "min_confidence: \"high\" must keep only the exact match");
+        assert_eq!(
+            names,
+            vec!["room"],
+            "min_confidence: \"high\" must keep only the exact match"
+        );
     }
 
     #[test]
     fn min_confidence_filtering_does_not_change_result_count_when_unset() {
         let db = setup_fixture();
-        let (unfiltered, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, None).unwrap();
-        let (explicit_low, _) = search_symbols(&db, "room", &[], None, false, None, SearchMode::Symbol, false, Some("low")).unwrap();
-        assert_eq!(unfiltered.len(), explicit_low.len(), "every tier here is >= Low, so min_confidence: \"low\" should be a no-op");
+        let (unfiltered, _) = search_symbols(
+            &db,
+            "room",
+            &[],
+            None,
+            false,
+            None,
+            SearchMode::Symbol,
+            false,
+            None,
+        )
+        .unwrap();
+        let (explicit_low, _) = search_symbols(
+            &db,
+            "room",
+            &[],
+            None,
+            false,
+            None,
+            SearchMode::Symbol,
+            false,
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(
+            unfiltered.len(),
+            explicit_low.len(),
+            "every tier here is >= Low, so min_confidence: \"low\" should be a no-op"
+        );
     }
 }
 
@@ -945,15 +1182,21 @@ mod find_symbol_tests {
         db.init_schema().unwrap();
         let file_id = db.insert_file("handlers.ts", "h").unwrap();
         for name in ["GET", "GetStarted", "GetGraphHelpers"] {
-            db.insert_symbol(file_id, &graph::SymbolNode {
-                name: name.to_string(),
-                kind: "function".to_string(),
-                start_line: 1,
-                end_line: 1,
-                start_byte: 0,
-                end_byte: 0,
-                signature: None, attributes: Vec::new(), metadata: None,
-            }).unwrap();
+            db.insert_symbol(
+                file_id,
+                &graph::SymbolNode {
+                    name: name.to_string(),
+                    kind: "function".to_string(),
+                    start_line: 1,
+                    end_line: 1,
+                    start_byte: 0,
+                    end_byte: 0,
+                    signature: None,
+                    attributes: Vec::new(),
+                    metadata: None,
+                },
+            )
+            .unwrap();
         }
 
         // context_lines = 0 -> no disk reads needed for previews.
@@ -966,7 +1209,11 @@ mod find_symbol_tests {
         assert_eq!(results.first().map(|(n, ..)| n.as_str()), Some("GET"));
 
         // The classification rule the MCP handler applies: exactly one exact.
-        let exact: Vec<&str> = names.iter().filter(|n| n.to_lowercase() == "get").copied().collect();
+        let exact: Vec<&str> = names
+            .iter()
+            .filter(|n| n.to_lowercase() == "get")
+            .copied()
+            .collect();
         assert_eq!(exact, vec!["GET"], "only GET is an exact match");
     }
 }

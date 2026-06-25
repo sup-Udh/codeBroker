@@ -24,9 +24,7 @@ impl LanguageFrontend for TypeScriptFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let metadata = graph::models::FileMetadata {
-            metadata: None,
-        };
+        let metadata = graph::models::FileMetadata { metadata: None };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
         let imports = extract_ts_imports(&tree, source_code, language, false);
@@ -57,9 +55,7 @@ impl LanguageFrontend for TsxFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let metadata = graph::models::FileMetadata {
-            metadata: None,
-        };
+        let metadata = graph::models::FileMetadata { metadata: None };
 
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
         let imports = extract_ts_imports(&tree, source_code, language, true);
@@ -280,7 +276,8 @@ fn extract_ts_imports(
         (call_expression function: (identifier) @call_name)
         (call_expression function: (member_expression property: (property_identifier) @method_call))
         (member_expression property: (property_identifier) @member_access)
-    ");
+    ",
+    );
 
     let query = match Query::new(&language, &query_str) {
         Ok(q) => q,

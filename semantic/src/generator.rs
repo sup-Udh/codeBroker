@@ -72,9 +72,14 @@ impl<'a> SummaryGenerator<'a> {
         let source_code = fs::read_to_string(&abs_file_path).unwrap_or_default();
 
         // 3. Assemble the ContextResponseBuilder
-        let builder = query::context::ContextResponseBuilder::new(self.db, symbol_name, file_hint, query::response::ResponseProfile::Verbose)
-            .map_err(|e| e.to_string())?
-            .ok_or("Failed to assemble context")?;
+        let builder = query::context::ContextResponseBuilder::new(
+            self.db,
+            symbol_name,
+            file_hint,
+            query::response::ResponseProfile::Verbose,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or("Failed to assemble context")?;
         let graph_indexed = builder.graph_indexed;
 
         // 3.5. Fetch config files
@@ -92,7 +97,8 @@ impl<'a> SummaryGenerator<'a> {
         }
 
         let source_hash = calculate_hash(&source_code);
-        let context_json = serde_json::to_string(&builder.build_json().unwrap_or_default()).unwrap_or_default();
+        let context_json =
+            serde_json::to_string(&builder.build_json().unwrap_or_default()).unwrap_or_default();
         let context_hash = calculate_hash(&context_json);
         let model_name = self.provider.model_name();
 

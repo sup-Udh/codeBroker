@@ -4,7 +4,6 @@ pub fn build_prompt(
     json_context: &str,
     config_files_text: &str,
 ) -> String {
-
     // We construct a massive, highly structured string using the format! macro
     format!(
         "You are an expert AI software architect. Analyze the following code symbol and explain its purpose, its role in the system, and what impact modifying it would have based on its blast radius.

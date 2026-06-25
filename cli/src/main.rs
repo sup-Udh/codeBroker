@@ -238,10 +238,7 @@ fn main() {
                             if let Some((metadata, symbols, imports)) =
                                 frontend.parse_and_extract(&source_code, &file_path)
                             {
-                                let metadata_str = metadata
-                                    .metadata
-                                    .as_deref()
-                                    .unwrap_or("{}");
+                                let metadata_str = metadata.metadata.as_deref().unwrap_or("{}");
                                 let _ = db.update_file_metadata(file_id, Some(metadata_str));
 
                                 for symbol in symbols {
@@ -315,8 +312,6 @@ fn main() {
                         .enclosing_symbol_id(source_file_id, line_number)
                         .unwrap_or(None);
 
-
-
                     // Call edges are resolved case-sensitively and without the
                     // global bare-name fallback that the import path uses below,
                     // because that fallback fabricated phantom relationships for
@@ -383,15 +378,24 @@ fn main() {
                         }
                     }
 
-                    // Fallback to global symbol resolution
-                    let words: Vec<&str> =
-                        import_name.split(|c: char| !c.is_alphanumeric()).collect();
-                    for word in words {
-                        if word.is_empty() {
-                            continue;
-                        }
-
-                        // Local-First Edge Linking
+                    // Fallback to global symbol resolution.
+                    //
+                    // We resolve the import/reference name AS A WHOLE, case-
+                    // sensitively. The previous implementation split the name on
+                    // every non-alphanumeric boundary and matched each fragment
+                    // case-INSENSITIVELY, which manufactured phantom dependency
+                    // edges: `from ai.topology_understanding_agent import
+                    // topology_agent` split into `topology` + `agent`, and the
+                    // `topology` fragment then matched a `Topology` pydantic
+                    // class — so `analyze_topology` (which never references the
+                    // class) became a "dependent" of `Topology`, while the
+                    // function that genuinely takes a `topology: Topology`
+                    // parameter was missed entirely. A compound identifier is a
+                    // single name; sub-word substring matching across case is a
+                    // coincidence, not a reference.
+                    let word = import_name.as_str();
+                    if !word.is_empty() && !GENERIC_SYMBOL_NAMES.contains(&word) {
+                        // Local-first: a same-file definition of the exact name.
                         let mut local_stmt = db
                             .conn
                             .prepare(
@@ -401,35 +405,32 @@ fn main() {
                         if let Ok(local_symbol_id) = local_stmt
                             .query_row(params![source_file_id, word], |row| row.get::<_, i64>(0))
                         {
-                            let _ = db.insert_edge_attributed(
-                                source_file_id,
-                                src_sym,
-                                local_symbol_id,
-                                &edge_kind,
-                            );
-                            edges_created += 1;
-                            continue;
-                        }
-
-                        // A global, case-insensitive bare-name match is a guess —
-                        // for short, conventionally-reused names (HTTP route
-                        // handlers, generic factory functions) it fabricates an
-                        // edge from every file that happens to import a
-                        // same-named export from somewhere else entirely (e.g.
-                        // `createClient` from `@supabase/supabase-js` linking to
-                        // an unrelated local `createClient` helper). Skip it.
-                        if GENERIC_SYMBOL_NAMES.contains(&word) {
-                            continue;
-                        }
-
-                        if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
-                            let _ = db.insert_edge_attributed(
-                                source_file_id,
-                                src_sym,
-                                target_symbol_id,
-                                &edge_kind,
-                            );
-                            edges_created += 1;
+                            if src_sym != Some(local_symbol_id)
+                                && db
+                                    .insert_edge_attributed(
+                                        source_file_id,
+                                        src_sym,
+                                        local_symbol_id,
+                                        &edge_kind,
+                                    )
+                                    .is_ok()
+                            {
+                                edges_created += 1;
+                            }
+                        } else if let Ok(Some((target_symbol_id, _target_file_id))) =
+                            db.find_symbol_exact_with_file(word)
+                        {
+                            if db
+                                .insert_edge_attributed(
+                                    source_file_id,
+                                    src_sym,
+                                    target_symbol_id,
+                                    &edge_kind,
+                                )
+                                .is_ok()
+                            {
+                                edges_created += 1;
+                            }
                         }
                     }
                 }
@@ -438,6 +439,27 @@ fn main() {
                     "Linking complete. Created {} true graph edges.",
                     edges_created
                 );
+                // 4.4 Infer logical interaction edges (HTTP/WebSocket runtime
+                // boundaries) and then precompute graph features (pagerank,
+                // fan-in/out, communities, and the is_entrypoint flag). The
+                // full `init` previously skipped BOTH of these passes — they
+                // only ran on the incremental `reindex_paths` path — so a
+                // freshly-`init`ed repository had an empty `symbol_features`
+                // table: no entrypoints, no centrality, no interaction edges,
+                // until something happened to trigger an incremental reindex.
+                // That made `list_entrypoints`/`project_overview` report zero
+                // entrypoints on a clean index regardless of how routes were
+                // detected. Running them here makes a full index complete and
+                // identical in shape to the incremental path.
+                match indexer::interactions::infer_interactions(&db) {
+                    Ok(()) => println!("Inferred logical interaction edges."),
+                    Err(e) => println!("Warning: interaction inference failed: {}", e),
+                }
+                match indexer::features::extract_features(&db) {
+                    Ok(()) => println!("Computed graph features (pagerank, entrypoints, ...)."),
+                    Err(e) => println!("Warning: feature extraction failed: {}", e),
+                }
+
                 // 4.45 Tag symbols with domain concepts (auth, realtime,
                 // notifications, database, ...) independent of literal
                 // name/path matching, so natural-language discovery doesn't
@@ -550,7 +572,8 @@ fn main() {
             match query::context::ContextResponseBuilder::new(&db, symbol, None, profile) {
                 Ok(Some(builder)) => {
                     // This is the magic: We convert our rich graph structs into clean JSON
-                    let json_payload = serde_json::to_string_pretty(&builder.build_json().unwrap()).unwrap();
+                    let json_payload =
+                        serde_json::to_string_pretty(&builder.build_json().unwrap()).unwrap();
                     println!("{}", json_payload);
                 }
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
@@ -725,8 +748,6 @@ fn main() {
                     if !stats.skipped.is_empty() {
                         println!("Skipped (unreadable or unsupported): {:?}", stats.skipped);
                     }
-
-
 
                     // Re-tag concepts too: cheap full re-tag (see
                     // tag_concepts doc comment) so a changed file's symbols
@@ -1263,7 +1284,9 @@ mod call_edge_tests {
             end_line: 1,
             start_byte: 0,
             end_byte: 0,
-            signature: None, attributes: Vec::new(), metadata: None,
+            signature: None,
+            attributes: Vec::new(),
+            metadata: None,
         }
     }
 

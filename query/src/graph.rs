@@ -152,7 +152,7 @@ impl GraphResponse {
                 edges.push(serde_json::json!([e.source, e.target, e.kind]));
             }
         }
-        
+
         let mut map = serde_json::Map::new();
         map.insert("root".to_string(), serde_json::json!(self.root));
         map.insert("depth".to_string(), serde_json::json!(self.depth));
@@ -162,7 +162,7 @@ impl GraphResponse {
         }
         map.insert("nodes".to_string(), serde_json::json!(nodes));
         map.insert("edges".to_string(), serde_json::json!(edges));
-        
+
         serde_json::Value::Object(map)
     }
 }
@@ -174,6 +174,23 @@ pub fn explore_graph(
     direction: GraphDirection,
     max_nodes: usize,
 ) -> Result<GraphResponse> {
+    explore_graph_scoped(db, symbol_name, max_depth, direction, max_nodes, None)
+}
+
+/// Like `explore_graph`, but when `file_hint` is given, the root lookup is
+/// scoped to a file whose path contains that substring. Callers are expected
+/// to have already resolved `symbol_name` to a specific definition (e.g. via
+/// `resolver::resolve_symbol`) when the name is ambiguous repo-wide — without
+/// this, the old `LIMIT 1` root lookup silently picked whichever same-named
+/// symbol the DB returned first, with no way to aim at a specific one.
+pub fn explore_graph_scoped(
+    db: &Database,
+    symbol_name: &str,
+    max_depth: usize,
+    direction: GraphDirection,
+    max_nodes: usize,
+    file_hint: Option<&str>,
+) -> Result<GraphResponse> {
     let safe_depth = std::cmp::min(max_depth, 5);
     let max_nodes = max_nodes.clamp(1, 200);
     let max_edges = max_nodes * 3;
@@ -181,18 +198,20 @@ pub fn explore_graph(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    // Find the root symbol
+    // Find the root symbol, optionally scoped to file_hint.
     let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
-         FROM symbols 
-         JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name = ?1 LIMIT 1",
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path
+         FROM symbols
+         JOIN files ON symbols.file_id = files.id
+         WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
+         ORDER BY symbols.id LIMIT 1",
     )?;
 
     let root_info: Option<(i64, String, String, String)> = stmt
-        .query_row(rusqlite::params![symbol_name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
+        .query_row(
+            rusqlite::params![symbol_name, file_hint.unwrap_or("")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
         .optional()?;
 
     let root_info = match root_info {
@@ -631,7 +650,13 @@ pub fn detect_logical_edges(db: &Database) -> Result<usize> {
                 )
                 .ok();
             if let Some((route_symbol_id, _route_path)) = found {
-                db.insert_interaction_edge(file_id, Some(symbol_id), route_symbol_id, "{\"kind\":\"http\",\"method\":\"fetch\"}", 0.7)?;
+                db.insert_interaction_edge(
+                    file_id,
+                    Some(symbol_id),
+                    route_symbol_id,
+                    "{\"kind\":\"http\",\"method\":\"fetch\"}",
+                    0.7,
+                )?;
                 inserted += 1;
             }
         }
@@ -908,13 +933,16 @@ pub fn architectural_hotspots(
     // explore_graph, and dependency_cycles. Edges with a NULL
     // source_symbol_id (unattributable top-level imports) are excluded from
     // the outgoing count for the same reason they're excluded elsewhere.
+    let canonical = canonical_edges_sql_list();
     let mut incoming_map = std::collections::HashMap::new();
-    let mut in_stmt = db.conn.prepare(
+    let mut in_stmt = db.conn.prepare(&format!(
         "SELECT target_symbol_id, COUNT(*)
          FROM edges
          WHERE target_symbol_id IS NOT NULL
+         AND kind IN ({})
          GROUP BY target_symbol_id",
-    )?;
+        canonical
+    ))?;
 
     let mut in_rows = in_stmt.query([])?;
     while let Some(row) = in_rows.next()? {
@@ -924,12 +952,14 @@ pub fn architectural_hotspots(
     }
 
     let mut outgoing_map = std::collections::HashMap::new();
-    let mut out_stmt = db.conn.prepare(
+    let mut out_stmt = db.conn.prepare(&format!(
         "SELECT source_symbol_id, COUNT(*)
          FROM edges
          WHERE source_symbol_id IS NOT NULL
+         AND kind IN ({})
          GROUP BY source_symbol_id",
-    )?;
+        canonical
+    ))?;
 
     let mut out_rows = out_stmt.query([])?;
     while let Some(row) = out_rows.next()? {
@@ -1322,6 +1352,11 @@ pub struct GraphSubtreeResponse {
     /// Set when a single file supplies a large share of the returned nodes —
     /// see `dominant_file_warning` for why this matters for hub files.
     pub dominant_file_warning: Option<String>,
+    /// Explains why the achieved `depth` is lower than what was requested when
+    /// that's surprising — chiefly "the root symbol has no edges, so it's an
+    /// isolated node" — instead of silently returning `depth: 0` for a
+    /// `depth: 2` request and leaving the caller to guess why.
+    pub truncated_reason: Option<String>,
     pub nodes: Vec<SubtreeNode>,
     pub edges: Vec<SubtreeEdge>,
 }
@@ -1339,6 +1374,9 @@ impl GraphSubtreeResponse {
         }
         if let Some(warning) = &self.dominant_file_warning {
             md.push_str(&format!("**Warning: {}**\n", warning));
+        }
+        if let Some(reason) = &self.truncated_reason {
+            md.push_str(&format!("**Note: {}**\n", reason));
         }
 
         md.push_str("\n#### Nodes\n");
@@ -1371,12 +1409,17 @@ impl GraphSubtreeResponse {
         let mut edges = Vec::new();
         for e in &self.edges {
             if matches!(profile, crate::response::ResponseProfile::Verbose) {
-                edges.push(serde_json::json!([e.source, e.target, e.edge_kind, e.edge_type]));
+                edges.push(serde_json::json!([
+                    e.source,
+                    e.target,
+                    e.edge_kind,
+                    e.edge_type
+                ]));
             } else {
                 edges.push(serde_json::json!([e.source, e.target, e.edge_kind]));
             }
         }
-        
+
         let mut map = serde_json::Map::new();
         map.insert("root".to_string(), serde_json::json!(self.root));
         map.insert("depth".to_string(), serde_json::json!(self.depth));
@@ -1386,9 +1429,12 @@ impl GraphSubtreeResponse {
         if let Some(w) = &self.dominant_file_warning {
             map.insert("dominant_file_warning".to_string(), serde_json::json!(w));
         }
+        if let Some(r) = &self.truncated_reason {
+            map.insert("truncated_reason".to_string(), serde_json::json!(r));
+        }
         map.insert("nodes".to_string(), serde_json::json!(nodes));
         map.insert("edges".to_string(), serde_json::json!(edges));
-        
+
         serde_json::Value::Object(map)
     }
 }
@@ -1398,6 +1444,7 @@ pub fn graph_subtree(
     root_symbol: &str,
     depth: usize,
     max_nodes: Option<usize>,
+    file_hint: Option<&str>,
 ) -> Result<GraphSubtreeResponse> {
     let safe_depth = std::cmp::min(depth, 5);
     // Previously a fixed 500 with no escape hatch on hub symbols. Defaulting
@@ -1415,17 +1462,23 @@ pub fn graph_subtree(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
+    // When a file_hint is supplied, scope root resolution to it so an
+    // ambiguous name (e.g. `SOFTWARE_REGISTRY` defined in both
+    // software_registry.py and software_registry_v2.py) resolves to the
+    // intended one rather than silently picking whichever row sorts first.
     let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, symbols.name, symbols.kind, files.path 
-         FROM symbols 
-         JOIN files ON symbols.file_id = files.id 
-         WHERE symbols.name = ?1 LIMIT 1",
+        "SELECT symbols.id, symbols.name, symbols.kind, files.path
+         FROM symbols
+         JOIN files ON symbols.file_id = files.id
+         WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
+         ORDER BY symbols.id LIMIT 1",
     )?;
 
     let root_info: Option<(i64, String, String, String)> = stmt
-        .query_row(rusqlite::params![root_symbol], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
+        .query_row(
+            rusqlite::params![root_symbol, file_hint.unwrap_or("")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
         .optional()?;
 
     let root_info = match root_info {
@@ -1438,6 +1491,13 @@ pub fn graph_subtree(
                 edge_count: 0,
                 truncated: false,
                 dominant_file_warning: None,
+                truncated_reason: Some(format!(
+                    "No symbol named '{}' found{}.",
+                    root_symbol,
+                    file_hint
+                        .map(|h| format!(" in a file matching '{}'", h))
+                        .unwrap_or_default()
+                )),
                 nodes: vec![],
                 edges: vec![],
             });
@@ -1620,6 +1680,17 @@ pub fn graph_subtree(
 
     let dominant_file_warning = dominant_file_warning(nodes.iter().map(|n| n.file_path.as_str()));
 
+    // Explain a depth shortfall that would otherwise look like a bug: a root
+    // with no edges yields depth 0 even when a deeper depth was requested.
+    let truncated_reason = if edges.is_empty() && safe_depth > 0 {
+        Some(format!(
+            "Root symbol '{}' has no connected edges in the dependency graph (isolated node), so the requested depth {} could not be traversed (reached depth 0).",
+            root_symbol, safe_depth
+        ))
+    } else {
+        None
+    };
+
     Ok(GraphSubtreeResponse {
         root: root_symbol.to_string(),
         depth: actual_depth_reached,
@@ -1627,6 +1698,7 @@ pub fn graph_subtree(
         edge_count: edges.len(),
         truncated,
         dominant_file_warning,
+        truncated_reason,
         nodes,
         edges,
     })
@@ -1969,30 +2041,60 @@ mod dependency_cycles_tests {
     }
 }
 
+/// The edge kinds that represent a genuine code-level dependency ("X depends on
+/// / uses Y"), used uniformly by impact analysis, forward/reverse dependency
+/// listing, and hotspot scoring so those tools can never report divergent
+/// dependency counts for the same symbol. `type_ref` (a parameter/return type
+/// annotation) is included because annotating a parameter with a type is a real
+/// dependency on that type — the case impact-analysis previously missed.
+pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
+    "calls",
+    "imports",
+    "interaction",
+    "component_use",
+    "type_ref",
+];
+
+/// SQL fragment `'calls', 'imports', ...` for embedding the canonical set in an
+/// `IN (...)` clause. Centralised so every query filters on the identical set.
+pub fn canonical_edges_sql_list() -> String {
+    CANONICAL_DEPENDENCY_EDGES
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Unified symbol-level API for depth=1 outgoing edges.
 /// Filters out self-loops unless explicitly recursive (self-loop where source == target).
-/// If `edge_kind` is Some, filters by that edge kind.
+/// If `edge_kinds` is Some, filters by those edge kinds.
 pub fn get_outgoing_edges(
     db: &storage::Database,
     symbol_id: i64,
-    edge_kind: Option<&str>,
+    edge_kinds: Option<&[&str]>,
 ) -> Result<Vec<String>> {
-    let query = if let Some(kind) = edge_kind {
+    let query = if let Some(kinds) = edge_kinds {
+        let kinds_str = kinds
+            .iter()
+            .map(|k| format!("'{}'", k))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "SELECT symbols.name 
              FROM edges 
              JOIN symbols ON edges.target_symbol_id = symbols.id 
              WHERE edges.source_symbol_id = ?1 
-             AND edges.kind = '{}' 
+             AND edges.kind IN ({}) 
              AND edges.target_symbol_id != edges.source_symbol_id",
-            kind
+            kinds_str
         )
     } else {
         "SELECT symbols.name 
          FROM edges 
          JOIN symbols ON edges.target_symbol_id = symbols.id 
          WHERE edges.source_symbol_id = ?1 
-         AND edges.target_symbol_id != edges.source_symbol_id".to_string()
+         AND edges.target_symbol_id != edges.source_symbol_id"
+            .to_string()
     };
 
     let mut stmt = db.conn.prepare(&query)?;
@@ -2008,22 +2110,27 @@ pub fn get_outgoing_edges(
 
 /// Unified symbol-level API for depth=1 incoming edges.
 /// Filters out self-loops.
-/// If `edge_kind` is Some, filters by that edge kind.
+/// If `edge_kinds` is Some, filters by those edge kinds.
 pub fn get_incoming_edges(
     db: &storage::Database,
     symbol_id: i64,
-    edge_kind: Option<&str>,
+    edge_kinds: Option<&[&str]>,
 ) -> Result<Vec<String>> {
-    let query = if let Some(kind) = edge_kind {
+    let query = if let Some(kinds) = edge_kinds {
+        let kinds_str = kinds
+            .iter()
+            .map(|k| format!("'{}'", k))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             "SELECT symbols.name 
              FROM edges 
              JOIN symbols ON edges.source_symbol_id = symbols.id 
              WHERE edges.target_symbol_id = ?1 
              AND edges.source_symbol_id IS NOT NULL 
-             AND edges.kind = '{}' 
+             AND edges.kind IN ({}) 
              AND edges.source_symbol_id != edges.target_symbol_id",
-            kind
+            kinds_str
         )
     } else {
         "SELECT symbols.name 
@@ -2031,7 +2138,8 @@ pub fn get_incoming_edges(
          JOIN symbols ON edges.source_symbol_id = symbols.id 
          WHERE edges.target_symbol_id = ?1 
          AND edges.source_symbol_id IS NOT NULL 
-         AND edges.source_symbol_id != edges.target_symbol_id".to_string()
+         AND edges.source_symbol_id != edges.target_symbol_id"
+            .to_string()
     };
 
     let mut stmt = db.conn.prepare(&query)?;

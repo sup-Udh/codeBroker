@@ -1,6 +1,6 @@
-use storage::Database;
 use query::context::ContextResponseBuilder;
 use query::response::ResponseProfile;
+use storage::Database;
 
 /// Assembles context for `symbol`, transparently incrementally reindexing
 /// the defining file and re-assembling once if the first assembly reports
@@ -82,7 +82,9 @@ mod tests {
             "export function greet(name) {\n  return `Hello, ${name}`;\n}\n\nfunction extra() {}\n";
         std::fs::write(project_root.join("greet.ts"), edited_source).unwrap();
 
-        let stale_check = ContextResponseBuilder::new(&db, "greet", None, ResponseProfile::Verbose).unwrap().unwrap();
+        let stale_check = ContextResponseBuilder::new(&db, "greet", None, ResponseProfile::Verbose)
+            .unwrap()
+            .unwrap();
         assert!(
             stale_check.stale,
             "expected the unreindexed edit to be flagged stale"

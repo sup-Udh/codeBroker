@@ -46,7 +46,7 @@ pub fn list_entrypoints(
     let mut stmt = db
         .conn
         .prepare(
-            "SELECT symbols.id, symbols.name, symbols.kind, files.path 
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.attributes
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              JOIN symbol_features f ON symbols.id = f.symbol_id
@@ -58,11 +58,12 @@ pub fn list_entrypoints(
     let mut routes = Vec::new();
     let mut pages = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let id: i64 = row.get(0).unwrap_or(0);
+        let _id: i64 = row.get(0).unwrap_or(0);
         let name: String = row.get(1).unwrap_or_default();
         let kind: String = row.get(2).unwrap_or_default();
         let path: String = row.get(3).unwrap_or_default();
-        
+        let attributes: Option<String> = row.get(4).unwrap_or(None);
+
         if let Some(scope) = path_scope {
             if !path.contains(scope) {
                 continue;
@@ -74,10 +75,16 @@ pub fn list_entrypoints(
             kind: kind.clone(),
             file_path: db.resolve_path(&path),
         };
-        if kind == "page" || kind == "layout" || name.to_lowercase().contains("page") {
-            pages.push(entry);
-        } else {
-            routes.push(entry);
+        // Route vs page is decided by the same shared classifier that set
+        // is_entrypoint, so the split can never disagree with detection.
+        match storage::entrypoints::classify_entrypoint_json(
+            &name,
+            &kind,
+            &path,
+            attributes.as_deref(),
+        ) {
+            Some(storage::entrypoints::EntrypointClass::Page) => pages.push(entry),
+            _ => routes.push(entry),
         }
     }
 
@@ -106,12 +113,21 @@ pub fn subsystem_communication(
     let stats_a = discover_subsystem(db, a, &[], None)?;
     let stats_b = discover_subsystem(db, b, &[], None)?;
 
-    let symbol_ids_for = |files: &[String]| -> Result<HashSet<i64>, String> {
+    // Resolve each subsystem's files to file ids. We key communication on FILE
+    // membership (source_file_id / target symbol's file_id), exactly as
+    // `discover_subsystem`'s `consumers`/`dependencies` do — previously this
+    // function only counted edges whose `source_symbol_id` was non-NULL and
+    // resolved to a symbol, so file-level edges (e.g. a top-level
+    // `import`/`fetch` from a frontend component into an orchestrator symbol,
+    // whose enclosing symbol is NULL) were invisible here while still showing
+    // up in `subsystem_stats(...).consumers`. The two tools now agree on
+    // whether an A<->B edge exists because they read the same edge basis.
+    let file_ids_for = |files: &[String]| -> Result<HashSet<i64>, String> {
         let mut ids = HashSet::new();
         for f in files {
             let mut stmt = db
                 .conn
-                .prepare("SELECT id FROM symbols WHERE file_id IN (SELECT id FROM files WHERE path = ?1)")
+                .prepare("SELECT id FROM files WHERE path = ?1")
                 .map_err(|e| e.to_string())?;
             let mut rows = stmt
                 .query(rusqlite::params![f])
@@ -123,18 +139,21 @@ pub fn subsystem_communication(
         Ok(ids)
     };
 
-    let ids_a = symbol_ids_for(&stats_a.files)?;
-    let ids_b = symbol_ids_for(&stats_b.files)?;
+    let files_a = file_ids_for(&stats_a.files)?;
+    let files_b = file_ids_for(&stats_b.files)?;
 
+    // Every edge with a target symbol, carrying both the source file and the
+    // target symbol's file so we can classify by file membership. The source
+    // label falls back to the source file's basename when the edge has no
+    // enclosing symbol (NULL source_symbol_id).
     let mut stmt = db
         .conn
         .prepare(
-            "SELECT edges.source_symbol_id, edges.target_symbol_id,
-                    src.name, tgt.name
+            "SELECT edges.source_file_id, tgt.file_id, src.name, tgt.name, srcf.path
              FROM edges
-             JOIN symbols src ON edges.source_symbol_id = src.id
              JOIN symbols tgt ON edges.target_symbol_id = tgt.id
-             WHERE edges.source_symbol_id IS NOT NULL",
+             JOIN files srcf ON edges.source_file_id = srcf.id
+             LEFT JOIN symbols src ON edges.source_symbol_id = src.id",
         )
         .map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
@@ -142,16 +161,28 @@ pub fn subsystem_communication(
     let mut a_to_b: Vec<(String, String)> = Vec::new();
     let mut b_to_a: Vec<(String, String)> = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let src_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let tgt_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-        let src_name: String = row.get(2).map_err(|e| e.to_string())?;
-        let tgt_name: String = row.get(3).map_err(|e| e.to_string())?;
-
-        if ids_a.contains(&src_id) && ids_b.contains(&tgt_id) {
-            a_to_b.push((src_name.clone(), tgt_name.clone()));
+        let src_file: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let tgt_file: i64 = row.get(1).map_err(|e| e.to_string())?;
+        // Edges entirely within one file aren't cross-subsystem communication.
+        if src_file == tgt_file {
+            continue;
         }
-        if ids_b.contains(&src_id) && ids_a.contains(&tgt_id) {
-            b_to_a.push((src_name, tgt_name));
+        let src_name: Option<String> = row.get(2).map_err(|e| e.to_string())?;
+        let tgt_name: String = row.get(3).map_err(|e| e.to_string())?;
+        let src_path: String = row.get(4).map_err(|e| e.to_string())?;
+        let src_label = src_name.unwrap_or_else(|| {
+            std::path::Path::new(&src_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&src_path)
+                .to_string()
+        });
+
+        if files_a.contains(&src_file) && files_b.contains(&tgt_file) {
+            a_to_b.push((src_label.clone(), tgt_name.clone()));
+        }
+        if files_b.contains(&src_file) && files_a.contains(&tgt_file) {
+            b_to_a.push((src_label, tgt_name));
         }
     }
 
@@ -204,7 +235,8 @@ pub fn discover_subsystem(
         if r.kind == "file" || r.kind == "text_match" {
             continue;
         }
-        if r.score >= 100 || r.confidence.starts_with("High") || r.confidence.starts_with("Medium") {
+        if r.score >= 100 || r.confidence.starts_with("High") || r.confidence.starts_with("Medium")
+        {
             let mut stmt = db
                 .conn
                 .prepare(
@@ -213,7 +245,9 @@ pub fn discover_subsystem(
                      WHERE symbols.name = ?1 AND symbols.kind = ?2",
                 )
                 .map_err(|e| e.to_string())?;
-            let mut rows = stmt.query(rusqlite::params![r.name, r.kind]).map_err(|e| e.to_string())?;
+            let mut rows = stmt
+                .query(rusqlite::params![r.name, r.kind])
+                .map_err(|e| e.to_string())?;
             while let Ok(Some(row)) = rows.next() {
                 let s_id: i64 = row.get(0).map_err(|e| e.to_string())?;
                 let f_id: i64 = row.get(1).map_err(|e| e.to_string())?;
@@ -239,18 +273,23 @@ pub fn discover_subsystem(
     // 2. Graph-Based Expansion (Cohesion-Driven Localized Traversal)
     // Expand from seeds to adjacent nodes that are tightly coupled to the subsystem.
     let mut current_frontier = matched_symbol_ids.clone();
-    
+
     // We expand for a maximum of 3 hops to prevent unbounded sprawling
     for _hop in 0..3 {
         let mut next_candidates = HashSet::new();
-        
+
         // Gather all immediate neighbors of the current frontier
         for &s_id in &current_frontier {
-            if let Ok(mut stmt) = db.conn.prepare("SELECT target_symbol_id FROM edges WHERE source_symbol_id = ?1") {
+            if let Ok(mut stmt) = db
+                .conn
+                .prepare("SELECT target_symbol_id FROM edges WHERE source_symbol_id = ?1")
+            {
                 if let Ok(mut rows) = stmt.query(rusqlite::params![s_id]) {
                     while let Ok(Some(row)) = rows.next() {
                         let tgt: i64 = row.get(0).unwrap();
-                        if !matched_symbol_ids.contains(&tgt) { next_candidates.insert(tgt); }
+                        if !matched_symbol_ids.contains(&tgt) {
+                            next_candidates.insert(tgt);
+                        }
                     }
                 }
             }
@@ -263,49 +302,69 @@ pub fn discover_subsystem(
                 }
             }
         }
-        
+
         if next_candidates.is_empty() {
             break;
         }
 
-        let matched_list = matched_symbol_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
-        let query_str = format!("SELECT COUNT(*) FROM edges WHERE (source_symbol_id = ?1 AND target_symbol_id IN ({})) OR (source_symbol_id IN ({}) AND target_symbol_id = ?1)", matched_list, matched_list);
-        
+        let matched_list = matched_symbol_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str = format!(
+            "SELECT COUNT(*) FROM edges WHERE (source_symbol_id = ?1 AND target_symbol_id IN ({})) OR (source_symbol_id IN ({}) AND target_symbol_id = ?1)",
+            matched_list, matched_list
+        );
+
         let mut next_frontier = HashSet::new();
         let mut added_any = false;
-        
+
         for &cand_id in &next_candidates {
-            let cohesive_edges: i64 = db.conn.query_row(&query_str, rusqlite::params![cand_id], |r| r.get(0)).unwrap_or(0);
-            
-            let total_edges: i64 = db.conn.query_row(
-                "SELECT fan_in + fan_out FROM symbol_features WHERE symbol_id = ?1",
-                rusqlite::params![cand_id],
-                |r| r.get(0)
-            ).unwrap_or(1);
-            
-            let is_local: bool = db.conn.query_row(
-                "SELECT is_local FROM symbol_features WHERE symbol_id = ?1",
-                rusqlite::params![cand_id],
-                |r| r.get(0)
-            ).unwrap_or(false);
+            let cohesive_edges: i64 = db
+                .conn
+                .query_row(&query_str, rusqlite::params![cand_id], |r| r.get(0))
+                .unwrap_or(0);
+
+            let total_edges: i64 = db
+                .conn
+                .query_row(
+                    "SELECT fan_in + fan_out FROM symbol_features WHERE symbol_id = ?1",
+                    rusqlite::params![cand_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(1);
+
+            let is_local: bool = db
+                .conn
+                .query_row(
+                    "SELECT is_local FROM symbol_features WHERE symbol_id = ?1",
+                    rusqlite::params![cand_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
 
             if is_local {
                 continue; // Skip pure local variables from expanding the subsystem boundaries
             }
-            
+
             let cohesion_ratio = cohesive_edges as f64 / (total_edges as f64).max(1.0);
-            
+
             // If the candidate commits at least 30% of its connectivity to the subsystem, OR it's deeply connected (>2 edges)
             if cohesion_ratio >= 0.3 || cohesive_edges >= 3 {
                 matched_symbol_ids.insert(cand_id);
                 next_frontier.insert(cand_id);
                 added_any = true;
-                if let Ok(f_id) = db.conn.query_row("SELECT file_id FROM symbols WHERE id = ?1", rusqlite::params![cand_id], |r| r.get::<_, i64>(0)) {
+                if let Ok(f_id) = db.conn.query_row(
+                    "SELECT file_id FROM symbols WHERE id = ?1",
+                    rusqlite::params![cand_id],
+                    |r| r.get::<_, i64>(0),
+                ) {
                     matched_file_ids.insert(f_id);
                 }
             }
         }
-        
+
         if !added_any {
             break; // Cohesion dropped, subsystem boundary found
         }
@@ -319,10 +378,19 @@ pub fn discover_subsystem(
     let mut page_entrypoints = Vec::new();
 
     for &s_id in &matched_symbol_ids {
-        if let Ok((s_name, kind, f_id)) = db.conn.query_row(
-            "SELECT name, kind, file_id FROM symbols WHERE id = ?1",
+        if let Ok((s_name, kind, f_id, attributes, path)) = db.conn.query_row(
+            "SELECT symbols.name, symbols.kind, symbols.file_id, symbols.attributes, files.path
+             FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.id = ?1",
             rusqlite::params![s_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            },
         ) {
             symbols.push(s_name.clone());
             if let Ok(Some(is_ep)) = db.conn.query_row(
@@ -331,10 +399,18 @@ pub fn discover_subsystem(
                 |r| r.get::<_, Option<bool>>(0),
             ) {
                 if is_ep {
-                    if kind == "page" || kind == "layout" || s_name.to_lowercase().contains("page") {
-                        page_entrypoints.push(s_name.clone());
-                    } else {
-                        routes.push(s_name.clone());
+                    // Same shared classifier as detection — route/page split
+                    // is always consistent across tools.
+                    match storage::entrypoints::classify_entrypoint_json(
+                        &s_name,
+                        &kind,
+                        &path,
+                        attributes.as_deref(),
+                    ) {
+                        Some(storage::entrypoints::EntrypointClass::Page) => {
+                            page_entrypoints.push(s_name.clone())
+                        }
+                        _ => routes.push(s_name.clone()),
                     }
                 }
             }
@@ -359,7 +435,9 @@ pub fn discover_subsystem(
                  WHERE edges.source_file_id = ?1",
             )
             .map_err(|e| e.to_string())?;
-        let mut edge_rows = edge_stmt.query(rusqlite::params![f_id]).map_err(|e| e.to_string())?;
+        let mut edge_rows = edge_stmt
+            .query(rusqlite::params![f_id])
+            .map_err(|e| e.to_string())?;
         while let Ok(Some(row)) = edge_rows.next() {
             let s_name: String = row.get(0).map_err(|e| e.to_string())?;
             let s_id: i64 = row.get(1).map_err(|e| e.to_string())?;
@@ -380,7 +458,9 @@ pub fn discover_subsystem(
                  WHERE edges.target_symbol_id = ?1",
             )
             .map_err(|e| e.to_string())?;
-        let mut edge_rows = edge_stmt.query(rusqlite::params![s_id]).map_err(|e| e.to_string())?;
+        let mut edge_rows = edge_stmt
+            .query(rusqlite::params![s_id])
+            .map_err(|e| e.to_string())?;
         while let Ok(Some(row)) = edge_rows.next() {
             let f_path: String = row.get(0).map_err(|e| e.to_string())?;
             let f_id: i64 = row.get(1).map_err(|e| e.to_string())?;

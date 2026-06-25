@@ -1,19 +1,24 @@
+use std::collections::HashMap;
 use storage::Database;
-use std::collections::{HashMap, HashSet};
 
 pub fn extract_features(db: &Database) -> Result<(), String> {
     // We compute:
     // pagerank, fan_in, fan_out, interaction_count, community_id
     // and composable booleans.
 
-    // 1. Fetch all symbols
-    let mut stmt = db.conn.prepare("SELECT id, kind, name, attributes FROM symbols").map_err(|e| e.to_string())?;
+    // 1. Fetch all symbols (joined to their file path so entrypoint
+    //    classification can see Next.js-style file conventions, not just the
+    //    symbol kind/decorators).
+    let mut stmt = db
+        .conn
+        .prepare(
+            "SELECT symbols.id, symbols.kind, symbols.name, symbols.attributes, files.path
+         FROM symbols JOIN files ON symbols.file_id = files.id",
+        )
+        .map_err(|e| e.to_string())?;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    
+
     struct SymInfo {
-        kind: String,
-        name: String,
-        attributes: Option<String>,
         fan_in: i64,
         fan_out: i64,
         interaction_count: i64,
@@ -33,30 +38,67 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
         let kind: String = row.get(1).unwrap();
         let name: String = row.get(2).unwrap();
         let attributes: Option<String> = row.get(3).unwrap_or(None);
+        let path: String = row.get(4).unwrap_or_default();
 
         let kind_lower = kind.to_lowercase();
-        let is_callable = ["function", "method", "route", "endpoint", "lambda", "macro"].contains(&kind_lower.as_str());
-        let is_type = ["class", "interface", "struct", "enum", "type"].contains(&kind_lower.as_str());
-        let is_local = ["variable", "local", "parameter", "field", "property", "import"].contains(&kind_lower.as_str());
+        let is_callable = ["function", "method", "route", "endpoint", "lambda", "macro"]
+            .contains(&kind_lower.as_str());
+        let is_type =
+            ["class", "interface", "struct", "enum", "type"].contains(&kind_lower.as_str());
+        let is_local = [
+            "variable",
+            "local",
+            "parameter",
+            "field",
+            "property",
+            "import",
+        ]
+        .contains(&kind_lower.as_str());
         let is_constant = ["constant"].contains(&kind_lower.as_str());
-        let is_entrypoint = ["route", "endpoint", "page", "layout"].contains(&kind_lower.as_str());
-        
+        // Entrypoint detection is delegated to the single shared classifier
+        // (storage::entrypoints) so every tool agrees on what an entrypoint is.
+        // It recognises decorator routes (FastAPI/Flask), explicit
+        // route/page/layout kinds, and Next.js file conventions — replacing the
+        // old `kind in [...]` + naive `contains("@")` heuristic that missed
+        // both `@app.websocket` routes and `app/**/page.tsx` pages.
+        let is_entrypoint = storage::entrypoints::classify_entrypoint_json(
+            &name,
+            &kind,
+            &path,
+            attributes.as_deref(),
+        )
+        .is_some();
+
         // Very basic approximations
-        let is_exported = !name.starts_with('_'); 
+        let is_exported = !name.starts_with('_');
         let is_public = !name.starts_with('_');
         let is_generated = name.contains("generated");
 
-        symbols.insert(id, SymInfo {
-            kind, name, attributes,
-            fan_in: 0, fan_out: 0, interaction_count: 0,
-            is_entrypoint, is_exported, is_public, is_callable, is_type, is_constant, is_local, is_generated
-        });
+        symbols.insert(
+            id,
+            SymInfo {
+                fan_in: 0,
+                fan_out: 0,
+                interaction_count: 0,
+                is_entrypoint,
+                is_exported,
+                is_public,
+                is_callable,
+                is_type,
+                is_constant,
+                is_local,
+                is_generated,
+            },
+        );
     }
 
     // 2. Compute fan_in, fan_out, interactions, and collect edges for PageRank/Community
-    let mut edge_stmt = db.conn.prepare("SELECT source_symbol_id, target_symbol_id, kind FROM edges").map_err(|e| e.to_string())?;
+    let mut edge_stmt = db
+        .conn
+        .prepare("SELECT source_symbol_id, target_symbol_id, kind FROM edges")
+        .map_err(|e| e.to_string())?;
     let mut edge_rows = edge_stmt.query([]).map_err(|e| e.to_string())?;
-    
+
     let mut out_edges: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut in_edges: HashMap<i64, Vec<i64>> = HashMap::new();
 
@@ -84,16 +126,6 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
         }
     }
 
-    // Adjust entrypoints (if something is callable and has no internal callers but has interaction metadata)
-    for (id, sym) in symbols.iter_mut() {
-        if sym.is_callable && sym.fan_in == 0 && sym.attributes.is_some() {
-            let attrs = sym.attributes.as_ref().unwrap();
-            if attrs.contains("@") { // naive decorator check
-                sym.is_entrypoint = true;
-            }
-        }
-    }
-
     // 3. Compute PageRank
     let mut pagerank: HashMap<i64, f64> = symbols.keys().map(|&k| (k, 1.0)).collect();
     let damping = 0.85;
@@ -115,7 +147,8 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
 
     // 4. Compute Communities (Label Propagation)
     let mut community: HashMap<i64, i64> = symbols.keys().map(|&k| (k, k)).collect();
-    for _ in 0..5 { // max iterations
+    for _ in 0..5 {
+        // max iterations
         let mut changes = false;
         for &id in symbols.keys() {
             let mut label_counts = HashMap::new();
@@ -132,14 +165,20 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
                 }
             }
             if !label_counts.is_empty() {
-                let best_label = label_counts.into_iter().max_by_key(|&(_, count)| count).unwrap().0;
+                let best_label = label_counts
+                    .into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap()
+                    .0;
                 if community[&id] != best_label {
                     community.insert(id, best_label);
                     changes = true;
                 }
             }
         }
-        if !changes { break; }
+        if !changes {
+            break;
+        }
     }
 
     // 5. Update SQLite Database

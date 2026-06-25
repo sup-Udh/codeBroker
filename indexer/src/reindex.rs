@@ -200,17 +200,22 @@ pub fn reindex_paths(
             continue;
         }
 
-        let words: Vec<&str> = import_name.split(|c: char| !c.is_alphanumeric()).collect();
-        for word in words {
-            if word.is_empty() {
-                continue;
-            }
-            // See GENERIC_SYMBOL_NAMES: a global bare-name match against these
-            // is a coincidence, not a real reference.
-            if GENERIC_SYMBOL_NAMES.contains(&word) {
-                continue;
-            }
-            if let Ok(Some(target_symbol_id)) = db.find_symbol_id_by_name(word) {
+        // Resolve the import/reference name AS A WHOLE, case-sensitively. The
+        // old word-split + case-insensitive match fabricated phantom edges
+        // (e.g. `topology_agent` -> the `Topology` class); see the matching
+        // comment in cli's full linker. A compound identifier is one name.
+        let word = import_name.as_str();
+        if !word.is_empty() && !GENERIC_SYMBOL_NAMES.contains(&word) {
+            if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, word) {
+                if src_sym != Some(local_id)
+                    && db
+                        .insert_edge_attributed(source_file_id, src_sym, local_id, &edge_kind)
+                        .is_ok()
+                {
+                    stats.edges_created += 1;
+                }
+            } else if let Ok(Some((target_symbol_id, _tfid))) = db.find_symbol_exact_with_file(word)
+            {
                 if db
                     .insert_edge_attributed(source_file_id, src_sym, target_symbol_id, &edge_kind)
                     .is_ok()
@@ -312,6 +317,67 @@ mod tests {
             edge_count_into(&db, "timeAgo") > 0,
             "incrementally reindexing only the helper's file must not lose the untouched \
              consumer's edge into it"
+        );
+
+        std::fs::remove_dir_all(&project_root).ok();
+    }
+
+    // Regression for the impact-analysis inversion bug: a class used as a type
+    // annotation (`def simulate(topology: Topology)`) must register the
+    // annotating function as its dependent, while a function that merely has a
+    // same-named parameter with a different annotation
+    // (`def analyze(topology: dict)`), or that imports a compound name
+    // containing the class name as a sub-word (`topology_agent`), must NOT.
+    // Previously the linker word-split + case-insensitive matching made the
+    // wrong function the dependent and dropped the real one.
+    #[test]
+    fn type_annotation_drives_dependency_not_param_name_or_subword() {
+        let unique = format!(
+            "codebroker_test_typeref_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(project_root.join(".codebroker")).unwrap();
+
+        write(
+            &project_root,
+            "main.py",
+            "class Topology:\n    pass\n\n\
+             def simulate(topology: Topology):\n    return topology\n\n\
+             def analyze(topology: dict):\n    from ai.topology_agent import topology_agent\n    return topology_agent\n",
+        );
+
+        let db_path = project_root.join(".codebroker").join("codebroker.db");
+        let db = Database::new(db_path.to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+        let root = project_root.to_str().unwrap();
+        reindex_paths(&db, root, &["main.py".to_string()]).unwrap();
+
+        // Names of symbols that have an edge INTO Topology.
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT s.name FROM edges e JOIN symbols s ON e.source_symbol_id = s.id
+                 WHERE e.target_symbol_id = (SELECT id FROM symbols WHERE name='Topology')",
+            )
+            .unwrap();
+        let dependents: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            dependents.contains(&"simulate".to_string()),
+            "simulate(topology: Topology) must depend on Topology, got {dependents:?}"
+        );
+        assert!(
+            !dependents.contains(&"analyze".to_string()),
+            "analyze(topology: dict) must NOT be a phantom dependent of Topology, got {dependents:?}"
         );
 
         std::fs::remove_dir_all(&project_root).ok();

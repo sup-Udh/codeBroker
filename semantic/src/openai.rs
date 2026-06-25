@@ -23,15 +23,31 @@ pub struct OpenAiProvider {
     model_id: String,
     consecutive_failures: AtomicUsize,
     cooldown_until: AtomicI64,
+    client: Client,
 }
 
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Self {
+        // Force HTTP/1.1. reqwest negotiates HTTP/2 via TLS ALPN by default,
+        // and on networks behind certain transparent proxies/middleboxes the
+        // TLS handshake and POST request both complete fine but the HTTP/2
+        // response never arrives — the request hangs until timeout with 0
+        // bytes received (reproduced with plain `curl` against this exact
+        // endpoint: default curl over HTTP/2 hangs, `curl --http1.1`
+        // succeeds immediately). HTTP/1.1 avoids that failure mode entirely
+        // and OpenAI's API works identically over it.
+        let client = Client::builder()
+            .http1_only()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
             api_key,
             model_id: DEFAULT_MODEL.to_string(),
             consecutive_failures: AtomicUsize::new(0),
             cooldown_until: AtomicI64::new(0),
+            client,
         }
     }
 
@@ -94,13 +110,10 @@ impl OpenAiProvider {
             "temperature": temperature
         });
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| format!("Failed to build client: {}", e))?;
-
-        let response = match client
+        let response = match self
+            .client
             .post(url)
+            .timeout(Duration::from_secs(timeout_secs))
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()
@@ -184,13 +197,10 @@ impl OpenAiProvider {
             "input": texts,
         });
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("Failed to build client: {}", e))?;
-
-        let response = match client
+        let response = match self
+            .client
             .post(url)
+            .timeout(Duration::from_secs(60))
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()

@@ -1,9 +1,9 @@
-use storage::Database;
-use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
+use storage::Database;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DuplicateMember {
@@ -27,16 +27,29 @@ pub struct DuplicateLogicReport {
     pub groups: Vec<DuplicateGroup>,
 }
 
-fn normalize(source: &str, file_path: &str) -> String {
-    let extension = std::path::Path::new(file_path).extension().and_then(|s| s.to_str()).unwrap_or("");
-    if let Some(ast_normalized) = parser::normalize::normalize_snippet(source, extension) {
-        ast_normalized
+fn normalize(source: &str, file_path: &str) -> Option<(String, usize)> {
+    let extension = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if let Some((ast_normalized, count)) = parser::normalize::normalize_snippet(source, extension) {
+        Some((ast_normalized, count))
     } else {
-        // Fallback for unsupported languages
-        source.split_whitespace().collect::<Vec<_>>().join(" ")
+        // Fallback for unsupported languages or rejected boilerplates
+        let fallback = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        if fallback.is_empty() {
+            None
+        } else {
+            // Very rough approximation of complexity if no AST available
+            Some((fallback.clone(), fallback.split_whitespace().count()))
+        }
     }
 }
-pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope: Option<&str>) -> Result<DuplicateLogicReport, String> {
+pub fn find_duplicate_logic(
+    db: &Database,
+    min_normalized_len: usize,
+    path_scope: Option<&str>,
+) -> Result<DuplicateLogicReport, String> {
     let mut stmt = db.conn.prepare(
         "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte
          FROM symbols
@@ -81,8 +94,26 @@ pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope
         }
 
         let source = String::from_utf8_lossy(&content[s..e]).to_string();
-        let normalized = normalize(&source, &abs_path);
-        if normalized.len() < min_normalized_len {
+
+        // We repurpose min_normalized_len as the minimum AST node count (e.g. 15 nodes)
+        // rather than string length
+        let (normalized, node_count) = match normalize(&source, &abs_path) {
+            Some(res) => res,
+            None => continue,
+        };
+
+        // 10 nodes is a good minimum floor to avoid trivial single lines,
+        // and we use the provided min_normalized_len parameter which was originally string length
+        // but now we'll compare it dynamically or just use a fixed floor.
+        // Actually, let's treat min_normalized_len = 15 for AST node counts if the caller passes something reasonable,
+        // or just use 15 directly if the caller passes 150 (the old string length).
+        let effective_min_nodes = if min_normalized_len > 100 {
+            15
+        } else {
+            min_normalized_len
+        };
+
+        if node_count < effective_min_nodes {
             continue;
         }
 
@@ -92,7 +123,9 @@ pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope
         normalized.hash(&mut hasher);
         let hash = hasher.finish();
 
-        let entry = groups.entry(hash).or_insert_with(|| (normalized.len(), Vec::new(), HashSet::new()));
+        let entry = groups
+            .entry(hash)
+            .or_insert_with(|| (node_count, Vec::new(), HashSet::new()));
         entry.2.insert(abs_path.clone());
         entry.1.push(DuplicateMember {
             symbol_name: name,
@@ -106,7 +139,10 @@ pub fn find_duplicate_logic(db: &Database, min_normalized_len: usize, path_scope
     let mut result_groups: Vec<DuplicateGroup> = groups
         .into_iter()
         .filter(|(_, (_, members, files))| members.len() > 1 && files.len() > 1)
-        .map(|(_, (normalized_length, members, _))| DuplicateGroup { normalized_length, members })
+        .map(|(_, (normalized_length, members, _))| DuplicateGroup {
+            normalized_length,
+            members,
+        })
         .collect();
 
     result_groups.sort_by(|a, b| b.normalized_length.cmp(&a.normalized_length));

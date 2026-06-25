@@ -3,6 +3,6 @@ pub mod context;
 pub mod duplicates;
 pub mod engine;
 pub mod graph;
+pub mod response;
 pub mod retrieval;
 pub mod subsystem;
-pub mod response;

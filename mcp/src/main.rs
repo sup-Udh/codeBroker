@@ -101,7 +101,6 @@ fn use_cheap_impact_path(
     total_dependencies < risk_threshold || !has_openai_key
 }
 
-
 /// find_symbol_candidates/search_symbols resolve paths to absolute (via
 /// db.resolve_path) before returning, but read_symbol_source_scoped's
 /// file_hint is matched against the RAW relative path stored in the `files`
@@ -115,7 +114,6 @@ fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str 
         .strip_prefix(prefix.as_str())
         .unwrap_or(absolute_path)
 }
-
 
 /// Orchestrates the one-shot "Context Capsule" workflow: discover the 1-3
 /// pivot symbols matching `query`, fetch their full implementation, expand
@@ -145,7 +143,8 @@ fn generate_context_capsule(
         query::engine::SearchMode::Both,
         false,
         None,
-    ).unwrap_or_else(|_| (vec![], None));
+    )
+    .unwrap_or_else(|_| (vec![], None));
 
     results.retain(|r| r.kind != "file" && r.kind != "text_match");
 
@@ -153,22 +152,33 @@ fn generate_context_capsule(
         let mut words = query.split_whitespace();
         words.any(|w| query::concepts::concepts_matching_term(w).is_empty() == false)
     };
-    
-    let highest_conf = results.first().map(|r| r.confidence.as_str()).unwrap_or("Low");
-    if highest_conf.starts_with("Low") || highest_conf.starts_with("None") || highest_conf == "File Path Match" {
+
+    let highest_conf = results
+        .first()
+        .map(|r| r.confidence.as_str())
+        .unwrap_or("Low");
+    if highest_conf.starts_with("Low")
+        || highest_conf.starts_with("None")
+        || highest_conf == "File Path Match"
+    {
         let mut md = String::new();
         let _ = writeln!(md, "# CodeBroker Context Capsule\n\n**Query:** {}\n", query);
-        let _ = writeln!(md, "> [!WARNING]\n> **No confident matches found.** The retrieval engine did not find any highly relevant anchors to safely expand upon. To prevent hallucinations, Context Capsule graph expansion was aborted. Try using `search_codebase` directly.");
+        let _ = writeln!(
+            md,
+            "> [!WARNING]\n> **No confident matches found.** The retrieval engine did not find any highly relevant anchors to safely expand upon. To prevent hallucinations, Context Capsule graph expansion was aborted. Try using `search_codebase` directly."
+        );
         return md;
     }
-    
+
     let needs_subsystem = is_conceptual; // Removed Low fallback since we bail out on Low now
 
     let mut subsystem_files = std::collections::HashSet::new();
     let mut subsystem_confidence = "Low".to_string();
 
     if needs_subsystem {
-        if let Ok(stats) = query::subsystem::discover_subsystem(db, query, semantic_tokens, query_vector) {
+        if let Ok(stats) =
+            query::subsystem::discover_subsystem(db, query, semantic_tokens, query_vector)
+        {
             subsystem_confidence = stats.confidence.clone();
             for f in stats.files {
                 subsystem_files.insert(f);
@@ -176,7 +186,7 @@ fn generate_context_capsule(
             // Boost existing results that are in subsystem
             let routes_set: std::collections::HashSet<_> = stats.routes.iter().cloned().collect();
             let symbols_set: std::collections::HashSet<_> = stats.symbols.iter().cloned().collect();
-            
+
             for r in &mut results {
                 let mut boosted = false;
                 if routes_set.contains(&r.name) {
@@ -194,7 +204,7 @@ fn generate_context_capsule(
                     }
                     boosted = true;
                 }
-                
+
                 // Penalize massive generic UI components if we have a subsystem
                 // so they don't drown out focused backend services.
                 if boosted && r.path.contains("components/") || r.name == "Dashboard" {
@@ -204,6 +214,25 @@ fn generate_context_capsule(
             results.sort_by(|a, b| b.score.cmp(&a.score));
         }
     }
+
+    // Capsule pivots are rendered with their FULL implementation, so a pivot
+    // should be a definition worth reading in full — a function, method, route,
+    // class, or component — not a bare module-level variable or a loop-local.
+    // Demote pure data/locals so a lexical token collision (the query word
+    // "metrics" matching an empty `METRICS_QUEUES = {}` dict, or byte-math
+    // locals like `rx_bytes`/`network_usage_mb`) can never outrank the
+    // semantically central function (e.g. `stream_metrics`) that actually
+    // answers the query. This is a property of what a capsule pivot IS, not a
+    // per-query heuristic.
+    for r in &mut results {
+        if matches!(
+            r.kind.as_str(),
+            "variable" | "local" | "parameter" | "field" | "property"
+        ) {
+            r.score -= 4000;
+        }
+    }
+    results.sort_by(|a, b| b.score.cmp(&a.score));
 
     let mut pivots = Vec::new();
     for r in results.into_iter().take(3) {
@@ -218,7 +247,12 @@ fn generate_context_capsule(
         } else {
             "Fuzzy fallback match."
         };
-        pivots.push((r.name.clone(), r.path.clone(), reason.to_string(), r.confidence.clone()));
+        pivots.push((
+            r.name.clone(),
+            r.path.clone(),
+            reason.to_string(),
+            r.confidence.clone(),
+        ));
     }
 
     if pivots.is_empty() {
@@ -229,14 +263,33 @@ fn generate_context_capsule(
         return md;
     }
 
-    // Capsule Confidence
-    let capsule_conf = pivots.iter().map(|p| p.3.clone()).max().unwrap_or("Low".to_string());
-    let capsule_conf = if subsystem_confidence.starts_with("High") { "High (Subsystem Validated)".to_string() } else { capsule_conf };
+    // Capsule Confidence.
+    //
+    // Pivots are sorted by score, so the first is the strongest match; use its
+    // confidence rather than a lexicographic `max()` over the strings (which
+    // wrongly ranked "Medium..." above "High..." because 'M' > 'H'). The
+    // "Subsystem Validated" label is now gated on the top pivot ITSELF being
+    // high-confidence — previously it was applied whenever the subsystem graph
+    // was connected, even if the chosen pivots were low-relevance, which is
+    // exactly what made the label confidently wrong. Structural connectivity
+    // ("these symbols form a subsystem") is not the same as answer relevance
+    // ("these symbols answer the query"); the label must reflect the latter.
+    let capsule_conf = pivots
+        .first()
+        .map(|p| p.3.clone())
+        .unwrap_or_else(|| "Low".to_string());
+    let capsule_conf =
+        if subsystem_confidence.starts_with("High") && capsule_conf.starts_with("High") {
+            "High (Subsystem Validated)".to_string()
+        } else {
+            capsule_conf
+        };
     let _ = writeln!(md, "**Capsule Confidence:** {}\n", capsule_conf);
 
     let _ = writeln!(md, "## Pivot Symbols (Full Implementation)\n");
 
-    let mut seen_support: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut seen_support: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     let mut support_sections: Vec<(String, i32, String)> = Vec::new(); // (markdown, score, path)
 
     for (name, hint, reason, _) in &pivots {
@@ -259,7 +312,10 @@ fn generate_context_capsule(
             if total > max_lines {
                 let hidden = total - max_lines;
                 let mut out = lines[..max_lines].join("\n");
-                out.push_str(&format!("\n    ... // [{} lines hidden for token reduction]", hidden));
+                out.push_str(&format!(
+                    "\n    ... // [{} lines hidden for token reduction]",
+                    hidden
+                ));
                 out
             } else {
                 src.source.clone()
@@ -269,28 +325,56 @@ fn generate_context_capsule(
         let _ = writeln!(md, "```\n{}\n```\n", src_body);
         seen_support.insert((src.symbol_name.clone(), src.file_path.clone()));
 
-
         // Gather adjacent symbols for relevance scoring
-        if let Ok(Some(ctx)) = query::context::ContextResponseBuilder::new(db, name, Some(rel_hint), query::response::ResponseProfile::Verbose) {
-
+        if let Ok(Some(ctx)) = query::context::ContextResponseBuilder::new(
+            db,
+            name,
+            Some(rel_hint),
+            query::response::ResponseProfile::Verbose,
+        ) {
             let mut candidates = Vec::new();
-            if let Ok(deps) = ctx.fetch_forward_dependencies() { for d in deps { candidates.push((d, "Forward Dependency")); } }
-            if let Ok(deps) = ctx.fetch_same_file_callers() { for d in deps { candidates.push((d, "Same-File Caller")); } }
-            if let Ok(deps) = ctx.fetch_reverse_dependencies() { for d in deps { candidates.push((d, "Reverse Dependency")); } }
-            if let Ok(deps) = ctx.fetch_callees() { for d in deps { candidates.push((d, "Callee")); } }
-            if let Ok(deps) = ctx.fetch_callers() { for d in deps { candidates.push((d, "Caller")); } }
-
+            if let Ok(deps) = ctx.fetch_forward_dependencies() {
+                for d in deps {
+                    candidates.push((d, "Forward Dependency"));
+                }
+            }
+            if let Ok(deps) = ctx.fetch_same_file_callers() {
+                for d in deps {
+                    candidates.push((d, "Same-File Caller"));
+                }
+            }
+            if let Ok(deps) = ctx.fetch_reverse_dependencies() {
+                for d in deps {
+                    candidates.push((d, "Reverse Dependency"));
+                }
+            }
+            if let Ok(deps) = ctx.fetch_callees() {
+                for d in deps {
+                    candidates.push((d, "Callee"));
+                }
+            }
+            if let Ok(deps) = ctx.fetch_callers() {
+                for d in deps {
+                    candidates.push((d, "Caller"));
+                }
+            }
 
             for (cand, rel_type) in candidates {
-                if let Ok(cand_sources) = query::retrieval::read_symbol_source_scoped(db, &cand, true, None) {
+                if let Ok(cand_sources) =
+                    query::retrieval::read_symbol_source_scoped(db, &cand, true, None)
+                {
                     for cand_src in cand_sources {
-                        if seen_support.contains(&(cand_src.symbol_name.clone(), cand_src.file_path.clone())) {
+                        if seen_support
+                            .contains(&(cand_src.symbol_name.clone(), cand_src.file_path.clone()))
+                        {
                             continue;
                         }
-                        
+
                         // Compute Relevance Score
                         let mut score = 0;
-                        if cand_src.file_path.contains(query) || cand_src.symbol_name.contains(query) {
+                        if cand_src.file_path.contains(query)
+                            || cand_src.symbol_name.contains(query)
+                        {
                             score += 500;
                         }
                         for t in semantic_tokens {
@@ -302,11 +386,15 @@ fn generate_context_capsule(
                         // cand_src.file_path is ABSOLUTE.
                         // db_path must be RELATIVE with ./ for SQL query.
                         let rel_cand_path = relative_hint(db, &cand_src.file_path);
-                        let db_path = if rel_cand_path.starts_with("./") { rel_cand_path.to_string() } else { format!("./{}", rel_cand_path) };
+                        let db_path = if rel_cand_path.starts_with("./") {
+                            rel_cand_path.to_string()
+                        } else {
+                            format!("./{}", rel_cand_path)
+                        };
                         if subsystem_files.contains(&cand_src.file_path) {
                             score += 1500; // High subsystem relevance
                         }
-                        
+
                         if let Some(qv) = query_vector {
                             if let Ok(mut stmt) = db.conn.prepare("SELECT embedding FROM symbol_embeddings WHERE symbol_id = (SELECT id FROM symbols WHERE name = ?1 AND file_id = (SELECT id FROM files WHERE path = ?2) LIMIT 1)") {
                                 if let Ok(mut rows) = stmt.query(rusqlite::params![cand_src.symbol_name, db_path]) {
@@ -325,10 +413,15 @@ fn generate_context_capsule(
                         if score > 200 {
                             let md_block = format!(
                                 "### `{}::{}` (Skeleton)\n*Relationship to {}*: {}\n```\n{}\n```\n",
-                                cand_src.file_path, cand_src.symbol_name, src.symbol_name, rel_type, cand_src.source
+                                cand_src.file_path,
+                                cand_src.symbol_name,
+                                src.symbol_name,
+                                rel_type,
+                                cand_src.source
                             );
                             support_sections.push((md_block, score, cand_src.file_path.clone()));
-                            seen_support.insert((cand_src.symbol_name.clone(), cand_src.file_path.clone()));
+                            seen_support
+                                .insert((cand_src.symbol_name.clone(), cand_src.file_path.clone()));
                         }
                     }
                 }
@@ -355,7 +448,7 @@ fn generate_context_capsule(
                 *count += 1;
             }
         }
-        
+
         final_support.sort_by(|a, b| b.1.cmp(&a.1));
 
         for (md_block, _) in final_support {
@@ -484,33 +577,24 @@ mod response_helpers_tests {
 /// can pick one and retry with `file_path` set, the same UX `find_symbol`
 /// already provides. Returns None when it's safe to proceed (0 matches, or
 /// exactly 1 match after applying file_hint).
-fn check_symbol_ambiguity(
+/// Resolves `symbol` (optionally scoped by `file_hint`) through the shared
+/// Universal Resolver (`resolver::resolve_symbol`). Every symbol-name-keyed
+/// tool calls this ONE function instead of separately reimplementing
+/// ambiguity detection — that duplication (each tool re-querying
+/// `find_symbol_candidates` and rendering its own "ambiguous" JSON) is
+/// exactly what the resolver architecture exists to remove. On a confident
+/// match, returns the resolved symbol (with its now-unambiguous absolute
+/// `file_path`) for the caller to act on. On `Ambiguous`/`NotFound`, returns
+/// the resolver's own JSON rendering — identical across every tool — as the
+/// final tool response.
+fn resolve_symbol_for_tool(
     db: &storage::Database,
     symbol: &str,
     file_hint: Option<&str>,
-) -> Option<String> {
-    let candidates = query::engine::find_symbol_candidates(db, symbol).ok()?;
-    let filtered: Vec<&query::engine::SymbolCandidate> = match file_hint {
-        Some(hint) => candidates
-            .iter()
-            .filter(|c| c.file_path.contains(hint))
-            .collect(),
-        None => candidates.iter().collect(),
-    };
-    if filtered.len() > 1 {
-        Some(serde_json::json!({
-            "ambiguous": true,
-            "symbol": symbol,
-            "match_count": filtered.len(),
-            "candidates": filtered.iter().take(15).map(|c| serde_json::json!({
-                "kind": c.kind,
-                "file_path": c.file_path,
-                "start_line": c.start_line,
-            })).collect::<Vec<_>>(),
-            "hint": "Multiple symbols share this name. Re-run with `file_path` set to a substring of the file you mean (see `candidates` above) to disambiguate."
-        }).to_string())
-    } else {
-        None
+) -> Result<resolver::ResolvedSymbol, String> {
+    match resolver::resolve_symbol(db, symbol, file_hint, None) {
+        resolver::ResolvedEntity::Symbol(s) => Ok(s),
+        other => Err(other.to_json_string()),
     }
 }
 
@@ -1170,7 +1254,8 @@ Treat native tools as the repository's implementation layer."#;
                                                 "depth": { "type": "number", "description": "Default 2, capped at 5. How many hops to traverse." },
                                                 "direction": { "type": "string", "enum": ["both", "incoming", "outgoing"], "description": "Default \"both\". Restrict traversal to incoming (callers) or outgoing (callees) edges only." },
                                                 "max_nodes": { "type": "number", "description": "Default 100, capped at 200. Caps the returned node count." },
-                                                "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." }
+                                                "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." },
+                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous root symbol name." }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -1209,7 +1294,8 @@ Treat native tools as the repository's implementation layer."#;
                                                 "root_symbol": { "type": "string", "description": "Root symbol name." },
                                                 "depth": { "type": "number", "description": "Default 3, capped at 5. How many hops to traverse outward. Start at 1-2 for a hub symbol (e.g. a widely-imported helper) to avoid truncation." },
                                                 "max_nodes": { "type": "number", "description": "Default 100, capped at 500. Caps the returned node count (edges are capped at 3x this)." },
-                                                "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." }
+                                                "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." },
+                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous root symbol name (when the same name is defined in multiple files)." }
                                             },
                                             "required": ["root_symbol"]
                                         }
@@ -1291,9 +1377,11 @@ Treat native tools as the repository's implementation layer."#;
                                 let format_opt = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("json");
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                            amb
-                                        } else {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                            let symbol = resolved.name.as_str();
+                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             // Self-heals a stale defining file (incrementally
                                             // reindexes it, then re-assembles) instead of serving
@@ -1335,6 +1423,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 Err(e) => format!("Error assembling context: {}", e),
                                             }
                                         }
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
@@ -1352,9 +1441,11 @@ Treat native tools as the repository's implementation layer."#;
                                 let risk_threshold = arguments.get("risk_threshold").and_then(|n| n.as_u64()).unwrap_or(5) as usize;
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                            amb
-                                        } else {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                            let symbol = resolved.name.as_str();
+                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             // Self-heals a stale defining file instead of just
                                             // warning: `get_edit_context` already refuses/self-heals
                                             // on stale boundaries, and serving a
@@ -1424,6 +1515,7 @@ Treat native tools as the repository's implementation layer."#;
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1576,10 +1668,19 @@ Treat native tools as the repository's implementation layer."#;
                                                     }
                                                 }
 
+                                                // The "is this name ambiguous" signal comes from
+                                                // the same shared resolver every other tool uses
+                                                // (rather than this tool re-deriving its own
+                                                // exact-match-count check), so `find_symbol`'s
+                                                // ambiguity verdict can never disagree with
+                                                // `get_context`/`impact_analysis`/etc.
+                                                let ambiguous = resolver::resolve_symbol(&db, symbol, path_scope, None).is_ambiguous();
+
                                                 let mut payload = serde_json::json!({
                                                     "workspace_root": db.project_root,
                                                     "query": symbol,
                                                     "found": !matches.is_empty(),
+                                                    "ambiguous": ambiguous,
                                                     "exact_matches": exact_matches,
                                                     "fuzzy_matches": fuzzy_matches,
                                                     "matches": matches,
@@ -1678,20 +1779,31 @@ Treat native tools as the repository's implementation layer."#;
                                 } else {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
-                                            let mut ambiguous: Vec<serde_json::Value> = Vec::new();
+                                            // Every target name goes through the shared resolver
+                                            // exactly once. Ambiguous/NotFound names are reported
+                                            // back verbatim (the resolver's own rendering) instead
+                                            // of this tool re-deriving its own ambiguity JSON;
+                                            // confidently-resolved names carry forward their
+                                            // now-unambiguous file hint to the actual source read.
+                                            let mut problems: Vec<serde_json::Value> = Vec::new();
+                                            let mut resolved_targets: Vec<(String, Option<String>)> = Vec::new();
                                             for symbol in &targets {
-                                                if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                                    ambiguous.push(serde_json::from_str(&amb).unwrap_or(serde_json::Value::Null));
+                                                match resolver::resolve_symbol(&db, symbol, file_hint, None) {
+                                                    resolver::ResolvedEntity::Symbol(s) => {
+                                                        let hint = relative_hint(&db, &s.file_path).to_string();
+                                                        resolved_targets.push((s.name, Some(hint)));
+                                                    }
+                                                    other => problems.push(other.to_json()),
                                                 }
                                             }
-                                            if !ambiguous.is_empty() {
-                                                serde_json::json!({ "ambiguous": true, "results": ambiguous }).to_string()
+                                            if !problems.is_empty() {
+                                                serde_json::json!({ "unresolved": true, "results": problems }).to_string()
                                             } else {
                                                 let mut combined_results = Vec::new();
                                                 let mut has_error = false;
                                                 let mut err_msg = String::new();
-                                                for symbol in targets {
-                                                    match query::retrieval::read_symbol_source_scoped(&db, &symbol, include_deps, file_hint) {
+                                                for (symbol, hint) in resolved_targets {
+                                                    match query::retrieval::read_symbol_source_scoped(&db, &symbol, include_deps, hint.as_deref()) {
                                                         Ok(results) => combined_results.extend(results),
                                                         Err(e) => {
                                                             has_error = true;
@@ -1808,9 +1920,22 @@ Treat native tools as the repository's implementation layer."#;
                                 let target_symbol = arguments.get("target_symbol").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::retrieval::skeletonize_file(&db, path, target_symbol) {
-                                            Ok(res) => res,
-                                            Err(e) => format!("Error reading file skeleton: {}", e),
+                                        // Path resolution (file vs. directory vs. ambiguous vs.
+                                        // not-found) is the resolver's job — this tool no longer
+                                        // reimplements its own "is this a directory" matching.
+                                        match resolver::resolve_path(&db, path) {
+                                            resolver::ResolvedEntity::File(f) => {
+                                                match query::retrieval::skeletonize_file(&db, &f.file_path, target_symbol) {
+                                                    Ok(res) => res,
+                                                    Err(e) => format!("Error reading file skeleton: {}", e),
+                                                }
+                                            }
+                                            resolver::ResolvedEntity::Directory(d) => format!(
+                                                "Error reading file skeleton: '{}' is a directory, not a file. Indexed files in it: {}. Pass one of these as the file path.",
+                                                d.directory_path,
+                                                d.sample_files.join(", ")
+                                            ),
+                                            other => format!("Error reading file skeleton: {}", other.to_json_string()),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1823,11 +1948,20 @@ Treat native tools as the repository's implementation layer."#;
                                 let direction = query::graph::GraphDirection::from(direction_str);
                                 let max_nodes = arguments.get("max_nodes").and_then(|n| n.as_u64()).unwrap_or(100) as usize;
                                 let format_opt = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("json");
+                                let file_hint = get_file_hint(&arguments);
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        // Previously had no ambiguity guard at all (flagged in
+                                        // the original bug report as a gap to audit) — root
+                                        // resolution now goes through the same shared resolver
+                                        // every other symbol-keyed tool uses.
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                        let hint = relative_hint(&db, &resolved.file_path);
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::graph::explore_graph(&db, symbol, depth, direction, max_nodes) {
+                                        match query::graph::explore_graph_scoped(&db, &resolved.name, depth, direction, max_nodes, Some(hint)) {
                                             Ok(res) => {
                                                 if format_opt == "markdown" {
                                                     res.to_markdown()
@@ -1838,6 +1972,8 @@ Treat native tools as the repository's implementation layer."#;
                                                 }
                                             },
                                             Err(e) => format!("Error exploring graph: {}", e),
+                                        }
+                                        }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1851,22 +1987,29 @@ Treat native tools as the repository's implementation layer."#;
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        // Ambiguity on either endpoint silently mis-resolves to
-                                        // whichever same-named symbol the DB happens to return
-                                        // first — a real path could then look like `found: false`
-                                        // simply because the wrong node was searched from/to.
-                                        if let Some(amb) = check_symbol_ambiguity(&db, from_symbol, from_file_hint) {
-                                            amb
-                                        } else if let Some(amb) = check_symbol_ambiguity(&db, to_symbol, to_file_hint) {
-                                            amb
-                                        } else {
-                                            match query::graph::shortest_path(&db, from_symbol, to_symbol, from_file_hint, to_file_hint) {
+                                        // Both endpoints resolved through the shared resolver
+                                        // instead of each silently mis-resolving to whichever
+                                        // same-named symbol the DB happened to return first — a
+                                        // real path could otherwise look like `found: false`
+                                        // purely because the wrong node was searched from/to.
+                                        match resolve_symbol_for_tool(&db, from_symbol, from_file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(from_resolved) => {
+                                        match resolve_symbol_for_tool(&db, to_symbol, to_file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(to_resolved) => {
+                                            let from_hint = relative_hint(&db, &from_resolved.file_path);
+                                            let to_hint = relative_hint(&db, &to_resolved.file_path);
+                                            match query::graph::shortest_path(&db, &from_resolved.name, &to_resolved.name, Some(from_hint), Some(to_hint)) {
                                                 Ok(res) => {
                                                     estimated_raw_context_tokens = res.nodes.len() * 50; // rough estimation
                                                     serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing path".to_string())
                                                 },
                                                 Err(e) => format!("Error finding shortest path: {}", e),
                                             }
+                                        }
+                                        }
+                                        }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1889,9 +2032,22 @@ Treat native tools as the repository's implementation layer."#;
                                 let subsystem_b = arguments.get("subsystem_b").and_then(|s| s.as_str()).unwrap_or("");
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::subsystem::subsystem_communication(&db, subsystem_a, subsystem_b) {
-                                            Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
-                                            Err(e) => format!("Error computing subsystem communication: {}", e),
+                                        // Gate both names on the resolver first: a name that
+                                        // can't be confidently discovered as a subsystem at all
+                                        // must say so, instead of silently producing a "0 edges
+                                        // in both directions" answer that reads the same as "they
+                                        // genuinely don't communicate".
+                                        let a_resolved = resolver::resolve_subsystem(&db, subsystem_a, &[], None);
+                                        let b_resolved = resolver::resolve_subsystem(&db, subsystem_b, &[], None);
+                                        if a_resolved.is_not_found() {
+                                            a_resolved.to_json_string()
+                                        } else if b_resolved.is_not_found() {
+                                            b_resolved.to_json_string()
+                                        } else {
+                                            match query::subsystem::subsystem_communication(&db, subsystem_a, subsystem_b) {
+                                                Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
+                                                Err(e) => format!("Error computing subsystem communication: {}", e),
+                                            }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1962,10 +2118,18 @@ Treat native tools as the repository's implementation layer."#;
                                 let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
                                 let max_nodes = arguments.get("max_nodes").and_then(|n| n.as_u64()).map(|n| n as usize);
                                 let format_opt = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("json");
+                                let file_hint = get_file_hint(&arguments);
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match query::graph::graph_subtree(&db, root_symbol, depth, max_nodes) {
+                                        // Root resolved through the shared resolver instead of
+                                        // silently picking whichever same-named symbol sorts
+                                        // first and reporting it as an isolated node.
+                                        match resolve_symbol_for_tool(&db, root_symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                        let hint = relative_hint(&db, &resolved.file_path);
+                                        match query::graph::graph_subtree(&db, &resolved.name, depth, max_nodes, Some(hint)) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.node_count * 50; // rough estimation
                                                 if format_opt == "markdown" {
@@ -1978,6 +2142,8 @@ Treat native tools as the repository's implementation layer."#;
                                             },
                                     Err(e) => format!("Error exploring graph subtree: {}", e),
                                         }
+                                        }
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
@@ -1986,13 +2152,35 @@ Treat native tools as the repository's implementation layer."#;
                                 let path = arguments.get("path").and_then(|s| s.as_str()).unwrap_or("");
                                 let start_line = arguments.get("start_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
                                 let end_line = arguments.get("end_line").and_then(|n| n.as_u64()).unwrap_or(1) as usize;
-                                let resolved_path = match storage::Database::new(&db_path) {
-                                    Ok(db) => db.resolve_path(path),
-                                    Err(_) => path.to_string(),
-                                };
-                                match query::retrieval::read_file_snippet(&resolved_path, start_line, end_line) {
-                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
-                                    Err(e) => format!("Error reading file snippet: {}", e),
+                                match storage::Database::new(&db_path) {
+                                    Ok(db) => {
+                                        match resolver::resolve_path(&db, path) {
+                                            resolver::ResolvedEntity::File(f) => {
+                                                match query::retrieval::read_file_snippet(&f.file_path, start_line, end_line) {
+                                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                                                    Err(e) => format!("Error reading file snippet: {}", e),
+                                                }
+                                            }
+                                            resolver::ResolvedEntity::Directory(d) => format!(
+                                                "Error reading file snippet: '{}' is a directory, not a file. Indexed files in it: {}. Pass one of these as the file path.",
+                                                d.directory_path,
+                                                d.sample_files.join(", ")
+                                            ),
+                                            resolver::ResolvedEntity::NotFound(_) => {
+                                                // Not every readable file is indexed (README,
+                                                // configs, ...) — fall back to a direct
+                                                // filesystem read rather than refusing outright
+                                                // just because the index doesn't know this path.
+                                                let resolved_path = db.resolve_path(path);
+                                                match query::retrieval::read_file_snippet(&resolved_path, start_line, end_line) {
+                                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                                                    Err(e) => format!("Error reading file snippet: {}", e),
+                                                }
+                                            }
+                                            other => other.to_json_string(),
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
                             "get_implementation" => {
@@ -2000,9 +2188,11 @@ Treat native tools as the repository's implementation layer."#;
                                 let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                            amb
-                                        } else {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                            let symbol = resolved.name.as_str();
+                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                             let context = query::context::ContextResponseBuilder::new(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let implementation = serde_json::json!({
@@ -2010,6 +2200,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 "context": context.map(|c| c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or(serde_json::json!({}))
                                             });
                                             serde_json::to_string_pretty(&implementation).unwrap_or_default()
+                                        }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -2020,9 +2211,11 @@ Treat native tools as the repository's implementation layer."#;
                                 let file_hint = get_file_hint(&arguments);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        if let Some(amb) = check_symbol_ambiguity(&db, symbol, file_hint) {
-                                            amb
-                                        } else {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint) {
+                                        Err(resp) => resp,
+                                        Ok(resolved) => {
+                                            let symbol = resolved.name.as_str();
+                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             // Self-heal on a stale defining file before reading
                                             // source/dependencies — see semantic::staleness. Source
                                             // is re-read AFTER any reindex too, since edit context
@@ -2047,6 +2240,7 @@ Treat native tools as the repository's implementation layer."#;
                                             add_response_size_hint(&mut edit_context);
                                             serde_json::to_string_pretty(&edit_context).unwrap_or_default()
                                         }
+                                        }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
@@ -2070,9 +2264,18 @@ Treat native tools as the repository's implementation layer."#;
                                         } else {
                                             vec![]
                                         };
-                                        match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector.as_deref()) {
-                                            Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
-                                            Err(e) => format!("Error discovering subsystem: {}", e),
+                                        // Gate on the resolver's confidence decision first — a
+                                        // name that can't be confidently discovered as a
+                                        // subsystem returns NotFound instead of an empty/Low
+                                        // stats struct that looked like a (wrong) answer.
+                                        match resolver::resolve_subsystem(&db, name, &semantic_tokens, query_vector.as_deref()) {
+                                            resolver::ResolvedEntity::Subsystem(_) => {
+                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector.as_deref()) {
+                                                    Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
+                                                    Err(e) => format!("Error discovering subsystem: {}", e),
+                                                }
+                                            }
+                                            other => other.to_json_string(),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
