@@ -172,7 +172,7 @@ fn extract_js_imports(
 ) -> Vec<ImportNode> {
     let mut imports = Vec::new();
     let query_str = "
-        (import_statement 
+        (import_statement
             (import_clause (named_imports (import_specifier name: (identifier) @import)))
             source: (string (string_fragment) @source)
         )
@@ -180,9 +180,19 @@ fn extract_js_imports(
             (import_clause (identifier) @import)
             source: (string (string_fragment) @source)
         )
+        (import_statement
+            (import_clause (namespace_import (identifier) @ns_import))
+            source: (string (string_fragment) @source)
+        )
+        (export_statement
+            (export_clause (export_specifier name: (identifier) @re_export))
+            source: (string (string_fragment) @source)
+        )
         (call_expression function: (identifier) @call_name)
         (call_expression function: (member_expression property: (property_identifier) @method_call))
         (member_expression property: (property_identifier) @member_access)
+        (new_expression constructor: (identifier) @new_call)
+        (class_declaration superClass: (identifier) @extends_class)
     ";
 
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
@@ -231,6 +241,34 @@ fn extract_js_imports(
                     if !crate::utils::is_noisy_call_name(&name) {
                         import_name = name.clone();
                         import_kind = "MEMBER_ACCESS".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "new_call" {
+                    let name = text.trim().to_string();
+                    if !crate::utils::is_noisy_call_name(&name) {
+                        import_name = name.clone();
+                        import_kind = "new_call".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "extends_class" {
+                    let name = text.trim().to_string();
+                    if !name.is_empty() {
+                        import_name = name.clone();
+                        import_kind = "extends".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "re_export" {
+                    let name = text.trim().to_string();
+                    if !name.is_empty() {
+                        import_name = name.clone();
+                        import_kind = "re_export".to_string();
+                        line_number = node.start_position().row + 1;
+                    }
+                } else if *capture_kind == "ns_import" {
+                    let name = text.trim().to_string();
+                    if !name.is_empty() {
+                        import_name = name.clone();
+                        import_kind = "imports".to_string();
                         line_number = node.start_position().row + 1;
                     }
                 }

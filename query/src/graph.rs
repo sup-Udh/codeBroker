@@ -498,24 +498,19 @@ fn extract_fetch_literals(source: &str) -> Vec<String> {
     out
 }
 
-/// Converts a literal API path like `/api/run` or `/api/rooms/[id]` into the
-/// path-fragment a Next.js route handler file would live under
-/// (`api/run/route`), so it can be matched against indexed file paths via a
-/// simple substring check. Dynamic segments (`[id]`) are stripped to their
-/// static prefix since the indexed file path uses the literal bracket
-/// directory name, not a resolved value.
+/// Converts a URL path literal like `/api/run` or `/api/rooms/[id]` into the
+/// static path fragment used for file-path substring matching. Dynamic segments
+/// (`[id]`, `:param`) are dropped so the remaining static prefix matches the
+/// actual directory layout regardless of the routing framework in use.
 fn route_file_fragment(literal: &str) -> String {
     let trimmed = literal.trim_start_matches('/');
-    let static_prefix: String = trimmed
+    // Stop at the first dynamic segment (bracket or colon notation) so the
+    // fragment matches any file under the static part of the URL tree.
+    trimmed
         .split('/')
-        .take_while(|seg| !seg.starts_with('['))
+        .take_while(|seg| !seg.starts_with('[') && !seg.starts_with(':'))
         .collect::<Vec<_>>()
-        .join("/");
-    if static_prefix.is_empty() {
-        trimmed.to_string()
-    } else {
-        static_prefix
-    }
+        .join("/")
 }
 
 fn find_suggested_connector(db: &Database, from_id: i64) -> Option<SuggestedConnector> {
@@ -548,6 +543,10 @@ fn find_suggested_connector(db: &Database, from_id: i64) -> Option<SuggestedConn
         if fragment.is_empty() {
             continue;
         }
+        // Match any route/endpoint symbol whose file path contains the static
+        // URL prefix. This is framework-agnostic: it matches
+        // `app/api/run/route.ts`, `routes/api/run.py`, or any other layout
+        // that places the handler under a directory named after the URL segment.
         let pattern = format!("%{}%", fragment);
         let found: Option<(String, String)> = db
             .conn
@@ -2044,9 +2043,20 @@ mod dependency_cycles_tests {
 /// The edge kinds that represent a genuine code-level dependency ("X depends on
 /// / uses Y"), used uniformly by impact analysis, forward/reverse dependency
 /// listing, and hotspot scoring so those tools can never report divergent
-/// dependency counts for the same symbol. `type_ref` (a parameter/return type
-/// annotation) is included because annotating a parameter with a type is a real
+/// dependency counts for the same symbol.
+///
+/// `type_ref` is included because annotating a parameter with a type is a real
 /// dependency on that type — the case impact-analysis previously missed.
+///
+/// `new_call`, `extends`, `implements`, `inherits`, `instantiates` are class-level
+/// relationships that are unambiguous (a class extending another is always a
+/// dependency, unlike a bare method_call whose receiver type is unknown without
+/// full type resolution). `re_export` is included because re-exporting a symbol
+/// creates a hard dependency on the source module.
+///
+/// `method_call` and `MEMBER_ACCESS` are intentionally excluded: without type
+/// resolution, these would generate phantom dependencies (every `obj.map()`
+/// resolving to an unrelated top-level `map` function).
 pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
     "calls",
     "imports",
@@ -2054,6 +2064,12 @@ pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
     "component_use",
     "type_ref",
     "global_ref",
+    "new_call",
+    "extends",
+    "implements",
+    "inherits",
+    "instantiates",
+    "re_export",
 ];
 
 /// SQL fragment `'calls', 'imports', ...` for embedding the canonical set in an
