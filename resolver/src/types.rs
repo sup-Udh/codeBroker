@@ -145,6 +145,15 @@ pub struct ResolvedSubsystem {
     pub file_count: usize,
     pub symbol_count: usize,
     pub confidence: Confidence,
+    /// Absolute file paths in this subsystem. Consumers that need to check
+    /// membership (e.g. pivot-boosting in the context capsule) use this
+    /// instead of re-running `discover_subsystem`.
+    pub files: Vec<String>,
+    /// Core symbol names in this subsystem.
+    pub symbols: Vec<String>,
+    /// Route/entrypoint symbol names (API handlers, page layouts) in this
+    /// subsystem.
+    pub routes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

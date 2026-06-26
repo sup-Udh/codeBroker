@@ -22,7 +22,7 @@
 pub mod pipeline;
 pub mod types;
 
-pub use pipeline::{resolve_any, resolve_path, resolve_subsystem, resolve_symbol};
+pub use pipeline::{resolve_any, resolve_path, resolve_search, resolve_subsystem, resolve_symbol};
 pub use types::{
     AmbiguousMatch, Candidate, Confidence, ConfidenceLabel, EntityType, NotFound,
     ResolvedDirectory, ResolvedEntity, ResolvedFeature, ResolvedFile, ResolvedSubsystem,

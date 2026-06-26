@@ -115,6 +115,31 @@ fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str 
         .unwrap_or(absolute_path)
 }
 
+/// Computes semantic expansion tokens and a query embedding vector for a
+/// given query string. Returns `(tokens, vector, llm_used)`.
+///
+/// Centralizes the four-times-repeated pattern of:
+///   getenv OPENAI_API_KEY → embed query → expand_query → (tokens, vector)
+/// so that `search_codebase`, `subsystem_stats`, and `generate_context_capsule`
+/// all call one function instead of each inlining the same OpenAI round-trips.
+fn prepare_semantic_context(query: &str) -> (Vec<String>, Option<Vec<f32>>, bool) {
+    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    if openai_key.is_empty() {
+        return (vec![], None, false);
+    }
+    use semantic::provider::LlmProvider;
+    let provider = semantic::openai::OpenAiProvider::new(openai_key);
+    let query_vector = provider
+        .embed_texts(&[query.to_string()])
+        .ok()
+        .and_then(|mut v| v.pop());
+    let (tokens, _) = provider.expand_query(query, 5).unwrap_or_else(|e| {
+        eprintln!("Semantic expansion failed/skipped: {}", e);
+        (vec![], 0)
+    });
+    (tokens, query_vector, true)
+}
+
 /// Orchestrates the one-shot "Context Capsule" workflow: discover the 1-3
 /// pivot symbols matching `query`, fetch their full implementation, expand
 /// to immediate (depth=1) callers/callees via the graph, and render
@@ -132,8 +157,9 @@ fn generate_context_capsule(
     let _ = writeln!(md, "# CodeBroker Context Capsule\n");
     let _ = writeln!(md, "**Query:** {}\n", query);
 
-    // 1. Fetch initial candidates via search_symbols
-    let (mut results, _reason) = query::engine::search_symbols(
+    // 1. Fetch initial candidates via the resolver's unified search (includes
+    //    concept augmentation — no need to repeat it here).
+    let (mut results, _reason) = resolver::resolve_search(
         db,
         query,
         semantic_tokens,
@@ -143,8 +169,7 @@ fn generate_context_capsule(
         query::engine::SearchMode::Both,
         false,
         None,
-    )
-    .unwrap_or_else(|_| (vec![], None));
+    );
 
     results.retain(|r| r.kind != "file" && r.kind != "text_match");
 
@@ -176,16 +201,21 @@ fn generate_context_capsule(
     let mut subsystem_confidence = "Low".to_string();
 
     if needs_subsystem {
-        if let Ok(stats) =
-            query::subsystem::discover_subsystem(db, query, semantic_tokens, query_vector)
+        if let resolver::ResolvedEntity::Subsystem(sub) =
+            resolver::resolve_subsystem(db, query, semantic_tokens, query_vector)
         {
-            subsystem_confidence = stats.confidence.clone();
-            for f in stats.files {
-                subsystem_files.insert(f);
+            subsystem_confidence = match sub.confidence.label {
+                resolver::ConfidenceLabel::High => "High",
+                resolver::ConfidenceLabel::Medium => "Medium",
+                resolver::ConfidenceLabel::Low => "Low",
+            }
+            .to_string();
+            for f in &sub.files {
+                subsystem_files.insert(f.clone());
             }
             // Boost existing results that are in subsystem
-            let routes_set: std::collections::HashSet<_> = stats.routes.iter().cloned().collect();
-            let symbols_set: std::collections::HashSet<_> = stats.symbols.iter().cloned().collect();
+            let routes_set: std::collections::HashSet<_> = sub.routes.iter().cloned().collect();
+            let symbols_set: std::collections::HashSet<_> = sub.symbols.iter().cloned().collect();
 
             for r in &mut results {
                 let mut boosted = false;
@@ -1533,95 +1563,24 @@ Treat native tools as the repository's implementation layer."#;
                                 let min_confidence = arguments.get("min_confidence").and_then(|s| s.as_str());
                                 let _include_source = arguments.get("include_source").and_then(|b| b.as_bool()).unwrap_or(false);
 
-                                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                                let mut llm_used = false;
-                                let mut query_vector = None;
-                                let semantic_tokens = if !openai_key.is_empty() {
-                                    use semantic::provider::LlmProvider;
-                                    let provider = semantic::openai::OpenAiProvider::new(openai_key.clone());
-                                    if let Ok(mut vecs) = provider.embed_texts(&[keyword.to_string()]) {
-                                        query_vector = vecs.pop();
-                                    }
-                                    match provider.expand_query(keyword, 5) {
-                                        Ok((tokens, _)) => {
-                                            llm_used = true;
-                                            tokens
-                                        },
-                                        Err(e) => {
-                                            eprintln!("Semantic expansion failed/skipped: {}", e);
-                                            vec![]
-                                        }
-                                    }
-                                } else {
-                                    vec![]
-                                };
+                                let (semantic_tokens, query_vector_opt, llm_used) = prepare_semantic_context(keyword);
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        match query::engine::search_symbols(&db, keyword, &semantic_tokens, query_vector.as_deref(), llm_used, path_scope, mode, whole_word, min_confidence) {
-                                            Ok((mut results, reason)) => {
-                                                // Semantic search removed per architectural upgrade instructions.
-                                                // Concept augmentation: independent of how weak/strong
-                                                // the literal keyword match was, also check whether the
-                                                // query term maps to a domain concept (auth, realtime,
-                                                // notifications, database) and pull in symbols tagged
-                                                // with it that the literal match missed entirely — e.g.
-                                                // "auth" previously found nothing for
-                                                // createClient/createAdminClient/signInWithOAuth since
-                                                // none of those names or their utils/supabase/*.ts path
-                                                // contain the substring "auth" (benchmark run_005).
-                                                // Capped and dedup'd against existing results by
-                                                // (name, path) so an already-found symbol isn't repeated.
-                                                let mut seen: std::collections::HashSet<(String, String)> = results
-                                                    .iter()
-                                                    .map(|r| (r.name.clone(), r.path.clone()))
-                                                    .collect();
-                                                let mut concept_added = 0usize;
-                                                for concept in query::concepts::concepts_matching_term(keyword) {
-                                                    if concept_added >= 10 {
-                                                        break;
-                                                    }
-                                                    if let Ok(matches) = query::concepts::symbols_for_concept(&db, concept) {
-                                                        for m in matches {
-                                                            if concept_added >= 10 {
-                                                                break;
-                                                            }
-                                                            let key = (m.symbol_name.clone(), m.file_path.clone());
-                                                            if !seen.insert(key) {
-                                                                continue;
-                                                            }
-                                                            if let Some(scope) = path_scope {
-                                                                if !m.file_path.contains(scope) {
-                                                                    continue;
-                                                                }
-                                                            }
-                                                            results.push(query::engine::SearchResult {
-                                                                path: m.file_path,
-                                                                name: m.symbol_name,
-                                                                kind: m.symbol_kind,
-                                                                score: 150,
-                                                                confidence: format!("Concept Match ({})", m.concept),
-                                                                explanation: format!("Matched conceptual tag '{}'", m.concept),
-                                                                line: None,
-                                                            });
-                                                            concept_added += 1;
-                                                        }
-                                                    }
-                                                }
-
-                                                let mut payload = serde_json::json!({
-                                                    "workspace_root": db.project_root,
-                                                    "results": results
-                                                });
-                                                if let Some(r) = reason {
-                                                    payload["reason"] = serde_json::Value::String(r);
-                                                }
-                                                add_response_size_hint(&mut payload);
-                                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                            },
-                                            Err(e) => serde_json::json!({"success": false, "error": format!("Error searching: {}", e)}).to_string(),
+                                        let (results, reason) = resolver::resolve_search(
+                                            &db, keyword, &semantic_tokens, query_vector_opt.as_deref(),
+                                            llm_used, path_scope, mode, whole_word, min_confidence,
+                                        );
+                                        let mut payload = serde_json::json!({
+                                            "workspace_root": db.project_root,
+                                            "results": results
+                                        });
+                                        if let Some(r) = reason {
+                                            payload["reason"] = serde_json::Value::String(r);
                                         }
+                                        add_response_size_hint(&mut payload);
+                                        serde_json::to_string_pretty(&payload).unwrap_or_default()
                                     }
                                     Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
                                 }
@@ -2252,28 +2211,14 @@ Treat native tools as the repository's implementation layer."#;
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                                        let mut query_vector = None;
-                                        let semantic_tokens = if !openai_key.is_empty() {
-                                            use semantic::provider::LlmProvider;
-                                            let provider = semantic::openai::OpenAiProvider::new(openai_key.clone());
-                                            if let Ok(mut vecs) = provider.embed_texts(&[name.to_string()]) {
-                                                query_vector = vecs.pop();
-                                            }
-                                            match provider.expand_query(name, 5) {
-                                                Ok((tokens, _)) => tokens,
-                                                Err(_) => vec![],
-                                            }
-                                        } else {
-                                            vec![]
-                                        };
+                                        let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(name);
                                         // Gate on the resolver's confidence decision first — a
                                         // name that can't be confidently discovered as a
                                         // subsystem returns NotFound instead of an empty/Low
                                         // stats struct that looked like a (wrong) answer.
-                                        match resolver::resolve_subsystem(&db, name, &semantic_tokens, query_vector.as_deref()) {
+                                        match resolver::resolve_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref()) {
                                             resolver::ResolvedEntity::Subsystem(_) => {
-                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector.as_deref()) {
+                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref()) {
                                                     Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
                                                     Err(e) => format!("Error discovering subsystem: {}", e),
                                                 }
@@ -2294,22 +2239,8 @@ Treat native tools as the repository's implementation layer."#;
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                                            let mut query_vector = None;
-                                            let semantic_tokens = if !openai_key.is_empty() {
-                                                use semantic::provider::LlmProvider;
-                                                let provider = semantic::openai::OpenAiProvider::new(openai_key.clone());
-                                                if let Ok(mut vecs) = provider.embed_texts(&[query_str.to_string()]) {
-                                                    query_vector = vecs.pop();
-                                                }
-                                                match provider.expand_query(query_str, 5) {
-                                                    Ok((tokens, _)) => tokens,
-                                                    Err(_) => vec![],
-                                                }
-                                            } else {
-                                                vec![]
-                                            };
-                                            generate_context_capsule(&db, query_str, file_hint, &semantic_tokens, query_vector.as_deref())
+                                            let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(query_str);
+                                            generate_context_capsule(&db, query_str, file_hint, &semantic_tokens, query_vector_opt.as_deref())
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
                                     }

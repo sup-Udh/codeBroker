@@ -526,6 +526,9 @@ pub fn resolve_subsystem(
                         stats.confidence
                     )],
                 ),
+                files: stats.files,
+                symbols: stats.symbols,
+                routes: stats.routes,
             })
         }
         _ => ResolvedEntity::NotFound(NotFound {
@@ -604,6 +607,9 @@ pub fn resolve_any(
                         stats.confidence
                     )],
                 ),
+                files: stats.files,
+                symbols: stats.symbols,
+                routes: stats.routes,
             });
         }
     }
@@ -620,6 +626,85 @@ pub fn resolve_any(
         ),
         stages_tried,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Multi-result search (search_codebase, generate_context_capsule)
+// ---------------------------------------------------------------------------
+
+/// Unified multi-result search entry point. Wraps `query::engine::search_symbols`
+/// and concept augmentation in one place so no MCP tool inlines either.
+///
+/// This is the "find ranked candidates" complement to `resolve_symbol`/`resolve_any`
+/// (which resolve a single entity). Use it whenever the caller wants a list:
+/// `search_codebase` and pivot selection in `generate_context_capsule`.
+pub fn resolve_search(
+    db: &Database,
+    query: &str,
+    semantic_tokens: &[String],
+    query_vector: Option<&[f32]>,
+    llm_used: bool,
+    path_scope: Option<&str>,
+    mode: query::engine::SearchMode,
+    whole_word: bool,
+    min_confidence: Option<&str>,
+) -> (Vec<query::engine::SearchResult>, Option<String>) {
+    let (mut results, reason) = query::engine::search_symbols(
+        db,
+        query,
+        semantic_tokens,
+        query_vector,
+        llm_used,
+        path_scope,
+        mode,
+        whole_word,
+        min_confidence,
+    )
+    .unwrap_or_else(|_| (vec![], None));
+
+    // Concept augmentation: query terms that map to a domain concept ("auth",
+    // "realtime", "notifications", "database") pull in concept-tagged symbols
+    // that pure lexical search misses — e.g. a query for "auth" finds
+    // createClient/signInWithOAuth even though those names don't contain "auth".
+    // Centralized here instead of being inline in each tool that needs it.
+    let mut seen: std::collections::HashSet<(String, String)> = results
+        .iter()
+        .map(|r| (r.name.clone(), r.path.clone()))
+        .collect();
+    let mut concept_added = 0usize;
+    for concept in query::concepts::concepts_matching_term(query) {
+        if concept_added >= 10 {
+            break;
+        }
+        if let Ok(matches) = query::concepts::symbols_for_concept(db, concept) {
+            for m in matches {
+                if concept_added >= 10 {
+                    break;
+                }
+                if let Some(scope) = path_scope {
+                    if !m.file_path.contains(scope) {
+                        continue;
+                    }
+                }
+                let key = (m.symbol_name.clone(), m.file_path.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+                results.push(query::engine::SearchResult {
+                    path: m.file_path,
+                    name: m.symbol_name,
+                    kind: m.symbol_kind,
+                    score: 150,
+                    confidence: format!("Concept Match ({})", m.concept),
+                    explanation: format!("Matched conceptual tag '{}'", m.concept),
+                    line: None,
+                });
+                concept_added += 1;
+            }
+        }
+    }
+    results.sort_by(|a, b| b.score.cmp(&a.score));
+    (results, reason)
 }
 
 #[cfg(test)]
