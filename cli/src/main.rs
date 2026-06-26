@@ -116,6 +116,7 @@ fn main() {
     match &cli.command {
         Commands::Init => {
             println!("Initializing CodeBroker...");
+            let t_pipeline = std::time::Instant::now();
 
             let _ = fs::create_dir_all(".codebroker");
 
@@ -126,6 +127,19 @@ fn main() {
             // in place via delete+repopulate creates exactly that window.
             const FINAL_DB_PATH: &str = ".codebroker/codebroker.db";
             const TMP_DB_PATH: &str = ".codebroker/codebroker.db.tmp";
+
+            // Load embeddings from the OLD database before wiping it.
+            // On every full `init`, the temp DB starts empty, so without
+            // this cache every symbol would be re-embedded via the API even
+            // if it hasn't changed — the dominant bottleneck as codebases grow.
+            let t_cache_load = std::time::Instant::now();
+            let embedding_cache = semantic::embeddings::load_embedding_cache(FINAL_DB_PATH);
+            eprintln!(
+                "[TIMING] Load old embedding cache: {}ms ({} cached embeddings)",
+                t_cache_load.elapsed().as_millis(),
+                embedding_cache.len()
+            );
+
             let _ = fs::remove_file(TMP_DB_PATH);
             let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
             let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
@@ -134,8 +148,10 @@ fn main() {
             // Scoped so `db` (and every Statement borrowed from it) is fully dropped,
             // releasing the file, before we checkpoint/rename below.
             {
+                let t_db_open = std::time::Instant::now();
                 let db = storage::Database::new(TMP_DB_PATH).expect("Failed to create DB");
                 db.init_schema().expect("Failed to initialize schema");
+                eprintln!("[TIMING] DB open + schema init: {}ms", t_db_open.elapsed().as_millis());
                 use parser::config_frontend::ConfigFrontend;
                 use parser::frontend::{LanguageFrontend, RustFrontend};
                 use parser::javascript_frontend::JavaScriptFrontend;
@@ -208,10 +224,18 @@ fn main() {
                 }
 
                 // 2. Walk the file system
+                let t_walk = std::time::Instant::now();
                 let files = indexer::walker::collect_files(".");
+                eprintln!("[TIMING] File walk: {}ms ({} files found)", t_walk.elapsed().as_millis(), files.len());
                 println!("Found {} files to index.", files.len());
 
                 // 3. The Main Indexing Loop
+                let t_pass1 = std::time::Instant::now();
+                let mut pass1_files = 0usize;
+                let mut pass1_symbols = 0usize;
+                let mut pass1_imports = 0usize;
+                let mut pass1_parse_ms = 0u128;
+                let mut pass1_db_insert_ms = 0u128;
                 for file_path in files {
                     if let Ok(source_code) = fs::read_to_string(&file_path) {
                         // A. Extract the file extension
@@ -232,21 +256,28 @@ fn main() {
                         // C. If we have a parser for this language, process it!
                         if let Some(frontend) = matched_frontend {
                             let content_hash = storage::hash_content(source_code.as_bytes());
+
+                            let t_parse = std::time::Instant::now();
+                            let parsed = frontend.parse_and_extract(&source_code, &file_path);
+                            pass1_parse_ms += t_parse.elapsed().as_millis();
+
+                            let t_db_ins = std::time::Instant::now();
                             let file_id = db.insert_file(&file_path, &content_hash).unwrap();
+                            pass1_files += 1;
 
                             // D. The Universal Extraction (Zero language-specific code here!)
-                            if let Some((metadata, symbols, imports)) =
-                                frontend.parse_and_extract(&source_code, &file_path)
-                            {
+                            if let Some((metadata, symbols, imports)) = parsed {
                                 let metadata_str = metadata.metadata.as_deref().unwrap_or("{}");
                                 let _ = db.update_file_metadata(file_id, Some(metadata_str));
 
                                 for symbol in symbols {
                                     db.insert_symbol(file_id, &symbol).unwrap();
+                                    pass1_symbols += 1;
                                 }
 
                                 for import in imports {
                                     db.insert_raw_import(file_id, &import).unwrap();
+                                    pass1_imports += 1;
                                 }
 
                                 // Angular split file logic
@@ -281,18 +312,41 @@ fn main() {
                                     }
                                 }
                             }
+                            pass1_db_insert_ms += t_db_ins.elapsed().as_millis();
                         }
                     }
                 }
+                eprintln!(
+                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | files={} symbols={} raw_imports={}",
+                    t_pass1.elapsed().as_millis(),
+                    pass1_parse_ms,
+                    pass1_db_insert_ms,
+                    pass1_files,
+                    pass1_symbols,
+                    pass1_imports
+                );
 
                 // --- PASS 2: THE LINKER ---
                 println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
+                let t_pass2 = std::time::Instant::now();
 
                 // 1. Get all the "Missing Friends" from our staging table
+                let t_fetch_imports = std::time::Instant::now();
                 let raw_imports = db
                     .get_all_raw_imports_with_lines()
                     .expect("Failed to fetch raw imports");
+                let total_raw_imports = raw_imports.len();
+                eprintln!("[TIMING] Fetch raw_imports: {}ms ({} rows)", t_fetch_imports.elapsed().as_millis(), total_raw_imports);
                 let mut edges_created = 0;
+
+                // Per-import timing accumulators
+                let mut t_enclosing_total = 0u128;
+                let mut t_resolve_total = 0u128;
+                let mut t_edge_insert_total = 0u128;
+                let mut count_call_edges = 0usize;
+                let mut count_import_edges = 0usize;
+                let mut count_skipped = 0usize;
+                let mut count_path_resolved = 0usize;
 
                 // 2. Loop through every single staged import
                 for (
@@ -308,9 +362,11 @@ fn main() {
                     // Attribute this edge to the symbol whose body contains the
                     // call/reference, so dependency_cycles has a real symbol graph
                     // (None for top-level imports outside any symbol).
+                    let t_enc = std::time::Instant::now();
                     let src_sym = db
                         .enclosing_symbol_id(source_file_id, line_number)
                         .unwrap_or(None);
+                    t_enclosing_total += t_enc.elapsed().as_micros();
 
                     // Call edges are resolved case-sensitively and without the
                     // global bare-name fallback that the import path uses below,
@@ -321,6 +377,7 @@ fn main() {
                         || edge_kind == "method_call"
                         || edge_kind == "MEMBER_ACCESS"
                     {
+                        let t_res = std::time::Instant::now();
                         resolve_call_edge(
                             &db,
                             source_file_id,
@@ -329,6 +386,8 @@ fn main() {
                             &edge_kind,
                             &mut edges_created,
                         );
+                        t_resolve_total += t_res.elapsed().as_micros();
+                        count_call_edges += 1;
                         continue;
                     }
 
@@ -350,7 +409,10 @@ fn main() {
 
                     // If we resolved a path, let's try to link exactly to that file's export
                     if let Some(src) = resolved_source {
+                        count_path_resolved += 1;
+                        let t_res = std::time::Instant::now();
                         // Very rudimentary resolution: find a file containing the path
+                        // NOTE: prepare() called inside the loop — re-parsed every iteration.
                         let mut file_stmt = db
                             .conn
                             .prepare("SELECT id FROM files WHERE path LIKE ?1 LIMIT 1")
@@ -360,22 +422,27 @@ fn main() {
                             file_stmt.query_row(params![search_path], |row| row.get::<_, i64>(0))
                         {
                             // find a symbol in that file that matches the name
+                            // NOTE: prepare() called inside the loop — re-parsed every iteration.
                             let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND LOWER(name) = LOWER(?2) LIMIT 1").unwrap();
                             if let Ok(target_symbol_id) = sym_stmt
                                 .query_row(params![target_file_id, import_name], |row| {
                                     row.get::<_, i64>(0)
                                 })
                             {
+                                t_resolve_total += t_res.elapsed().as_micros();
+                                let t_edge = std::time::Instant::now();
                                 let _ = db.insert_edge_attributed(
                                     source_file_id,
                                     src_sym,
                                     target_symbol_id,
                                     &edge_kind,
                                 );
+                                t_edge_insert_total += t_edge.elapsed().as_micros();
                                 edges_created += 1;
                                 continue;
                             }
                         }
+                        t_resolve_total += t_res.elapsed().as_micros();
                     }
 
                     // Fallback to global symbol resolution.
@@ -395,7 +462,10 @@ fn main() {
                     // coincidence, not a reference.
                     let word = import_name.as_str();
                     if !word.is_empty() && !GENERIC_SYMBOL_NAMES.contains(&word) {
+                        count_import_edges += 1;
+                        let t_res = std::time::Instant::now();
                         // Local-first: a same-file definition of the exact name.
+                        // NOTE: prepare() is called inside the loop — re-parsed every iteration.
                         let mut local_stmt = db
                             .conn
                             .prepare(
@@ -405,6 +475,8 @@ fn main() {
                         if let Ok(local_symbol_id) = local_stmt
                             .query_row(params![source_file_id, word], |row| row.get::<_, i64>(0))
                         {
+                            t_resolve_total += t_res.elapsed().as_micros();
+                            let t_edge = std::time::Instant::now();
                             if src_sym != Some(local_symbol_id)
                                 && db
                                     .insert_edge_attributed(
@@ -417,9 +489,12 @@ fn main() {
                             {
                                 edges_created += 1;
                             }
+                            t_edge_insert_total += t_edge.elapsed().as_micros();
                         } else if let Ok(Some((target_symbol_id, _target_file_id))) =
                             db.find_symbol_exact_with_file(word)
                         {
+                            t_resolve_total += t_res.elapsed().as_micros();
+                            let t_edge = std::time::Instant::now();
                             if db
                                 .insert_edge_attributed(
                                     source_file_id,
@@ -431,7 +506,13 @@ fn main() {
                             {
                                 edges_created += 1;
                             }
+                            t_edge_insert_total += t_edge.elapsed().as_micros();
+                        } else {
+                            t_resolve_total += t_res.elapsed().as_micros();
+                            count_skipped += 1;
                         }
+                    } else {
+                        count_skipped += 1;
                     }
                 }
 
@@ -439,6 +520,25 @@ fn main() {
                     "Linking complete. Created {} true graph edges.",
                     edges_created
                 );
+                eprintln!(
+                    "[TIMING] Pass 2 (edge linking): {}ms | raw_imports={} edges={} | enclosing_lookup={}µs resolve={}µs edge_insert={}µs | call_edges={} import_edges={} skipped={}",
+                    t_pass2.elapsed().as_millis(),
+                    total_raw_imports,
+                    edges_created,
+                    t_enclosing_total,
+                    t_resolve_total,
+                    t_edge_insert_total,
+                    count_call_edges,
+                    count_import_edges,
+                    count_skipped
+                );
+                eprintln!(
+                    "[TIMING] Pass 2 per-import averages: enclosing={:.1}µs resolve={:.1}µs edge_insert={:.1}µs",
+                    t_enclosing_total as f64 / total_raw_imports.max(1) as f64,
+                    t_resolve_total as f64 / total_raw_imports.max(1) as f64,
+                    t_edge_insert_total as f64 / total_raw_imports.max(1) as f64,
+                );
+
                 // 4.4 Infer logical interaction edges (HTTP/WebSocket runtime
                 // boundaries) and then precompute graph features (pagerank,
                 // fan-in/out, communities, and the is_entrypoint flag). The
@@ -451,24 +551,31 @@ fn main() {
                 // entrypoints on a clean index regardless of how routes were
                 // detected. Running them here makes a full index complete and
                 // identical in shape to the incremental path.
+                let t_interactions = std::time::Instant::now();
                 match indexer::interactions::infer_interactions(&db) {
                     Ok(()) => println!("Inferred logical interaction edges."),
                     Err(e) => println!("Warning: interaction inference failed: {}", e),
                 }
+                eprintln!("[TIMING] infer_interactions: {}ms", t_interactions.elapsed().as_millis());
+
+                let t_features = std::time::Instant::now();
                 match indexer::features::extract_features(&db) {
                     Ok(()) => println!("Computed graph features (pagerank, entrypoints, ...)."),
                     Err(e) => println!("Warning: feature extraction failed: {}", e),
                 }
+                eprintln!("[TIMING] extract_features: {}ms", t_features.elapsed().as_millis());
 
                 // 4.45 Tag symbols with domain concepts (auth, realtime,
                 // notifications, database, ...) independent of literal
                 // name/path matching, so natural-language discovery doesn't
                 // depend entirely on a query term appearing verbatim in a
                 // symbol or file name.
+                let t_concepts = std::time::Instant::now();
                 match query::concepts::tag_concepts(&db) {
                     Ok(count) => println!("Tagged {} symbol/concept matches.", count),
                     Err(e) => println!("Warning: concept tagging failed: {}", e),
                 }
+                eprintln!("[TIMING] tag_concepts: {}ms", t_concepts.elapsed().as_millis());
 
                 // 4.5 Embed symbols for semantic search, if a key is configured.
                 // Silently skipped (not an error) without OPENAI_API_KEY, matching
@@ -476,17 +583,45 @@ fn main() {
                 // deterministic indexing must never require a network call to
                 // complete.
                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let t_embed = std::time::Instant::now();
                 if !openai_key.is_empty() {
                     println!("Generating embeddings for semantic search...");
                     let provider = semantic::openai::OpenAiProvider::new(openai_key);
+
+                    // Replay unchanged embeddings from the old DB — no API call for these.
+                    let t_apply = std::time::Instant::now();
+                    let cache_hits = semantic::embeddings::apply_embedding_cache(&db, &embedding_cache);
+                    eprintln!(
+                        "[TIMING] Apply embedding cache: {}ms ({} hits from cache, bypassed API)",
+                        t_apply.elapsed().as_millis(),
+                        cache_hits
+                    );
+
                     match semantic::embeddings::backfill_missing_embeddings(&db, &provider, None) {
-                        Ok(stats) => println!(
-                            "Embedded {} symbols in {} batch(es).",
-                            stats.embedded, stats.batches
-                        ),
+                        Ok(stats) => {
+                            if stats.failed_batches > 0 {
+                                println!(
+                                    "Embedded {} symbols ({} from cache, {} via API in {} batch(es)). {} batch(es) failed after retries — those symbols will be embedded on the next run.",
+                                    stats.embedded + cache_hits,
+                                    cache_hits,
+                                    stats.embedded,
+                                    stats.batches,
+                                    stats.failed_batches
+                                );
+                            } else {
+                                println!(
+                                    "Embedded {} symbols ({} from cache, {} via API in {} batch(es)).",
+                                    stats.embedded + cache_hits,
+                                    cache_hits,
+                                    stats.embedded,
+                                    stats.batches
+                                );
+                            }
+                        }
                         Err(e) => println!("Warning: embedding generation failed: {}", e),
                     }
                 }
+                eprintln!("[TIMING] backfill_embeddings (total incl. cache): {}ms", t_embed.elapsed().as_millis());
 
                 // 5. Update Metadata timestamp
                 if let Ok(timestamp) =
@@ -500,7 +635,10 @@ fn main() {
 
                 // Flush WAL into the main file before closing, so the temp file is a
                 // single self-contained snapshot before we publish it.
+                let t_wal = std::time::Instant::now();
                 let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                eprintln!("[TIMING] WAL checkpoint: {}ms", t_wal.elapsed().as_millis());
+                eprintln!("[TIMING] === PIPELINE TOTAL (inside DB scope): {}ms ===", t_pipeline.elapsed().as_millis());
             }
 
             let _ = fs::remove_file(format!("{}-wal", FINAL_DB_PATH));
@@ -509,6 +647,7 @@ fn main() {
             let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
             let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
 
+            eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
             println!("Indexing complete! Run a query to test it.");
         }
         Commands::Query { text } => {
@@ -766,7 +905,14 @@ fn main() {
                             Some(&stats.touched_symbol_ids),
                         ) {
                             Ok(embed_stats) => {
-                                println!("Embedded {} symbol(s).", embed_stats.embedded)
+                                if embed_stats.failed_batches > 0 {
+                                    println!(
+                                        "Embedded {} symbol(s). {} batch(es) failed and will retry on next reindex.",
+                                        embed_stats.embedded, embed_stats.failed_batches
+                                    );
+                                } else {
+                                    println!("Embedded {} symbol(s).", embed_stats.embedded);
+                                }
                             }
                             Err(e) => println!("Warning: embedding generation failed: {}", e),
                         }

@@ -36,9 +36,19 @@ impl OpenAiProvider {
         // endpoint: default curl over HTTP/2 hangs, `curl --http1.1`
         // succeeds immediately). HTTP/1.1 avoids that failure mode entirely
         // and OpenAI's API works identically over it.
+        //
+        // Disable automatic gzip/deflate/brotli decompression. When reqwest
+        // decompresses a gzip stream and the connection drops mid-transfer, the
+        // decompressor reports "error decoding response body" instead of a plain
+        // network error — masking the real cause and causing the full 120-second
+        // timeout to expire before the error surfaces. Without auto-decompression
+        // the server sends plain JSON (OpenAI never compresses small API
+        // responses in practice), response.bytes() returns raw JSON, and any
+        // truncation produces a clear network error that retries can recover from.
         let client = Client::builder()
             .http1_only()
             .timeout(Duration::from_secs(60))
+            .gzip(false)
             .build()
             .unwrap_or_else(|_| Client::new());
 
@@ -205,7 +215,7 @@ impl OpenAiProvider {
         let response = match self
             .client
             .post(url)
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(30))
             .bearer_auth(&self.api_key)
             .json(&payload)
             .send()

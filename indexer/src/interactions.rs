@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::time::Instant;
 use storage::Database;
 
 // Very basic inference using file content scanning for now,
 // matching the request to infer generic interactions.
 pub fn infer_interactions(db: &Database) -> Result<(), String> {
+    let t_total = Instant::now();
+
     // 1. Gather all files and their contents
+    let t0 = Instant::now();
     let mut stmt = db
         .conn
         .prepare("SELECT id, path FROM files")
@@ -21,8 +25,14 @@ pub fn infer_interactions(db: &Database) -> Result<(), String> {
             file_contents.insert(file_id, content);
         }
     }
+    eprintln!(
+        "[TIMING:interactions] Re-read {} files from disk: {}ms",
+        file_contents.len(),
+        t0.elapsed().as_millis()
+    );
 
     // 2. Gather entrypoints (e.g., routes)
+    let t1 = Instant::now();
     let mut route_stmt = db.conn.prepare("SELECT id, name, file_id, attributes FROM symbols WHERE kind IN ('route', 'endpoint', 'handler')").map_err(|e| e.to_string())?;
     let mut route_rows = route_stmt.query([]).map_err(|e| e.to_string())?;
 
@@ -42,8 +52,15 @@ pub fn infer_interactions(db: &Database) -> Result<(), String> {
             attributes: row.get(3).unwrap_or(None),
         });
     }
+    eprintln!(
+        "[TIMING:interactions] Load entrypoints: {}ms ({} entrypoints)",
+        t1.elapsed().as_millis(),
+        entrypoints.len()
+    );
 
     // 3. Scan for interactions
+    let t2 = Instant::now();
+    let mut interaction_edges_inserted = 0usize;
     for (file_id, content) in &file_contents {
         // Find all fetch/post/get
         let fetches = extract_literals(content, "fetch(");
@@ -95,10 +112,17 @@ pub fn infer_interactions(db: &Database) -> Result<(), String> {
                     let _ = db.insert_interaction_edge(
                         *file_id, src_sym, ep.id, &metadata, 0.9, // high confidence if matched
                     );
+                    interaction_edges_inserted += 1;
                 }
             }
         }
     }
+    eprintln!(
+        "[TIMING:interactions] Scan + edge insertion ({} edges): {}ms",
+        interaction_edges_inserted,
+        t2.elapsed().as_millis()
+    );
+    eprintln!("[TIMING:interactions] Total infer_interactions: {}ms", t_total.elapsed().as_millis());
 
     Ok(())
 }
