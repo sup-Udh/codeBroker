@@ -166,7 +166,11 @@ pub fn reindex_paths(
         // bare-name fallback), matching the full `codebroker init` linker —
         // otherwise a member call like `query.delete()` re-links to an
         // exported `DELETE` on every incremental reindex. See resolve_call_edge.
-        if edge_kind == "calls" || edge_kind == "method_call" || edge_kind == "MEMBER_ACCESS" {
+        if edge_kind == "calls"
+            || edge_kind == "new_call"
+            || edge_kind == "method_call"
+            || edge_kind == "MEMBER_ACCESS"
+        {
             if let Ok(Some(local_id)) =
                 db.find_symbol_id_in_file_exact(source_file_id, &import_name)
             {
@@ -177,7 +181,7 @@ pub fn reindex_paths(
                 {
                     stats.edges_created += 1;
                 }
-            } else if edge_kind == "calls" || edge_kind == "MEMBER_ACCESS" {
+            } else if edge_kind == "calls" || edge_kind == "new_call" || edge_kind == "MEMBER_ACCESS" {
                 if !GENERIC_SYMBOL_NAMES.contains(&import_name.as_str()) {
                     if let Ok(Some((target_id, target_file_id))) =
                         db.find_symbol_exact_with_file(&import_name)
@@ -231,6 +235,19 @@ pub fn reindex_paths(
 
     // 4. Extract and precompute graph features
     let _ = crate::features::extract_features(db);
+
+    // 5. Validate graph structure and persist completeness metrics.
+    if let Ok(report) = query::validation::validate(db) {
+        if !report.is_valid() {
+            eprintln!(
+                "[graph] validation issues: {} dangling, {} duplicate, {} self-loops",
+                report.dangling_edges, report.duplicate_edges, report.self_loops
+            );
+        }
+    }
+    if let Ok(metrics) = query::metrics::compute_metrics(db) {
+        let _ = query::metrics::save_metrics(db, &metrics);
+    }
 
     Ok(stats)
 }

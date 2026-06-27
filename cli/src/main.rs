@@ -10,9 +10,11 @@ use storage::GENERIC_SYMBOL_NAMES;
 /// `someObject.get()` to a `GET` route, purely on a case-folded name collision.
 ///
 /// Rules:
-/// - Free calls (`foo()`, edge_kind "calls"): try an exact, case-sensitive,
+/// - Free calls (`foo()`, edge_kind "calls") and constructor calls
+///   (`new Foo()`, edge_kind "new_call"): try an exact, case-sensitive,
 ///   same-file definition first (the common local-helper case), then a single
-///   exact, case-sensitive global match.
+///   exact, case-sensitive global match. Constructor names are unique enough
+///   that a global fallback is reliable.
 /// - Member calls (`obj.foo()`, edge_kind "method_call"): only a same-file
 ///   exact match — never a global one, since without type resolution we can't
 ///   know which object `foo` belongs to, and a global guess is always a guess.
@@ -374,6 +376,7 @@ fn main() {
                     // common handler names (e.g. a member call `query.delete()`
                     // linking to an exported `DELETE` route). See resolve_call_edge.
                     if edge_kind == "calls"
+                        || edge_kind == "new_call"
                         || edge_kind == "method_call"
                         || edge_kind == "MEMBER_ACCESS"
                     {
@@ -564,6 +567,38 @@ fn main() {
                     Err(e) => println!("Warning: feature extraction failed: {}", e),
                 }
                 eprintln!("[TIMING] extract_features: {}ms", t_features.elapsed().as_millis());
+
+                // 4.4 Validate graph structure and persist completeness metrics.
+                let t_validate = std::time::Instant::now();
+                match query::validation::validate(&db) {
+                    Ok(report) => {
+                        println!(
+                            "Graph validation: {} symbols, {} edges, import_resolution={:.1}%, connectivity={:.1}%",
+                            report.total_symbols,
+                            report.total_edges,
+                            report.import_resolution_rate() * 100.0,
+                            report.graph_connectivity() * 100.0,
+                        );
+                        if !report.is_valid() {
+                            println!(
+                                "  Issues: {} dangling edges, {} duplicates, {} self-loops",
+                                report.dangling_edges, report.duplicate_edges, report.self_loops
+                            );
+                        }
+                    }
+                    Err(e) => println!("Warning: graph validation failed: {}", e),
+                }
+                match query::metrics::compute_metrics(&db) {
+                    Ok(metrics) => {
+                        println!(
+                            "Graph metrics: density={:.4}, orphans={}, isolated_files={}",
+                            metrics.graph_density, metrics.orphan_symbols, metrics.isolated_files
+                        );
+                        let _ = query::metrics::save_metrics(&db, &metrics);
+                    }
+                    Err(e) => println!("Warning: graph metrics failed: {}", e),
+                }
+                eprintln!("[TIMING] validate+metrics: {}ms", t_validate.elapsed().as_millis());
 
                 // 4.45 Tag symbols with domain concepts (auth, realtime,
                 // notifications, database, ...) independent of literal

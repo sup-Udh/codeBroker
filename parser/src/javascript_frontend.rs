@@ -192,7 +192,7 @@ fn extract_js_imports(
         (call_expression function: (member_expression property: (property_identifier) @method_call))
         (member_expression property: (property_identifier) @member_access)
         (new_expression constructor: (identifier) @new_call)
-        (class_declaration superClass: (identifier) @extends_class)
+        (class_declaration (class_heritage (identifier) @extends_class))
     ";
 
     let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");

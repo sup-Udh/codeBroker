@@ -1,26 +1,26 @@
 //! Shared, single-source-of-truth classification of "entrypoints" (the symbols
 //! a repository exposes to the outside world: HTTP/WebSocket route handlers and
-//! framework page/layout components).
+//! page/layout components identified by file convention).
 //!
 //! Every tool that reports entrypoints (`list_entrypoints`, `project_overview`,
 //! `repository_stats`, `subsystem_stats`, and the `is_entrypoint` feature flag
 //! computed at index time) routes through these functions, so they can never
 //! disagree about what counts as a route vs. a page vs. nothing. Previously the
 //! logic was duplicated and inconsistent: feature extraction used a naive
-//! `contains("@")` decorator check (which both missed `@app.websocket` framing
-//! and falsely flagged `@staticmethod`/`@property`), and the route-vs-page split
+//! `contains("@")` decorator check (which both missed websocket decorators and
+//! falsely flagged `@staticmethod`/`@property`), and the route-vs-page split
 //! was re-derived from the symbol `kind` alone in three different places — none
-//! of which recognised Next.js App Router (`app/**/page.tsx`) file conventions,
+//! of which recognised file-convention entrypoints (`app/**/page.tsx` style),
 //! so every such entrypoint silently reported as zero.
 
 /// How an entrypoint is surfaced to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntrypointClass {
-    /// An API/WebSocket route handler (FastAPI/Flask decorator, Next.js
-    /// `route.ts` / `pages/api`, an explicitly-parsed `route`/`endpoint` kind).
+    /// An API/WebSocket route handler (decorator-based or file-convention-based:
+    /// e.g. `route.ts`/`pages/api`, or an explicitly-parsed `route`/`endpoint` kind).
     Route,
-    /// A user-facing page/layout component (Next.js App Router `page`/`layout`,
-    /// Pages Router page, or an explicitly-parsed `page`/`layout` kind).
+    /// A user-facing page/layout component (file-convention: `app/**/page.*`,
+    /// `app/**/layout.*`, `pages/**/*.{tsx,jsx}`, or an explicit `page`/`layout` kind).
     Page,
     /// A CLI/desktop application entrypoint: Python `__main__.py` convention or
     /// a module-level function named `main` in a Python script.
@@ -47,13 +47,13 @@ fn is_callable_kind(kind_lower: &str) -> bool {
     )
 }
 
-/// True if a decorator string denotes an HTTP/WebSocket route. Handles the
-/// common Python frameworks: FastAPI/Starlette (`@app.get(...)`,
-/// `@router.post(...)`, `@app.websocket(...)`), Flask/Blueprint
-/// (`@app.route(...)`, `@bp.route(...)`), and bare `@get`/`@post` style
-/// decorators. Crucially it does NOT fire for ordinary decorators like
-/// `@staticmethod`, `@property`, `@dataclass`, or `@pytest.fixture`, which the
-/// old `contains("@")` heuristic wrongly promoted to entrypoints.
+/// True if a decorator string denotes an HTTP/WebSocket route. Detects dotted
+/// form (`@obj.get(...)`, `@obj.post(...)`, `@obj.websocket(...)`,
+/// `@obj.route(...)`) and bare form (`@get`, `@post`) based purely on the HTTP
+/// method / route-registration name, without assuming any specific framework.
+/// Does NOT fire for ordinary decorators like `@staticmethod`, `@property`,
+/// `@dataclass`, or `@pytest.fixture`, which the old `contains("@")` heuristic
+/// wrongly promoted to entrypoints.
 pub fn is_route_decorator(attr: &str) -> bool {
     // Strip a leading '@' and take everything up to the first '(' — the
     // "callee" portion, e.g. "app.get" from `@app.get("/x")`.
@@ -108,13 +108,13 @@ fn is_web_component_ext(ext: &str) -> bool {
     matches!(ext, "tsx" | "jsx" | "ts" | "js")
 }
 
-/// Detects Next.js (and similar) file-convention entrypoints purely from the
-/// path. App Router: `app/**/page.{tsx,jsx,ts,js}` and `layout.*` are pages,
-/// `app/**/route.{ts,js}` is an API route. Pages Router: `pages/**/*.{tsx,jsx}`
-/// is a page, `pages/api/**` is a route. `name`/`kind` gate which symbol inside
-/// such a file is treated as the entrypoint so helper functions don't all get
-/// flagged.
-fn nextjs_class(path: &str, name: &str, kind_lower: &str) -> Option<EntrypointClass> {
+/// Detects file-convention entrypoints purely from the directory/file structure.
+/// `app/` convention: files named `route.{ts,js}` are API routes; files named
+/// `page.*`, `layout.*`, `template.*`, or `default.*` are pages. `pages/`
+/// convention: `.tsx`/`.jsx` files are pages; files under `pages/api/` are
+/// routes. `name`/`kind` gate which symbol inside such a file counts as the
+/// entrypoint so co-located helper functions are not flagged.
+fn file_convention_class(path: &str, name: &str, kind_lower: &str) -> Option<EntrypointClass> {
     let normalized = path.replace('\\', "/");
     let lower = normalized.to_lowercase();
     let ext = extension(&normalized);
@@ -126,8 +126,8 @@ fn nextjs_class(path: &str, name: &str, kind_lower: &str) -> Option<EntrypointCl
     let in_app_dir = lower.contains("/app/") || lower.starts_with("app/");
     let in_pages_dir = lower.contains("/pages/") || lower.starts_with("pages/");
 
-    // App Router API route (`app/**/route.ts`): handler functions are named
-    // after the HTTP verb (GET/POST/...), so accept any callable.
+    // `app/**/route.{ts,js}`: handler functions named after the HTTP verb
+    // (GET/POST/...) or any callable exported from that file.
     if in_app_dir && file_stem == "route" && (ext == "ts" || ext == "js") {
         if is_callable_kind(kind_lower) {
             return Some(EntrypointClass::Route);
@@ -135,10 +135,9 @@ fn nextjs_class(path: &str, name: &str, kind_lower: &str) -> Option<EntrypointCl
         return None;
     }
 
-    // App Router page/layout: the default-exported component. Restrict to
-    // callable symbols whose name is component-cased (leading uppercase),
-    // which is the React component convention (e.g. `Home`, `RootLayout`),
-    // so co-located lowercase helpers aren't mistaken for the page.
+    // `app/**/page.*` / `layout.*` / `template.*` / `default.*`: the
+    // exported page/layout component. Restrict to uppercase-leading names
+    // (component convention) so co-located lowercase helpers aren't flagged.
     if in_app_dir
         && matches!(
             file_stem.as_str(),
@@ -157,7 +156,7 @@ fn nextjs_class(path: &str, name: &str, kind_lower: &str) -> Option<EntrypointCl
         return None;
     }
 
-    // Pages Router.
+    // `pages/**/*.{tsx,jsx}`: page files; `pages/api/**` → route.
     if in_pages_dir && (ext == "tsx" || ext == "jsx") {
         // `_app`/`_document` are framework plumbing, not user pages.
         if file_stem == "_app" || file_stem == "_document" {
@@ -202,7 +201,7 @@ pub fn classify_entrypoint(
         _ => {}
     }
 
-    // 2. Decorator-based routes (FastAPI/Flask/Starlette).
+    // 2. Decorator-based routes (dotted or bare HTTP-method decorators).
     if is_callable_kind(&kind_lower) {
         for attr in attributes {
             if is_route_decorator(attr) {
@@ -211,8 +210,8 @@ pub fn classify_entrypoint(
         }
     }
 
-    // 3. Framework file conventions (Next.js App Router / Pages Router).
-    if let Some(c) = nextjs_class(path, name, &kind_lower) {
+    // 3. Directory file-convention entrypoints (app/, pages/ layouts).
+    if let Some(c) = file_convention_class(path, name, &kind_lower) {
         return Some(c);
     }
 
@@ -251,7 +250,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fastapi_decorators_are_routes() {
+    fn http_method_decorators_are_routes() {
         for d in [
             "@app.get(\"/\")",
             "@app.post(\"/analyze-topology\")",
@@ -293,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_app_router_page_and_layout() {
+    fn app_dir_page_and_layout_are_pages() {
         assert_eq!(
             classify_entrypoint("Home", "function", "OrcaAI/frontend/app/page.tsx", &[]),
             Some(EntrypointClass::Page)
@@ -310,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_lowercase_helper_in_page_is_not_entrypoint() {
+    fn lowercase_helper_in_page_file_is_not_entrypoint() {
         assert_eq!(
             classify_entrypoint(
                 "formatDate",
@@ -323,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_app_router_route_is_a_route() {
+    fn app_dir_route_file_is_a_route() {
         assert_eq!(
             classify_entrypoint("GET", "function", "app/api/users/route.ts", &[]),
             Some(EntrypointClass::Route)

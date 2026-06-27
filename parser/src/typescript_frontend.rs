@@ -286,7 +286,6 @@ fn extract_ts_imports(
         (member_expression property: (property_identifier) @member_access)
         (new_expression constructor: (identifier) @new_call)
         (extends_clause value: (identifier) @extends_class)
-        (extends_clause value: (type_identifier) @extends_class)
         (implements_clause (type_identifier) @implements_type)
     ",
     );
@@ -443,5 +442,59 @@ mod data_const_tests {
                 .iter()
                 .any(|s| s.name == "FOO" && s.kind == "constant")
         );
+    }
+
+    #[test]
+    fn named_import_produces_import_edge() {
+        let src = r#"import { timeAgo } from "../lib/timeFormat";
+function render() { return timeAgo(1); }"#;
+        let (_meta, _symbols, imports) = TypeScriptFrontend
+            .parse_and_extract(src, "dashboard.ts")
+            .expect("parse should succeed");
+        let import_names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
+        let import_edge = imports.iter().find(|i| i.name == "timeAgo" && i.kind.as_deref() == Some("imports"));
+        assert!(
+            import_edge.is_some(),
+            "named import must produce an imports edge; import names found: {import_names:?}"
+        );
+        assert_eq!(
+            import_edge.unwrap().source.as_deref(),
+            Some("../lib/timeFormat"),
+            "import source must be the module path"
+        );
+    }
+
+    #[test]
+    fn ts_import_query_must_compile() {
+        // This test guards against the silent Err(_) => return imports fallback
+        // in extract_ts_imports. If the combined query string fails to compile,
+        // the test fails loudly here instead of silently producing 0 imports.
+        let query_str = "
+        (import_statement
+            (import_clause (named_imports (import_specifier name: (identifier) @import)))
+            source: (string (string_fragment) @source)
+        )
+        (import_statement
+            (import_clause (identifier) @import)
+            source: (string (string_fragment) @source)
+        )
+        (import_statement
+            (import_clause (namespace_import (identifier) @ns_import))
+            source: (string (string_fragment) @source)
+        )
+        (export_statement
+            (export_clause (export_specifier name: (identifier) @re_export))
+            source: (string (string_fragment) @source)
+        )
+        (call_expression function: (identifier) @call_name)
+        (call_expression function: (member_expression property: (property_identifier) @method_call))
+        (member_expression property: (property_identifier) @member_access)
+        (new_expression constructor: (identifier) @new_call)
+        (extends_clause value: (identifier) @extends_class)
+        (implements_clause (type_identifier) @implements_type)
+        ";
+        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        tree_sitter::Query::new(&language, query_str)
+            .expect("TypeScript import query must compile without errors");
     }
 }

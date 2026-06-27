@@ -318,7 +318,9 @@ fn extract_py_imports(
             }
         }
 
-        if !import_name.is_empty() {
+        // Wildcard imports (`from x import *`) can't resolve to a specific
+        // symbol, so they produce no edge.
+        if !import_name.is_empty() && import_name != "*" {
             imports.push(ImportNode {
                 name: import_name,
                 source: if import_source.is_empty() {
