@@ -17,7 +17,7 @@ pub struct GraphMetrics {
     pub graph_connectivity: f64,
     /// Average edges per symbol.
     pub graph_density: f64,
-    /// Fraction of raw_imports for which the linker produced an edge.
+    /// Fraction of relationships for which the linker produced an edge.
     pub import_resolution_rate: f64,
     /// Edge count per edge kind ("calls", "imports", "extends", …).
     pub edge_distribution: HashMap<String, i64>,
@@ -121,15 +121,15 @@ pub fn compute_metrics(db: &Database) -> Result<GraphMetrics> {
         total_edges as f64 / total_symbols as f64
     };
 
-    let total_raw_imports: i64 = db
+    let total_relationships: i64 = db
         .conn
-        .query_row("SELECT COUNT(*) FROM raw_imports", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))
         .unwrap_or(0);
 
     let unresolved: i64 = db
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM raw_imports ri
+            "SELECT COUNT(*) FROM relationships ri
              WHERE NOT EXISTS (
                  SELECT 1 FROM edges e
                  WHERE e.source_file_id = ri.file_id
@@ -140,10 +140,10 @@ pub fn compute_metrics(db: &Database) -> Result<GraphMetrics> {
         )
         .unwrap_or(0);
 
-    let import_resolution_rate = if total_raw_imports == 0 {
+    let import_resolution_rate = if total_relationships == 0 {
         1.0
     } else {
-        (total_raw_imports - unresolved) as f64 / total_raw_imports as f64
+        (total_relationships - unresolved) as f64 / total_relationships as f64
     };
 
     let mut edge_distribution = HashMap::new();

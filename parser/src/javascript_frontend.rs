@@ -1,5 +1,5 @@
 use crate::frontend::LanguageFrontend;
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct JavaScriptFrontend;
@@ -12,11 +12,12 @@ impl LanguageFrontend for JavaScriptFrontend {
     fn parse_and_extract(
         &self,
         source_code: &str,
-        _path: &str,
+        path: &str,
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_javascript::LANGUAGE.into();
         let mut parser = Parser::new();
@@ -25,11 +26,18 @@ impl LanguageFrontend for JavaScriptFrontend {
         let tree = parser.parse(source_code, None)?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
+        let symbols = extract_js_symbols(&tree, source_code, language, path);
 
-        let symbols = extract_js_symbols(&tree, source_code, language.clone(), _path);
-        let imports = extract_js_imports(&tree, source_code, language);
+        let mut collector = crate::discovery::RelationshipCollector::new();
+        crate::discovery::LanguageVisitor::visit(
+            &crate::discovery::javascript::JavaScriptVisitor,
+            &tree,
+            source_code,
+            &mut collector,
+        );
+        let relationships = collector.into_relationship_nodes();
 
-        Some((metadata, symbols, imports))
+        Some((metadata, symbols, relationships, Vec::new()))
     }
 }
 
@@ -165,11 +173,12 @@ fn extract_js_symbols(
     symbols
 }
 
+#[allow(dead_code)]
 fn extract_js_imports(
     tree: &Tree,
     source_code: &str,
     language: tree_sitter::Language,
-) -> Vec<ImportNode> {
+) -> Vec<RelationshipNode> {
     let mut imports = Vec::new();
     let query_str = "
         (import_statement
@@ -276,7 +285,7 @@ fn extract_js_imports(
         }
 
         if !import_name.is_empty() {
-            imports.push(ImportNode {
+            imports.push(RelationshipNode {
                 name: import_name,
                 source: if import_source.is_empty() {
                     None
@@ -308,7 +317,7 @@ mod call_resolution_tests {
             }
             function helper() {}
         "#;
-        let (_meta, _symbols, imports) = JavaScriptFrontend
+        let (_meta, _symbols, imports, _) = JavaScriptFrontend
             .parse_and_extract(src, "route.js")
             .expect("parse should succeed");
 

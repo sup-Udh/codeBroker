@@ -19,11 +19,11 @@ It uses a plugin-based architecture centered around the `GraphValidator` trait. 
 - **Self Loops**: Detects edges where the source symbol points to itself (recursion vs. bad local attribution).
 
 ### Import Diagnostics (`ImportValidator`)
-- **Unresolved Imports**: Finds `raw_imports` (kind `imports`) that never produced an edge.
+- **Unresolved Imports**: Finds `relationships` (kind `imports`) that never produced an edge.
 - The validator classifies failures into actionable likely causes: Alias failures, External dependencies, Missing files, or Namespace imports.
 
 ### Call Diagnostics (`CallValidator`)
-- **Unresolved Calls**: Identifies `raw_imports` (kinds `calls`, `method_call`, `new_call`) missing resolution edges.
+- **Unresolved Calls**: Identifies `relationships` (kinds `calls`, `method_call`, `new_call`) missing resolution edges.
 - Classifies missing method calls as dynamic/type-inference dependent, and missing free calls as unresolved globals.
 
 ## Graph Health Computation

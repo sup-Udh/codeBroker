@@ -1,5 +1,5 @@
 use crate::frontend::LanguageFrontend;
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct PythonFrontend;
@@ -16,7 +16,8 @@ impl LanguageFrontend for PythonFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_python::LANGUAGE.into();
         let mut parser = Parser::new();
@@ -24,10 +25,23 @@ impl LanguageFrontend for PythonFrontend {
 
         let tree = parser.parse(source_code, None)?;
 
-        let symbols = extract_py_symbols(&tree, source_code, language.clone());
-        let imports = extract_py_imports(&tree, source_code, language);
+        let symbols = extract_py_symbols(&tree, source_code, language);
 
-        Some((graph::models::FileMetadata::default(), symbols, imports))
+        let mut collector = crate::discovery::RelationshipCollector::new();
+        crate::discovery::LanguageVisitor::visit(
+            &crate::discovery::python::PythonVisitor,
+            &tree,
+            source_code,
+            &mut collector,
+        );
+        let relationships = collector.into_relationship_nodes();
+        let semantic = crate::discovery::LanguageVisitor::visit_semantic(
+            &crate::discovery::python::PythonVisitor,
+            &tree,
+            source_code,
+        );
+
+        Some((graph::models::FileMetadata::default(), symbols, relationships, semantic))
     }
 }
 
@@ -96,13 +110,8 @@ fn extract_py_symbols(
                 let mut current = node.parent();
                 while let Some(p) = current {
                     if p.kind() == "class_definition" {
-                        if let Some(class_name_node) = p.child_by_field_name("name") {
-                            if let Ok(class_name) =
-                                class_name_node.utf8_text(source_code.as_bytes())
-                            {
-                                name = format!("{}.{}", class_name, name);
-                                kind = "method".to_string();
-                            }
+                        if p.child_by_field_name("name").is_some() {
+                            kind = "method".to_string();
                         }
                         break;
                     }
@@ -187,7 +196,7 @@ def simulate(topology: Topology):
 def analyze(topology: dict):
     return topology
 ";
-        let (_m, _syms, imports) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
+        let (_m, _syms, imports, _) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
 
         let type_refs: Vec<&str> = imports
             .iter()
@@ -215,7 +224,7 @@ class Result:
 def run() -> Result:
     return Result()
 ";
-        let (_m, _syms, imports) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
+        let (_m, _syms, imports, _) = PythonFrontend.parse_and_extract(src, "main.py").unwrap();
         assert!(
             imports
                 .iter()
@@ -225,11 +234,12 @@ def run() -> Result:
     }
 }
 
+#[allow(dead_code)]
 fn extract_py_imports(
     tree: &Tree,
     source_code: &str,
     language: tree_sitter::Language,
-) -> Vec<ImportNode> {
+) -> Vec<RelationshipNode> {
     let mut imports = Vec::new();
     // Grab any individual identifier inside any import statement
     let query_str = "
@@ -321,7 +331,7 @@ fn extract_py_imports(
         // Wildcard imports (`from x import *`) can't resolve to a specific
         // symbol, so they produce no edge.
         if !import_name.is_empty() && import_name != "*" {
-            imports.push(ImportNode {
+            imports.push(RelationshipNode {
                 name: import_name,
                 source: if import_source.is_empty() {
                     None

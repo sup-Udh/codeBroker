@@ -1,5 +1,5 @@
 use crate::frontend::LanguageFrontend;
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 
 pub struct ConfigFrontend;
 
@@ -21,7 +21,8 @@ impl LanguageFrontend for ConfigFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
         let mut symbols = Vec::new();
 
@@ -75,6 +76,6 @@ impl LanguageFrontend for ConfigFrontend {
             }
         }
 
-        Some((graph::models::FileMetadata::default(), symbols, Vec::new()))
+        Some((graph::models::FileMetadata::default(), symbols, Vec::new(), Vec::new()))
     }
 }

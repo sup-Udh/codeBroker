@@ -29,7 +29,7 @@ pub struct IncrementalStats {
 /// symbols — necessary, since those symbols are about to be deleted and
 /// reinserted with new auto-increment ids, making the old ids dangling.
 /// Pass 2 below therefore must re-link not just the touched files' own
-/// outgoing edges, but every OTHER file's `raw_imports` row that references
+/// outgoing edges, but every OTHER file's `relationships` row that references
 /// a symbol name just (re)inserted into a touched file — otherwise those
 /// cross-file consumers' edges are deleted here and never recreated,
 /// silently losing real reverse-dependency data (the untouched consumer
@@ -120,11 +120,16 @@ pub fn reindex_paths(
         touched_file_ids.push(file_id);
         stats.files_processed += 1;
 
-        if let Some((metadata, symbols, imports)) =
+        if let Some((metadata, symbols, imports, semantic_bindings)) =
             frontend.parse_and_extract(&source_code, &stored_path)
         {
             let _ = db.update_file_metadata(file_id, metadata.metadata.as_deref());
+            let mut seen_syms = std::collections::HashSet::new();
             for symbol in symbols {
+                let key = (symbol.name.clone(), symbol.kind.clone(), symbol.start_byte);
+                if !seen_syms.insert(key) {
+                    continue; // duplicate from overlapping tree-sitter captures
+                }
                 if let Ok(symbol_id) = db.insert_symbol(file_id, &symbol) {
                     stats.symbols_inserted += 1;
                     stats.touched_symbol_ids.push(symbol_id);
@@ -132,104 +137,24 @@ pub fn reindex_paths(
                 }
             }
             for import in imports {
-                let _ = db.insert_raw_import(file_id, &import);
+                let _ = db.insert_relationship(file_id, &import);
+            }
+            for binding in semantic_bindings {
+                let _ = db.insert_semantic_binding(file_id, &binding);
             }
         }
     }
 
-    // Scoped pass 2: re-link raw_imports belonging to files we just touched
+    // Scoped pass 2: re-link relationships belonging to files we just touched
     // (their own outgoing edges), PLUS any other file's raw_import that
     // references a symbol name we just re-inserted (their now-dangling
     // incoming edges — see the correctness note on this function). Re-running
     // the full linker unconditionally would re-insert duplicate edges for
     // every untouched file in the repo; this keeps the scope to exactly the
     // touched files plus their known consumers.
-    let raw_imports = db
-        .get_all_raw_imports_with_lines()
-        .map_err(|e| e.to_string())?;
-    for (_raw_id, source_file_id, import_name, _import_source, import_kind, line_number) in
-        raw_imports
-    {
-        let is_touched_source = touched_file_ids.contains(&source_file_id);
-        let references_touched_symbol = touched_symbol_names.contains(&import_name);
-        if !is_touched_source && !references_touched_symbol {
-            continue;
-        }
-        let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
-        // Attribute the edge to its enclosing symbol (by line) so cycle
-        // detection has a symbol-level graph, matching the full init linker.
-        let src_sym = db
-            .enclosing_symbol_id(source_file_id, line_number)
-            .unwrap_or(None);
-
-        // Call edges use case-sensitive, scope-aware resolution (no global
-        // bare-name fallback), matching the full `codebroker init` linker —
-        // otherwise a member call like `query.delete()` re-links to an
-        // exported `DELETE` on every incremental reindex. See resolve_call_edge.
-        if edge_kind == "calls"
-            || edge_kind == "new_call"
-            || edge_kind == "method_call"
-            || edge_kind == "MEMBER_ACCESS"
-        {
-            if let Ok(Some(local_id)) =
-                db.find_symbol_id_in_file_exact(source_file_id, &import_name)
-            {
-                if src_sym != Some(local_id)
-                    && db
-                        .insert_edge_attributed(source_file_id, src_sym, local_id, &edge_kind)
-                        .is_ok()
-                {
-                    stats.edges_created += 1;
-                }
-            } else if edge_kind == "calls" || edge_kind == "new_call" || edge_kind == "MEMBER_ACCESS" {
-                if !GENERIC_SYMBOL_NAMES.contains(&import_name.as_str()) {
-                    if let Ok(Some((target_id, target_file_id))) =
-                        db.find_symbol_exact_with_file(&import_name)
-                    {
-                        if target_file_id != source_file_id
-                            && db
-                                .insert_edge_attributed(
-                                    source_file_id,
-                                    src_sym,
-                                    target_id,
-                                    &edge_kind,
-                                )
-                                .is_ok()
-                        {
-                            stats.edges_created += 1;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Resolve the import/reference name AS A WHOLE, case-sensitively. The
-        // old word-split + case-insensitive match fabricated phantom edges
-        // (e.g. `topology_agent` -> the `Topology` class); see the matching
-        // comment in cli's full linker. A compound identifier is one name.
-        let word = import_name.as_str();
-        if !word.is_empty() && !GENERIC_SYMBOL_NAMES.contains(&word) {
-            if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, word) {
-                if src_sym != Some(local_id)
-                    && db
-                        .insert_edge_attributed(source_file_id, src_sym, local_id, &edge_kind)
-                        .is_ok()
-                {
-                    stats.edges_created += 1;
-                }
-            } else if let Ok(Some((target_symbol_id, _tfid))) = db.find_symbol_exact_with_file(word)
-            {
-                if db
-                    .insert_edge_attributed(source_file_id, src_sym, target_symbol_id, &edge_kind)
-                    .is_ok()
-                {
-                    stats.edges_created += 1;
-                }
-            }
-        }
-    }
-
+    let (edges_created, _) = crate::resolver::resolve_relationships(db, Some(&touched_file_ids)).unwrap_or((0,0));
+    stats.edges_created += edges_created;
+    
     // 3. Infer logical interactions
     let _ = crate::interactions::infer_interactions(db);
 
@@ -276,7 +201,7 @@ mod tests {
     // ONLY the file defining a helper silently lost every OTHER file's edge
     // into that helper. `delete_file_data` deletes a touched file's incoming
     // edges (correct — the symbol is about to get a new id), but the old
-    // pass 2 only re-linked raw_imports whose source_file_id was itself a
+    // pass 2 only re-linked relationships whose source_file_id was itself a
     // touched file, so untouched consumer files were never revisited and
     // their now-dangling edges were never recreated.
     #[test]

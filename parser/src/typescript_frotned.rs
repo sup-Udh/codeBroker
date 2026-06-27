@@ -10,7 +10,7 @@ impl LanguageFrontend for TypeScriptFrontend {
 
     // parse-extract:
 
-    fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<ImportNode>)> {
+    fn parse_and_extract(&self, source_code: &str) -> Option<(Vec<SymbolNode>, Vec<RelationshipNode>)> {
         // 1. Initialize the TypeScript language parser
         let language = tree_sitter_typescript::language_typescript();
         let mut parser = tree_sitter::Parser::new();

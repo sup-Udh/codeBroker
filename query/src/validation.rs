@@ -10,7 +10,7 @@ pub struct ValidationReport {
     pub total_symbols: i64,
     pub total_files: i64,
     pub total_edges: i64,
-    pub total_raw_imports: i64,
+    pub total_relationships: i64,
     /// Edges whose source_symbol_id or target_symbol_id no longer exist in
     /// the symbols table. Should always be zero; a non-zero value indicates a
     /// reindex that deleted symbols without cascading the delete to edges.
@@ -33,19 +33,19 @@ pub struct ValidationReport {
     /// Raw imports for which the linker created no edge of the matching kind
     /// from the same file. Over-counts stdlib/builtin names that legitimately
     /// don't resolve, but gives a useful directional measure.
-    pub unresolved_raw_imports: i64,
+    pub unresolved_relationships: i64,
     /// Human-readable descriptions of each non-zero issue found.
     pub issues: Vec<String>,
 }
 
 impl ValidationReport {
-    /// Fraction of raw_imports for which at least one edge was created.
+    /// Fraction of relationships for which at least one edge was created.
     pub fn import_resolution_rate(&self) -> f64 {
-        if self.total_raw_imports == 0 {
+        if self.total_relationships == 0 {
             return 1.0;
         }
-        (self.total_raw_imports - self.unresolved_raw_imports) as f64
-            / self.total_raw_imports as f64
+        (self.total_relationships - self.unresolved_relationships) as f64
+            / self.total_relationships as f64
     }
 
     /// Fraction of symbols that participate in at least one edge.
@@ -67,7 +67,7 @@ impl ValidationReport {
         md.push_str(&format!("| Files indexed | {} |\n", self.total_files));
         md.push_str(&format!("| Symbols indexed | {} |\n", self.total_symbols));
         md.push_str(&format!("| Edges | {} |\n", self.total_edges));
-        md.push_str(&format!("| Raw imports staged | {} |\n", self.total_raw_imports));
+        md.push_str(&format!("| Raw imports staged | {} |\n", self.total_relationships));
         md.push_str(&format!("| Dangling edges | {} |\n", self.dangling_edges));
         md.push_str(&format!("| Duplicate edges | {} |\n", self.duplicate_edges));
         md.push_str(&format!("| Self-loops | {} |\n", self.self_loops));
@@ -111,9 +111,9 @@ pub fn validate(db: &Database) -> Result<ValidationReport> {
         .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
         .unwrap_or(0);
 
-    let total_raw_imports: i64 = db
+    let total_relationships: i64 = db
         .conn
-        .query_row("SELECT COUNT(*) FROM raw_imports", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))
         .unwrap_or(0);
 
     let dangling_edges: i64 = db
@@ -183,10 +183,10 @@ pub fn validate(db: &Database) -> Result<ValidationReport> {
     // Raw imports for which no edge of the same kind was created from the same
     // file. This over-estimates unresolved for stdlib names, but gives a
     // consistent directional signal across reindexes.
-    let unresolved_raw_imports: i64 = db
+    let unresolved_relationships: i64 = db
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM raw_imports ri
+            "SELECT COUNT(*) FROM relationships ri
              WHERE NOT EXISTS (
                  SELECT 1 FROM edges e
                  WHERE e.source_file_id = ri.file_id
@@ -221,13 +221,13 @@ pub fn validate(db: &Database) -> Result<ValidationReport> {
         total_symbols,
         total_files,
         total_edges,
-        total_raw_imports,
+        total_relationships,
         dangling_edges,
         duplicate_edges,
         self_loops,
         orphan_symbols,
         isolated_files,
-        unresolved_raw_imports,
+        unresolved_relationships,
         issues,
     })
 }
@@ -299,9 +299,9 @@ mod tests {
         let db = Database::new(":memory:").unwrap();
         db.init_schema().unwrap();
         let f = db.insert_file("a.py", "h").unwrap();
-        db.insert_raw_import(
+        db.insert_relationship(
             f,
-            &graph::ImportNode {
+            &graph::RelationshipNode {
                 name: "something".to_string(),
                 source: None,
                 line_number: 1,
@@ -311,8 +311,8 @@ mod tests {
         .unwrap();
         let report = validate(&db).unwrap();
         // 1 raw import, 0 edges → 0% resolution
-        assert_eq!(report.total_raw_imports, 1);
-        assert_eq!(report.unresolved_raw_imports, 1);
+        assert_eq!(report.total_relationships, 1);
+        assert_eq!(report.unresolved_relationships, 1);
         assert!((report.import_resolution_rate() - 0.0).abs() < 1e-9);
     }
 }

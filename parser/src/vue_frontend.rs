@@ -1,7 +1,7 @@
 use crate::frontend::LanguageFrontend;
 use crate::javascript_frontend::JavaScriptFrontend;
 use crate::typescript_frontend::TsxFrontend;
-use graph::models::{FileMetadata, ImportNode, SymbolNode};
+use graph::models::{FileMetadata, RelationshipNode, SemanticBinding, SymbolNode};
 
 pub struct VueFrontend;
 
@@ -14,8 +14,7 @@ impl LanguageFrontend for VueFrontend {
         &self,
         source_code: &str,
         path: &str,
-    ) -> Option<(FileMetadata, Vec<SymbolNode>, Vec<ImportNode>)> {
-        // Find <script> block and extract its content
+    ) -> Option<(FileMetadata, Vec<SymbolNode>, Vec<RelationshipNode>, Vec<SemanticBinding>)> {
         let mut script_content = String::new();
         let mut is_ts = false;
         let mut in_script = false;
@@ -26,7 +25,6 @@ impl LanguageFrontend for VueFrontend {
                 if line.contains("lang=\"ts\"") || line.contains("lang='ts'") {
                     is_ts = true;
                 }
-                // Maintain line numbers by pushing blank lines
                 script_content.push_str("\n");
                 continue;
             } else if line.contains("</script>") {
@@ -49,8 +47,7 @@ impl LanguageFrontend for VueFrontend {
             JavaScriptFrontend.parse_and_extract(&script_content, path)
         };
 
-        if let Some((_, _, ref mut imports)) = result {
-            // Process template bindings
+        if let Some((_, _, ref mut imports, _)) = result {
             let re = regex::Regex::new(
                 r#"(?:@|v-on:|v-model|:)[a-zA-Z0-9_\-]+="([a-zA-Z0-9_]+)(?:\(|")"#,
             )
@@ -58,7 +55,7 @@ impl LanguageFrontend for VueFrontend {
             for (line_idx, line) in source_code.lines().enumerate() {
                 for cap in re.captures_iter(line) {
                     if let Some(handler) = cap.get(1) {
-                        imports.push(ImportNode {
+                        imports.push(RelationshipNode {
                             name: handler.as_str().to_string(),
                             source: None,
                             line_number: line_idx + 1,

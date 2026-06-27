@@ -1,3 +1,52 @@
+/// Semantic binding from static type analysis — not a graph edge, used only
+/// during indexing to propagate type information for receiver resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticBindingKind {
+    /// Explicit type annotation: `const x: Type` or `x: Type` (Python)
+    VarType,
+    /// Function return type annotation: `function f(): Type` or `def f() -> Type`
+    ReturnType,
+    /// Class / struct field type: `class C { field: Type }` (context = class name)
+    FieldType,
+    /// Simple alias assignment: `const x = y` where y is an identifier
+    Alias,
+}
+
+impl SemanticBindingKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SemanticBindingKind::VarType => "var_type",
+            SemanticBindingKind::ReturnType => "return_type",
+            SemanticBindingKind::FieldType => "field_type",
+            SemanticBindingKind::Alias => "alias",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "var_type" => Some(SemanticBindingKind::VarType),
+            "return_type" => Some(SemanticBindingKind::ReturnType),
+            "field_type" => Some(SemanticBindingKind::FieldType),
+            "alias" => Some(SemanticBindingKind::Alias),
+            _ => None,
+        }
+    }
+}
+
+/// A semantic fact extracted from a file during parsing, stored separately from
+/// graph relationships so that it doesn't appear in resolution metrics.
+#[derive(Debug, Clone)]
+pub struct SemanticBinding {
+    pub kind: SemanticBindingKind,
+    /// The name being bound: variable name, function name, or field name.
+    pub name: String,
+    /// The type or source name:
+    /// - VarType/ReturnType/FieldType: the type identifier (e.g. "Database")
+    /// - Alias: the source variable name (e.g. `const x = y` → type_name = "y")
+    pub type_name: String,
+    /// For FieldType: the class name that owns this field.
+    pub context: Option<String>,
+}
+
 /// Universal code relationships used as edge `kind` values in the graph.
 /// Every parser frontend and linker must use these constants instead of
 /// inline string literals so there is one authoritative list of edge kinds.
@@ -36,6 +85,11 @@ pub mod edge_kind {
     pub const INTERACTION: &str = "interaction";
     /// A component rendered inside another component's output.
     pub const COMPONENT_USE: &str = "component_use";
+    /// Decorator, attribute, or annotation applied to a symbol:
+    /// `#[derive(Debug)]`, `@Injectable()`, `@app.get("/")`.
+    pub const ANNOTATION: &str = "annotation";
+    /// Generic type constraint: `T: Clone` (Rust) or `T extends Serializable` (TypeScript).
+    pub const GENERIC_CONSTRAINT: &str = "generic_constraint";
 }
 
 #[derive(Debug, Default)]
@@ -55,7 +109,62 @@ pub struct SymbolNode {
     pub metadata: Option<String>,
 }
 
-pub struct ImportNode {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionState {
+    RepositorySymbol,
+    WorkspaceModule,
+    ExternalDependency,
+    StandardLibrary,
+    Builtin,
+    Dynamic,
+    Ambiguous,
+    Unknown,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolutionEvidence {
+    ImportMatch,
+    VariableAssignment,
+    TypeAnnotation,
+    ConstructorCall,
+    ModuleExport,
+    LexicalScopeMatch,
+    NamespaceMatch,
+}
+
+impl ResolutionEvidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResolutionEvidence::ImportMatch => "ImportMatch",
+            ResolutionEvidence::VariableAssignment => "VariableAssignment",
+            ResolutionEvidence::TypeAnnotation => "TypeAnnotation",
+            ResolutionEvidence::ConstructorCall => "ConstructorCall",
+            ResolutionEvidence::ModuleExport => "ModuleExport",
+            ResolutionEvidence::LexicalScopeMatch => "LexicalScopeMatch",
+            ResolutionEvidence::NamespaceMatch => "NamespaceMatch",
+        }
+    }
+}
+
+impl ResolutionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResolutionState::RepositorySymbol => "RepositorySymbol",
+            ResolutionState::WorkspaceModule => "WorkspaceModule",
+            ResolutionState::ExternalDependency => "ExternalDependency",
+            ResolutionState::StandardLibrary => "StandardLibrary",
+            ResolutionState::Builtin => "Builtin",
+            ResolutionState::Dynamic => "Dynamic",
+            ResolutionState::Ambiguous => "Ambiguous",
+            ResolutionState::Unknown => "Unknown",
+            ResolutionState::Missing => "Missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationshipNode {
     pub name: String,
     pub source: Option<String>,
     pub line_number: usize,

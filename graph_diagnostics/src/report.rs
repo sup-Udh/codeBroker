@@ -9,16 +9,33 @@ pub struct GraphHealth {
     pub metrics: HashMap<String, f64>,
 }
 
+/// Counts of discovered relationships broken down by kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiscoveryStats {
+    pub by_kind: HashMap<String, i64>,
+    pub total: i64,
+}
+
+/// Counts of resolved relationships broken down by resolution state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResolutionStats {
+    pub by_state: HashMap<String, i64>,
+    pub total: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsReport {
     pub total_files: i64,
     pub total_symbols: i64,
     pub total_edges: i64,
-    pub total_raw_imports: i64,
-    
+    pub total_relationships: i64,
+
+    pub discovery: DiscoveryStats,
+    pub resolution: ResolutionStats,
+
     pub findings: Vec<DiagnosticFinding>,
     pub health: GraphHealth,
-    
+
     pub passed: bool,
 }
 
@@ -28,11 +45,41 @@ impl DiagnosticsReport {
         out.push_str("====================================\n");
         out.push_str("CodeBroker Graph Diagnostics\n");
         out.push_str("====================================\n\n");
-        
+
         out.push_str(&format!("Files   {}\n", self.total_files));
         out.push_str(&format!("Symbols {}\n", self.total_symbols));
         out.push_str(&format!("Edges   {}\n", self.total_edges));
         out.push_str("------------------------------------\n\n");
+
+        // Relationship discovery section
+        if self.discovery.total > 0 {
+            out.push_str("Relationship Discovery\n\n");
+            let mut kinds: Vec<_> = self.discovery.by_kind.iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(a.1));
+            for (kind, count) in &kinds {
+                let dots = ".".repeat(28_usize.saturating_sub(kind.len()));
+                out.push_str(&format!("{}{}{}\n", kind, dots, count));
+            }
+            let label = "Total Relationships";
+            let dots = ".".repeat(28_usize.saturating_sub(label.len()));
+            out.push_str(&format!("\n{}{}{}\n", label, dots, self.discovery.total));
+            out.push_str("------------------------------------\n\n");
+        }
+
+        // Resolution section
+        if self.resolution.total > 0 {
+            out.push_str("Relationship Resolution\n\n");
+            let mut states: Vec<_> = self.resolution.by_state.iter().collect();
+            states.sort_by(|a, b| b.1.cmp(a.1));
+            for (state, count) in &states {
+                let dots = ".".repeat(28_usize.saturating_sub(state.len()));
+                out.push_str(&format!("{}{}{}\n", state, dots, count));
+            }
+            let label = "Total Resolved";
+            let dots = ".".repeat(28_usize.saturating_sub(label.len()));
+            out.push_str(&format!("\n{}{}{}\n", label, dots, self.resolution.total));
+            out.push_str("------------------------------------\n\n");
+        }
         
         // Group findings by severity
         let mut criticals = 0;

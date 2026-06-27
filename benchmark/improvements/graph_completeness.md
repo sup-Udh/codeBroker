@@ -103,10 +103,10 @@ Checks run post-index:
 - **Self-loops** — `source_symbol_id == target_symbol_id`
 - **Orphan symbols** — symbols with no edges (in or out)
 - **Isolated files** — files with no cross-file edges
-- **Unresolved imports** — raw_imports with no matching graph edge
+- **Unresolved imports** — relationships with no matching graph edge
 
 `ValidationReport` provides:
-- `import_resolution_rate()` — fraction of raw_imports resolved to edges
+- `import_resolution_rate()` — fraction of relationships resolved to edges
 - `graph_connectivity()` — fraction of files with ≥1 cross-file edge
 - `is_valid()` — `dangling_edges == 0 && duplicate_edges == 0`
 
@@ -206,6 +206,79 @@ same-file only.
 
 ---
 
+## Static Semantic Analysis Engine (Phase 6)
+
+### Semantic Bindings (`semantic_bindings` table)
+
+New DB table stores per-file semantic facts extracted by each language frontend:
+
+| Kind | What it captures | Example |
+|------|-----------------|---------|
+| `VarType` | Annotated variable/parameter types | `const x: MyClass = …`, `(req: Request)` |
+| `FieldType` | Class field type annotations | `private db: Database` |
+| `ReturnType` | Function/method return types | `function f(): MyType` |
+| `Alias` | Bare identifier assignments | `const foo = bar` |
+
+- `CASCADE DELETE` on `file_id` FK so incremental reindex cleans them automatically
+- Extracted by `visit_semantic()` in each language's `LanguageVisitor` implementation
+
+### TypeScript Semantic Extraction
+
+- Variable type annotations: `const x: Type` (plain and `Generic<T>`)
+- Function/method/arrow parameter types: `(req: Request, res: Response)` — uses `pattern:` field per tree-sitter TS grammar
+- Function/method return types
+- Class field types (plain and generic: `Map<K, V>` extracts `Map`)
+- Alias assignments: `const x = y`
+
+**Generic type support**: Both `(type_identifier)` and `(generic_type name: (type_identifier))` patterns are captured, extracting the outer type name (`Map<K,V>` → `Map`).
+
+**Receiver type filter**: `is_js_receiver_type()` allows `Array`, `Map`, `Set`, `Promise` etc. to be stored as semantic bindings even though `is_ts_builtin_type()` filters them from type_ref edges (preventing spurious Missing relationships).
+
+### Python Semantic Extraction
+
+- Variable annotations: `x: Type = …` (`annotated_assignment`)
+- Function return types
+- Class field annotations in class body
+- Alias assignments: `x = y`
+- **Method symbol naming fix**: Methods stored as short name (not `ClassName.method`) so `find_method_in_type` can match by parent byte-range containment
+
+### TypeScript Class Method Symbol Indexing
+
+Added `(class_declaration body: (class_body (method_definition name: (property_identifier) @method)))` to `extract_ts_symbols`.
+
+Methods are now indexed as individual symbols with kind `"method"`. The `parent_map` in `SymbolIndex::build()` uses byte-range containment to link methods to their class. `find_method_in_type("register", "AuthService")` now works.
+
+### ReceiverResolutionStage Enhancements
+
+When `resolve_field_type("orders")` returns `"Map"` and `"Map"` is in `JS_BUILTIN_RECEIVERS`, the call is immediately classified as `Builtin`. This handles:
+- `this.orders.set(key, val)` — `orders: Map<K,V>` → Builtin
+- `res.status(400)` — `res: Response` (parameter annotation) → Builtin
+- `this.authService.register()` — `authService: AuthService` → RepositorySymbol
+
+### Noisy Call Filter Expansion (`is_noisy_rust_call`)
+
+Extended to cover ~80 Rust stdlib and external crate method names that can never resolve to repository symbols:
+- Rust stdlib: string/slice/iterator adapters, Path methods, Duration/Instant
+- rusqlite: `query_row`, `query_map`, `prepare`, `query`
+- tree-sitter: `root_node`, `utf8_text`, `start_position`, `end_position`, `capture_names`
+- Regex: `captures_iter`, `is_match`
+- serde_json: `as_object`, `as_array`, `as_f64`, `as_i64`
+
+Effect: **1724 fewer relationships emitted** (2613 → 884 for `method_call`), reducing Dynamic count and graph noise.
+
+### Phase 6 Metrics (vs Phase 5 baseline)
+
+| Metric | Phase 5 | Phase 6 | Delta |
+|--------|---------|---------|-------|
+| Method Resolution Success | 15.04% | **40.38%** | +25.34 pp |
+| Dynamic Fallback Rate | 49.42% | **28.41%** | −21.01 pp |
+| Import Resolution Success | 93.82% | 93.94% | +0.12 pp |
+| Total Relationships | 5561 | 3837 | −1724 |
+| Builtin (method_call) | 6 | 59 | +53 |
+| RepositorySymbol | 1155 | 1142 | −13 (removed false positives) |
+
+---
+
 ## Remaining Unresolved Patterns
 
 1. **Default exports** — `export default class Foo` → the symbol name `Foo` is
@@ -213,19 +286,26 @@ same-file only.
    separate edge. Callers doing `import Foo from '…'` link correctly; callers
    doing `import X from '…'` (aliased) may not.
 
-2. **Rust method calls** — `obj.method()` is not extracted. Adding method-call
-   edges would require type inference to determine the receiver type; without it,
-   global matching would fabricate phantom edges.
+2. **Rust method calls** — Rust type inference is not performed. Rust method
+   calls go through the noisy filter, and the residual Dynamic (~262 method_calls)
+   are calls on external crate objects with receiver-specific names.
 
-3. **Rust generic type parameters** — `impl<T: Trait>` captures `T` and `Trait`;
+3. **Chained method calls** — `res.status(400).json({…})` has `source=None`
+   because the receiver is the result of another call, not an identifier. These
+   cannot be resolved without return-type tracking through the call chain.
+
+4. **Rust generic type parameters** — `impl<T: Trait>` captures `T` and `Trait`;
    single-character names are filtered but multi-character generic params (`Key`,
    `Val`) are not. Improvement requires detecting the generic parameter context.
 
-4. **TypeScript `extends` on interfaces** — `interface Foo extends Bar` uses
+5. **TypeScript `extends` on interfaces** — `interface Foo extends Bar` uses
    `extends_type_clause`, not `extends_clause`. These are currently not captured.
    Pattern: `(extends_type_clause type: (type_identifier) @extends_class)`.
 
-5. **Wildcard re-exports** — `export * from '…'` cannot link to specific symbols.
+6. **Wildcard re-exports** — `export * from '…'` cannot link to specific symbols.
+
+7. **Array-literal typed fields** — `items: ItemType[]` uses `array_type` node,
+   not `generic_type`, so `Array` is not captured as the outer type.
 
 ---
 

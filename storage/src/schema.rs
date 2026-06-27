@@ -42,13 +42,16 @@ pub const INIT_SQL: &str = "
         FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
 
-    CREATE TABLE IF NOT EXISTS raw_imports (
+    CREATE TABLE IF NOT EXISTS relationships (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         source TEXT,
         line_number INTEGER NOT NULL,
         kind TEXT,
+        state TEXT,
+        confidence REAL DEFAULT 1.0,
+        evidence TEXT,
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 
@@ -109,6 +112,20 @@ pub const INIT_SQL: &str = "
         overview_text TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Semantic bindings extracted by static analysis during indexing.
+    -- Separate from the relationships table so they don't appear in resolution
+    -- metrics. Deleted on incremental reindex via delete_file_data.
+    CREATE TABLE IF NOT EXISTS semantic_bindings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        type_name TEXT NOT NULL,
+        context TEXT,
+        FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_semantic_bindings_file ON semantic_bindings(file_id);
 
     CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,

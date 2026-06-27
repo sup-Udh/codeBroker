@@ -63,7 +63,7 @@ impl GraphValidator for EdgeValidator {
                     severity: Severity::Error,
                     title: format!("Duplicate Edge ({})", k),
                     description: "The same edge was inserted multiple times.".to_string(),
-                    likely_cause: "insert_edge_attributed dedup logic failed, or multiple raw_imports resolved to the same target.".to_string(),
+                    likely_cause: "insert_edge_attributed dedup logic failed, or multiple relationships resolved to the same target.".to_string(),
                     suggested_fix: "Apply UNIQUE constraint on edges or filter duplicates at resolution time.".to_string(),
                     file_id: Some(sf),
                     symbol_id: ss,

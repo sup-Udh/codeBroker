@@ -1,5 +1,5 @@
 use crate::frontend::LanguageFrontend;
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct TypeScriptFrontend;
@@ -16,7 +16,8 @@ impl LanguageFrontend for TypeScriptFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
         let mut parser = Parser::new();
@@ -25,11 +26,11 @@ impl LanguageFrontend for TypeScriptFrontend {
         let tree = parser.parse(source_code, None)?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
-
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
-        let imports = extract_ts_imports(&tree, source_code, language, false);
+        let relationships = extract_ts_relationships(&tree, source_code, false);
+        let semantic = extract_ts_semantic_bindings(&tree, source_code, false);
 
-        Some((metadata, symbols, imports))
+        Some((metadata, symbols, relationships, semantic))
     }
 }
 
@@ -47,7 +48,8 @@ impl LanguageFrontend for TsxFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_typescript::LANGUAGE_TSX.into();
         let mut parser = Parser::new();
@@ -56,11 +58,11 @@ impl LanguageFrontend for TsxFrontend {
         let tree = parser.parse(source_code, None)?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
-
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
-        let imports = extract_ts_imports(&tree, source_code, language, true);
+        let relationships = extract_ts_relationships(&tree, source_code, true);
+        let semantic = extract_ts_semantic_bindings(&tree, source_code, true);
 
-        Some((metadata, symbols, imports))
+        Some((metadata, symbols, relationships, semantic))
     }
 }
 
@@ -80,17 +82,20 @@ fn extract_ts_symbols(
         "
         (class_declaration name: (type_identifier) @type)
         (interface_declaration name: (type_identifier) @type)
-        (function_declaration 
+        (class_declaration
+          body: (class_body
+            (method_definition name: (property_identifier) @method)))
+        (function_declaration
             name: (identifier) @function
-            parameters: (formal_parameters 
+            parameters: (formal_parameters
                 (required_parameter type: (type_annotation (type_identifier) @prop_type))
             )?
         )
-        (lexical_declaration 
-            (variable_declarator 
-                name: (identifier) @function 
-                value: (arrow_function 
-                    parameters: (formal_parameters 
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @function
+                value: (arrow_function
+                    parameters: (formal_parameters
                         (required_parameter type: (type_annotation (type_identifier) @prop_type))
                     )?
                 )
@@ -137,6 +142,7 @@ fn extract_ts_symbols(
                 if *capture_kind == "function"
                     || *capture_kind == "type"
                     || *capture_kind == "data_const"
+                    || *capture_kind == "method"
                 {
                     symbol_name = text.to_string();
                     symbol_kind = capture_kind.to_string();
@@ -256,12 +262,40 @@ fn extract_ts_symbols(
     symbols
 }
 
+pub(crate) fn extract_ts_relationships(
+    tree: &Tree,
+    source_code: &str,
+    is_tsx: bool,
+) -> Vec<RelationshipNode> {
+    let mut collector = crate::discovery::RelationshipCollector::new();
+    crate::discovery::LanguageVisitor::visit(
+        &crate::discovery::typescript::TypeScriptVisitor { is_tsx },
+        tree,
+        source_code,
+        &mut collector,
+    );
+    collector.into_relationship_nodes()
+}
+
+fn extract_ts_semantic_bindings(
+    tree: &Tree,
+    source_code: &str,
+    is_tsx: bool,
+) -> Vec<SemanticBinding> {
+    crate::discovery::LanguageVisitor::visit_semantic(
+        &crate::discovery::typescript::TypeScriptVisitor { is_tsx },
+        tree,
+        source_code,
+    )
+}
+
+#[allow(dead_code)]
 fn extract_ts_imports(
     tree: &Tree,
     source_code: &str,
     language: tree_sitter::Language,
     is_tsx: bool,
-) -> Vec<ImportNode> {
+) -> Vec<RelationshipNode> {
     let mut imports = Vec::new();
     let mut query_str = String::from(
         "
@@ -376,7 +410,7 @@ fn extract_ts_imports(
         }
 
         if !import_name.is_empty() {
-            imports.push(ImportNode {
+            imports.push(RelationshipNode {
                 name: import_name,
                 source: if import_source.is_empty() {
                     None
@@ -434,7 +468,7 @@ mod data_const_tests {
     #[test]
     fn smoke_test_via_frontend() {
         let src = "export const FOO = [1, 2, 3];";
-        let (_meta, symbols, _imports) = TypeScriptFrontend
+        let (_meta, symbols, _imports, _) = TypeScriptFrontend
             .parse_and_extract(src, "foo.ts")
             .expect("parse should succeed");
         assert!(
@@ -448,7 +482,7 @@ mod data_const_tests {
     fn named_import_produces_import_edge() {
         let src = r#"import { timeAgo } from "../lib/timeFormat";
 function render() { return timeAgo(1); }"#;
-        let (_meta, _symbols, imports) = TypeScriptFrontend
+        let (_meta, _symbols, imports, _) = TypeScriptFrontend
             .parse_and_extract(src, "dashboard.ts")
             .expect("parse should succeed");
         let import_names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();

@@ -3,74 +3,6 @@ use rusqlite::params;
 use std::fs;
 use storage::GENERIC_SYMBOL_NAMES;
 
-/// Resolves a call/method-call raw_import into a graph edge without the
-/// case-insensitive global bare-name matching the import linker uses. That
-/// matching fabricated phantom edges for short, repeated handler names: a
-/// member call `query.delete()` would link to an exported `DELETE`, and
-/// `someObject.get()` to a `GET` route, purely on a case-folded name collision.
-///
-/// Rules:
-/// - Free calls (`foo()`, edge_kind "calls") and constructor calls
-///   (`new Foo()`, edge_kind "new_call"): try an exact, case-sensitive,
-///   same-file definition first (the common local-helper case), then a single
-///   exact, case-sensitive global match. Constructor names are unique enough
-///   that a global fallback is reliable.
-/// - Member calls (`obj.foo()`, edge_kind "method_call"): only a same-file
-///   exact match — never a global one, since without type resolution we can't
-///   know which object `foo` belongs to, and a global guess is always a guess.
-/// - Self-referential edges (target symbol defined in the calling file and
-///   matched globally) are skipped to avoid `X -> X` self-loops.
-fn resolve_call_edge(
-    db: &storage::Database,
-    source_file_id: i64,
-    source_symbol_id: Option<i64>,
-    name: &str,
-    edge_kind: &str,
-    edges_created: &mut i64,
-) {
-    if name.is_empty() {
-        return;
-    }
-
-    if let Ok(Some(local_id)) = db.find_symbol_id_in_file_exact(source_file_id, name) {
-        // Skip a symbol calling itself: a self-edge is a cycle-detection
-        // artifact, not a dependency relationship.
-        if source_symbol_id == Some(local_id) {
-            return;
-        }
-        if db
-            .insert_edge_attributed(source_file_id, source_symbol_id, local_id, edge_kind)
-            .is_ok()
-        {
-            *edges_created += 1;
-        }
-        return;
-    }
-
-    // Member access never falls back to a global match.
-    if edge_kind == "method_call" || edge_kind == "MEMBER_ACCESS" {
-        return;
-    }
-
-    if GENERIC_SYMBOL_NAMES.contains(&name) {
-        return;
-    }
-
-    if let Ok(Some((target_id, target_file_id))) = db.find_symbol_exact_with_file(name) {
-        // A same-file match would have been caught above; reaching here with
-        // target_file_id == source_file_id can only be a self-reference.
-        if target_file_id == source_file_id {
-            return;
-        }
-        if db
-            .insert_edge_attributed(source_file_id, source_symbol_id, target_id, edge_kind)
-            .is_ok()
-        {
-            *edges_created += 1;
-        }
-    }
-}
-
 // 1. Define the CLI arguments
 #[derive(Parser)]
 #[command(name = "codebroker")]
@@ -270,18 +202,29 @@ fn main() {
                             pass1_files += 1;
 
                             // D. The Universal Extraction (Zero language-specific code here!)
-                            if let Some((metadata, symbols, imports)) = parsed {
+                            if let Some((metadata, symbols, imports, semantic_bindings)) = parsed {
                                 let metadata_str = metadata.metadata.as_deref().unwrap_or("{}");
                                 let _ = db.update_file_metadata(file_id, Some(metadata_str));
 
+                                // Deduplicate symbols by (name, kind, start_byte) before
+                                // insertion to prevent duplicate DB rows from overlapping
+                                // tree-sitter query captures.
+                                let mut seen_syms = std::collections::HashSet::new();
                                 for symbol in symbols {
-                                    db.insert_symbol(file_id, &symbol).unwrap();
-                                    pass1_symbols += 1;
+                                    let key = (symbol.name.clone(), symbol.kind.clone(), symbol.start_byte);
+                                    if seen_syms.insert(key) {
+                                        db.insert_symbol(file_id, &symbol).unwrap();
+                                        pass1_symbols += 1;
+                                    }
                                 }
 
                                 for import in imports {
-                                    db.insert_raw_import(file_id, &import).unwrap();
+                                    db.insert_relationship(file_id, &import).unwrap();
                                     pass1_imports += 1;
+                                }
+
+                                for binding in semantic_bindings {
+                                    let _ = db.insert_semantic_binding(file_id, &binding);
                                 }
 
                                 // Angular split file logic
@@ -301,13 +244,13 @@ fn main() {
                                             {
                                                 for cap in re.captures_iter(line_str) {
                                                     if let Some(handler) = cap.get(1) {
-                                                        let import_node = graph::ImportNode {
+                                                        let import_node = graph::RelationshipNode {
                                                             name: handler.as_str().to_string(),
                                                             source: None,
                                                             line_number: line_idx + 1,
                                                             kind: Some("calls".to_string()),
                                                         };
-                                                        db.insert_raw_import(file_id, &import_node)
+                                                        db.insert_relationship(file_id, &import_node)
                                                             .unwrap();
                                                     }
                                                 }
@@ -321,7 +264,7 @@ fn main() {
                     }
                 }
                 eprintln!(
-                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | files={} symbols={} raw_imports={}",
+                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | files={} symbols={} relationships={}",
                     t_pass1.elapsed().as_millis(),
                     pass1_parse_ms,
                     pass1_db_insert_ms,
@@ -333,216 +276,10 @@ fn main() {
                 // --- PASS 2: THE LINKER ---
                 println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
                 let t_pass2 = std::time::Instant::now();
-
-                // 1. Get all the "Missing Friends" from our staging table
-                let t_fetch_imports = std::time::Instant::now();
-                let raw_imports = db
-                    .get_all_raw_imports_with_lines()
-                    .expect("Failed to fetch raw imports");
-                let total_raw_imports = raw_imports.len();
-                eprintln!("[TIMING] Fetch raw_imports: {}ms ({} rows)", t_fetch_imports.elapsed().as_millis(), total_raw_imports);
-                let mut edges_created = 0;
-
-                // Per-import timing accumulators
-                let mut t_enclosing_total = 0u128;
-                let mut t_resolve_total = 0u128;
-                let mut t_edge_insert_total = 0u128;
-                let mut count_call_edges = 0usize;
-                let mut count_import_edges = 0usize;
-                let mut count_skipped = 0usize;
-                let mut count_path_resolved = 0usize;
-
-                // 2. Loop through every single staged import
-                for (
-                    _raw_id,
-                    source_file_id,
-                    import_name,
-                    import_source,
-                    import_kind,
-                    line_number,
-                ) in raw_imports
-                {
-                    let edge_kind = import_kind.unwrap_or_else(|| "imports".to_string());
-                    // Attribute this edge to the symbol whose body contains the
-                    // call/reference, so dependency_cycles has a real symbol graph
-                    // (None for top-level imports outside any symbol).
-                    let t_enc = std::time::Instant::now();
-                    let src_sym = db
-                        .enclosing_symbol_id(source_file_id, line_number)
-                        .unwrap_or(None);
-                    t_enclosing_total += t_enc.elapsed().as_micros();
-
-                    // Call edges are resolved case-sensitively and without the
-                    // global bare-name fallback that the import path uses below,
-                    // because that fallback fabricated phantom relationships for
-                    // common handler names (e.g. a member call `query.delete()`
-                    // linking to an exported `DELETE` route). See resolve_call_edge.
-                    if edge_kind == "calls"
-                        || edge_kind == "new_call"
-                        || edge_kind == "method_call"
-                        || edge_kind == "MEMBER_ACCESS"
-                    {
-                        let t_res = std::time::Instant::now();
-                        resolve_call_edge(
-                            &db,
-                            source_file_id,
-                            src_sym,
-                            &import_name,
-                            &edge_kind,
-                            &mut edges_created,
-                        );
-                        t_resolve_total += t_res.elapsed().as_micros();
-                        count_call_edges += 1;
-                        continue;
-                    }
-
-                    // Determine if we have a source path we can resolve via aliases
-                    let mut resolved_source = import_source.clone();
-                    if let Some(src) = &import_source {
-                        for (alias, path_prefix) in &alias_map {
-                            if src.starts_with(alias) {
-                                resolved_source = Some(src.replace(alias, path_prefix));
-                                break;
-                            }
-                        }
-
-                        if resolved_source.is_none() && src.contains('.') && !src.contains('/') {
-                            let py_path = src.replace(".", "/");
-                            resolved_source = Some(format!("{}.py", py_path));
-                        }
-                    }
-
-                    // If we resolved a path, let's try to link exactly to that file's export
-                    if let Some(src) = resolved_source {
-                        count_path_resolved += 1;
-                        let t_res = std::time::Instant::now();
-                        // Very rudimentary resolution: find a file containing the path
-                        // NOTE: prepare() called inside the loop — re-parsed every iteration.
-                        let mut file_stmt = db
-                            .conn
-                            .prepare("SELECT id FROM files WHERE path LIKE ?1 LIMIT 1")
-                            .unwrap();
-                        let search_path = format!("%{}%", src);
-                        if let Ok(target_file_id) =
-                            file_stmt.query_row(params![search_path], |row| row.get::<_, i64>(0))
-                        {
-                            // find a symbol in that file that matches the name
-                            // NOTE: prepare() called inside the loop — re-parsed every iteration.
-                            let mut sym_stmt = db.conn.prepare("SELECT id FROM symbols WHERE file_id = ?1 AND LOWER(name) = LOWER(?2) LIMIT 1").unwrap();
-                            if let Ok(target_symbol_id) = sym_stmt
-                                .query_row(params![target_file_id, import_name], |row| {
-                                    row.get::<_, i64>(0)
-                                })
-                            {
-                                t_resolve_total += t_res.elapsed().as_micros();
-                                let t_edge = std::time::Instant::now();
-                                let _ = db.insert_edge_attributed(
-                                    source_file_id,
-                                    src_sym,
-                                    target_symbol_id,
-                                    &edge_kind,
-                                );
-                                t_edge_insert_total += t_edge.elapsed().as_micros();
-                                edges_created += 1;
-                                continue;
-                            }
-                        }
-                        t_resolve_total += t_res.elapsed().as_micros();
-                    }
-
-                    // Fallback to global symbol resolution.
-                    //
-                    // We resolve the import/reference name AS A WHOLE, case-
-                    // sensitively. The previous implementation split the name on
-                    // every non-alphanumeric boundary and matched each fragment
-                    // case-INSENSITIVELY, which manufactured phantom dependency
-                    // edges: `from ai.topology_understanding_agent import
-                    // topology_agent` split into `topology` + `agent`, and the
-                    // `topology` fragment then matched a `Topology` pydantic
-                    // class — so `analyze_topology` (which never references the
-                    // class) became a "dependent" of `Topology`, while the
-                    // function that genuinely takes a `topology: Topology`
-                    // parameter was missed entirely. A compound identifier is a
-                    // single name; sub-word substring matching across case is a
-                    // coincidence, not a reference.
-                    let word = import_name.as_str();
-                    if !word.is_empty() && !GENERIC_SYMBOL_NAMES.contains(&word) {
-                        count_import_edges += 1;
-                        let t_res = std::time::Instant::now();
-                        // Local-first: a same-file definition of the exact name.
-                        // NOTE: prepare() is called inside the loop — re-parsed every iteration.
-                        let mut local_stmt = db
-                            .conn
-                            .prepare(
-                                "SELECT id FROM symbols WHERE file_id = ?1 AND name = ?2 LIMIT 1",
-                            )
-                            .unwrap();
-                        if let Ok(local_symbol_id) = local_stmt
-                            .query_row(params![source_file_id, word], |row| row.get::<_, i64>(0))
-                        {
-                            t_resolve_total += t_res.elapsed().as_micros();
-                            let t_edge = std::time::Instant::now();
-                            if src_sym != Some(local_symbol_id)
-                                && db
-                                    .insert_edge_attributed(
-                                        source_file_id,
-                                        src_sym,
-                                        local_symbol_id,
-                                        &edge_kind,
-                                    )
-                                    .is_ok()
-                            {
-                                edges_created += 1;
-                            }
-                            t_edge_insert_total += t_edge.elapsed().as_micros();
-                        } else if let Ok(Some((target_symbol_id, _target_file_id))) =
-                            db.find_symbol_exact_with_file(word)
-                        {
-                            t_resolve_total += t_res.elapsed().as_micros();
-                            let t_edge = std::time::Instant::now();
-                            if db
-                                .insert_edge_attributed(
-                                    source_file_id,
-                                    src_sym,
-                                    target_symbol_id,
-                                    &edge_kind,
-                                )
-                                .is_ok()
-                            {
-                                edges_created += 1;
-                            }
-                            t_edge_insert_total += t_edge.elapsed().as_micros();
-                        } else {
-                            t_resolve_total += t_res.elapsed().as_micros();
-                            count_skipped += 1;
-                        }
-                    } else {
-                        count_skipped += 1;
-                    }
-                }
-
-                println!(
-                    "Linking complete. Created {} true graph edges.",
-                    edges_created
-                );
-                eprintln!(
-                    "[TIMING] Pass 2 (edge linking): {}ms | raw_imports={} edges={} | enclosing_lookup={}µs resolve={}µs edge_insert={}µs | call_edges={} import_edges={} skipped={}",
-                    t_pass2.elapsed().as_millis(),
-                    total_raw_imports,
-                    edges_created,
-                    t_enclosing_total,
-                    t_resolve_total,
-                    t_edge_insert_total,
-                    count_call_edges,
-                    count_import_edges,
-                    count_skipped
-                );
-                eprintln!(
-                    "[TIMING] Pass 2 per-import averages: enclosing={:.1}µs resolve={:.1}µs edge_insert={:.1}µs",
-                    t_enclosing_total as f64 / total_raw_imports.max(1) as f64,
-                    t_resolve_total as f64 / total_raw_imports.max(1) as f64,
-                    t_edge_insert_total as f64 / total_raw_imports.max(1) as f64,
-                );
+                let (edges_created, total_relationships) =
+        indexer::resolver::resolve_relationships(&db, None).expect("Linker failed");
+                println!("Linking complete. Created {} true graph edges from {} relationships.", edges_created, total_relationships);
+                eprintln!("[TIMING] Pass 2 (edge linking): {}ms", t_pass2.elapsed().as_millis());
 
                 // 4.4 Infer logical interaction edges (HTTP/WebSocket runtime
                 // boundaries) and then precompute graph features (pagerank,
@@ -1466,124 +1203,4 @@ Treat native tools as the repository's implementation layer."#;
     }
 }
 
-#[cfg(test)]
-mod call_edge_tests {
-    use super::*;
 
-    fn sym(name: &str) -> graph::SymbolNode {
-        graph::SymbolNode {
-            name: name.to_string(),
-            kind: "function".to_string(),
-            start_line: 1,
-            end_line: 1,
-            start_byte: 0,
-            end_byte: 0,
-            signature: None,
-            attributes: Vec::new(),
-            metadata: None,
-        }
-    }
-
-    fn count_edges(db: &storage::Database) -> i64 {
-        db.conn
-            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
-            .unwrap_or(0)
-    }
-
-    // #2 — call_resolution_fixture: a member call `someObject.get()` (tagged
-    // method_call) in file B must NOT create an edge to an exported `GET` in
-    // file A. Bare/case-folded name matching used to fabricate exactly this.
-    #[test]
-    fn method_call_does_not_link_to_same_named_toplevel_symbol() {
-        let db = storage::Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_a = db.insert_file("a.ts", "h").unwrap(); // defines GET
-        db.insert_symbol(file_a, &sym("GET")).unwrap();
-        let file_b = db.insert_file("b.ts", "h").unwrap(); // calls someObject.get()
-
-        let mut created = 0i64;
-        // member access -> method_call, name "get"
-        resolve_call_edge(&db, file_b, None, "get", "method_call", &mut created);
-        // member access with exact-case name "GET"
-        resolve_call_edge(&db, file_b, None, "GET", "method_call", &mut created);
-
-        assert_eq!(
-            created, 0,
-            "member calls must not link to a top-level symbol"
-        );
-        assert_eq!(count_edges(&db), 0);
-    }
-
-    #[test]
-    fn free_call_resolution_is_case_sensitive() {
-        let db = storage::Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_a = db.insert_file("a.ts", "h").unwrap();
-        db.insert_symbol(file_a, &sym("fetchWidgets")).unwrap();
-        let file_b = db.insert_file("b.ts", "h").unwrap();
-
-        let mut created = 0i64;
-        // lowercase free call `fetchwidgets()` must NOT match `fetchWidgets` (case-sensitive).
-        resolve_call_edge(&db, file_b, None, "fetchwidgets", "calls", &mut created);
-        assert_eq!(created, 0, "case-folded match must not happen");
-        assert_eq!(count_edges(&db), 0);
-
-        // exact-case free call `fetchWidgets()` from another file DOES link.
-        resolve_call_edge(&db, file_b, None, "fetchWidgets", "calls", &mut created);
-        assert_eq!(created, 1, "exact-case free call should resolve");
-        assert_eq!(count_edges(&db), 1);
-    }
-
-    // GENERIC_SYMBOL_NAMES (GET/POST/DELETE/createClient/etc) are excluded
-    // from the global bare-name match entirely, even with an exact-case hit —
-    // see GENERIC_SYMBOL_NAMES for why (CodeBroker Fix #1: a member call like
-    // `query.delete()` was fabricating an edge to an exported `DELETE` route
-    // purely on a name collision).
-    #[test]
-    fn free_call_resolution_excludes_generic_names_even_on_exact_case_match() {
-        let db = storage::Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_a = db.insert_file("a.ts", "h").unwrap();
-        db.insert_symbol(file_a, &sym("GET")).unwrap();
-        let file_b = db.insert_file("b.ts", "h").unwrap();
-
-        let mut created = 0i64;
-        resolve_call_edge(&db, file_b, None, "GET", "calls", &mut created);
-        assert_eq!(
-            created, 0,
-            "generic name must not resolve globally even on exact case match"
-        );
-        assert_eq!(count_edges(&db), 0);
-    }
-
-    #[test]
-    fn free_call_links_to_same_file_helper() {
-        let db = storage::Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_a = db.insert_file("a.ts", "h").unwrap();
-        db.insert_symbol(file_a, &sym("helper")).unwrap();
-
-        let mut created = 0i64;
-        resolve_call_edge(&db, file_a, None, "helper", "calls", &mut created);
-        assert_eq!(created, 1, "same-file helper call should resolve locally");
-    }
-
-    // #1 — a symbol calling itself (recursion) must not create a self-edge,
-    // since dependency_cycles would otherwise see a length-1 cycle.
-    #[test]
-    fn recursive_self_call_creates_no_self_edge() {
-        let db = storage::Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_a = db.insert_file("a.ts", "h").unwrap();
-        let recur = db.insert_symbol(file_a, &sym("recur")).unwrap();
-
-        let mut created = 0i64;
-        // recur() called from within recur's own body (source_symbol == target).
-        resolve_call_edge(&db, file_a, Some(recur), "recur", "calls", &mut created);
-        assert_eq!(
-            created, 0,
-            "a function calling itself must not create a self-edge"
-        );
-        assert_eq!(count_edges(&db), 0);
-    }
-}

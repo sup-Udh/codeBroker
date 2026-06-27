@@ -1,4 +1,5 @@
 pub mod config_frontend;
+pub mod discovery;
 pub mod extractor;
 pub mod frontend;
 pub mod javascript_frontend;

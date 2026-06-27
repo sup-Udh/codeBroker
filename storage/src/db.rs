@@ -1,4 +1,4 @@
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SemanticBindingKind, SymbolNode};
 use rusqlite::params;
 use rusqlite::{Connection, Result};
 
@@ -186,10 +186,22 @@ impl Database {
             .execute("ALTER TABLE files ADD COLUMN metadata TEXT;", []);
         let _ = self
             .conn
-            .execute("ALTER TABLE raw_imports ADD COLUMN source TEXT;", []);
+            .execute("ALTER TABLE relationships RENAME TO relationships;", []);
         let _ = self
             .conn
-            .execute("ALTER TABLE raw_imports ADD COLUMN kind TEXT;", []);
+            .execute("ALTER TABLE relationships ADD COLUMN source TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE relationships ADD COLUMN kind TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE relationships ADD COLUMN state TEXT;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE relationships ADD COLUMN confidence REAL DEFAULT 1.0;", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE relationships ADD COLUMN evidence TEXT;", []);
         let _ = self
             .conn
             .execute("ALTER TABLE symbols ADD COLUMN signature TEXT;", []);
@@ -375,27 +387,59 @@ impl Database {
         Ok(out)
     }
 
-    /// Inserts an import as a special kind of symbol
-    pub fn insert_raw_import(&self, file_id: i64, import: &ImportNode) -> Result<i64> {
+    /// Inserts a generic relationship (import, call, reference)
+    pub fn insert_relationship(&self, file_id: i64, rel: &RelationshipNode) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO raw_imports (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, import.name, import.source, import.line_number as i64, import.kind],
+            "INSERT INTO relationships (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, rel.name, rel.source, rel.line_number as i64, rel.kind],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    // new methods:
+    /// Insert a semantic binding (type annotation, field type, return type, alias).
+    pub fn insert_semantic_binding(&self, file_id: i64, binding: &SemanticBinding) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO semantic_bindings (file_id, kind, name, type_name, context) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, binding.kind.as_str(), binding.name, binding.type_name, binding.context],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
 
-    /// Pass 2 Helper: Gets all staged imports that need to be resolved
-    pub fn get_all_raw_imports(
+    /// Returns all semantic bindings grouped by file_id.
+    /// Tuple: (file_id, SemanticBinding)
+    pub fn get_all_semantic_bindings(&self) -> Result<Vec<(i64, SemanticBinding)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, kind, name, type_name, context FROM semantic_bindings ORDER BY file_id",
+        )?;
+        let iter = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for item in iter {
+            let (file_id, kind_str, name, type_name, context) = item?;
+            if let Some(kind) = SemanticBindingKind::from_str(&kind_str) {
+                results.push((file_id, SemanticBinding { kind, name, type_name, context }));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Pass 2 Helper: Gets all staged relationships that need to be resolved
+    pub fn get_all_relationships(
         &self,
     ) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>)>> {
-        // Returns a tuple of (raw_import_id, file_id, import_name, source, kind)
+        // Returns a tuple of (relationship_id, file_id, name, source, kind)
         let mut stmt = self
             .conn
-            .prepare("SELECT id, file_id, name, source, kind FROM raw_imports")?;
+            .prepare("SELECT id, file_id, name, source, kind FROM relationships")?;
 
-        let import_iter = stmt.query_map([], |row| {
+        let rel_iter = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -406,24 +450,24 @@ impl Database {
         })?;
 
         let mut results = Vec::new();
-        for import in import_iter {
-            results.push(import?);
+        for rel in rel_iter {
+            results.push(rel?);
         }
         Ok(results)
     }
 
-    /// Like `get_all_raw_imports`, but also returns each import/call's
+    /// Like `get_all_relationships`, but also returns each relationship's
     /// `line_number`. The linker uses the line to resolve which symbol a call
     /// originates from (`enclosing_symbol_id`) and record it as the edge's
     /// `source_symbol_id`, so cycle detection has a real symbol-level graph.
-    /// Tuple: (raw_import_id, file_id, import_name, source, kind, line_number).
-    pub fn get_all_raw_imports_with_lines(
+    /// Tuple: (relationship_id, file_id, name, source, kind, line_number).
+    pub fn get_all_relationships_with_lines(
         &self,
     ) -> Result<Vec<(i64, i64, String, Option<String>, Option<String>, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_id, name, source, kind, line_number FROM raw_imports ORDER BY id",
+            "SELECT id, file_id, name, source, kind, line_number FROM relationships ORDER BY id",
         )?;
-        let import_iter = stmt.query_map([], |row| {
+        let rel_iter = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -434,10 +478,26 @@ impl Database {
             ))
         })?;
         let mut results = Vec::new();
-        for import in import_iter {
-            results.push(import?);
+        for rel in rel_iter {
+            results.push(rel?);
         }
         Ok(results)
+    }
+
+    /// Updates the resolved state of a relationship
+    pub fn update_relationship_state(
+        &self,
+        rel_id: i64,
+        state: &str,
+        confidence: f64,
+        evidence: Option<graph::models::ResolutionEvidence>,
+    ) -> Result<()> {
+        let evidence_str = evidence.map(|e| e.as_str());
+        self.conn.execute(
+            "UPDATE relationships SET state = ?1, confidence = ?2, evidence = ?3 WHERE id = ?4",
+            params![state, confidence, evidence_str, rel_id],
+        )?;
+        Ok(())
     }
 
     /// Returns the id of the innermost symbol in `file_id` whose line range
@@ -476,7 +536,7 @@ impl Database {
         }
     }
 
-    /// Incremental reindex helper: clears all symbols, edges, raw_imports, and
+    /// Incremental reindex helper: clears all symbols, edges, relationships, and
     /// embeddings tied to a file before re-parsing it. Must run before
     /// re-inserting fresh rows for the same file — `init_schema` never enables
     /// `PRAGMA foreign_keys`, so the `ON DELETE CASCADE` declared in the
@@ -494,7 +554,7 @@ impl Database {
             params![file_id],
         )?;
         self.conn.execute(
-            "DELETE FROM raw_imports WHERE file_id = ?1",
+            "DELETE FROM relationships WHERE file_id = ?1",
             params![file_id],
         )?;
         self.conn
@@ -580,7 +640,7 @@ impl Database {
         target_symbol_id: i64,
         kind: &str,
     ) -> Result<()> {
-        // A single raw_import can yield the same logical edge more than once
+        // A single relationship can yield the same logical edge more than once
         // (e.g. the same name appearing in several word-split fallback
         // matches, or being imported more than once in the same file). Without
         // a dedup check, edge counts for hotspot/cycle scoring inflate by a

@@ -1,4 +1,4 @@
-use graph::ImportNode;
+use graph::RelationshipNode;
 use graph::SymbolNode;
 use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
@@ -57,7 +57,7 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
 ///
 /// `use` declarations: only the **leaf** name is extracted, not the full
 /// path, because the linker resolves by symbol name, not by module path.
-/// `use std::collections::HashMap;` → ImportNode { name: "HashMap", … }.
+/// `use std::collections::HashMap;` → RelationshipNode { name: "HashMap", … }.
 /// Glob imports (`use foo::*;`) produce no import node since `*` cannot
 /// resolve to a specific symbol.
 ///
@@ -68,7 +68,7 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
 ///
 /// `impl Trait for Type`: produces an `implements` edge from the `impl` block's
 /// source file to the trait name, and an `inherits` edge to the self type.
-pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
+pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<RelationshipNode> {
     let mut imports = Vec::new();
 
     let query_str = "
@@ -102,7 +102,7 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
                     "call_name" => {
                         let name = raw.to_string();
                         if !is_noisy_rust_call(&name) {
-                            imports.push(ImportNode {
+                            imports.push(RelationshipNode {
                                 name,
                                 source: None,
                                 line_number: node.start_position().row + 1,
@@ -113,7 +113,7 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
                     "impl_trait" => {
                         let name = raw.to_string();
                         if !name.is_empty() {
-                            imports.push(ImportNode {
+                            imports.push(RelationshipNode {
                                 name,
                                 source: None,
                                 line_number: node.start_position().row + 1,
@@ -130,13 +130,13 @@ pub fn extract_imports(tree: &Tree, source_code: &str) -> Vec<ImportNode> {
     imports
 }
 
-/// Walks a Rust use-path text and pushes one `ImportNode` per leaf name.
+/// Walks a Rust use-path text and pushes one `RelationshipNode` per leaf name.
 /// Examples:
 /// - `"std::collections::HashMap"` → pushes `"HashMap"`
 /// - `"{HashMap, BTreeMap}"` → pushes both (the caller handles the outer path)
 /// - `"*"` → skipped (glob, unresolvable)
 /// - `"self"` / `"super"` / `"crate"` → skipped (relative self-referential)
-fn extract_use_leaf_names(raw: &str, line: usize, out: &mut Vec<ImportNode>) {
+fn extract_use_leaf_names(raw: &str, line: usize, out: &mut Vec<RelationshipNode>) {
     let raw = raw.trim();
     if raw == "*" || raw == "self" || raw == "super" || raw == "crate" {
         return;
@@ -180,7 +180,7 @@ fn extract_use_leaf_names(raw: &str, line: usize, out: &mut Vec<ImportNode>) {
         return;
     }
 
-    out.push(ImportNode {
+    out.push(RelationshipNode {
         name: leaf.to_string(),
         source: None,
         line_number: line,
@@ -244,7 +244,7 @@ mod extractor_tests {
     #[test]
     fn use_leaf_extracted_not_full_path() {
         let src = "use std::collections::HashMap;";
-        let (_m, _syms, imports) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
+        let (_m, _syms, imports, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
         let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
         assert!(
             names.contains(&"HashMap"),
@@ -259,7 +259,7 @@ mod extractor_tests {
     #[test]
     fn brace_group_yields_individual_leaves() {
         let src = "use std::collections::{HashMap, BTreeMap};";
-        let (_m, _syms, imports) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
+        let (_m, _syms, imports, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
         let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"HashMap"), "HashMap missing from {names:?}");
         assert!(
@@ -271,7 +271,7 @@ mod extractor_tests {
     #[test]
     fn glob_import_produces_no_node() {
         let src = "use std::io::*;";
-        let (_m, _syms, imports) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
+        let (_m, _syms, imports, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
         assert!(
             imports.iter().all(|i| i.name != "*"),
             "glob must not produce an import node"
@@ -284,7 +284,7 @@ mod extractor_tests {
             enum Color { Red, Green, Blue }
             trait Drawable { fn draw(&self); }
         "#;
-        let (_m, syms, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
+        let (_m, syms, _, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
         let kinds: Vec<&str> = syms.iter().map(|s| s.kind.as_str()).collect();
         assert!(
             kinds.contains(&"enum"),
@@ -303,7 +303,7 @@ mod extractor_tests {
             struct Circle;
             impl Drawable for Circle {}
         "#;
-        let (_m, _syms, imports) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
+        let (_m, _syms, imports, _) = RustFrontend.parse_and_extract(src, "a.rs").unwrap();
         let impl_edges: Vec<&str> = imports
             .iter()
             .filter(|i| i.kind.as_deref() == Some("implements"))

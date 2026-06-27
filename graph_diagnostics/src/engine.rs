@@ -3,7 +3,7 @@ use storage::Database;
 use std::collections::HashMap;
 
 use crate::traits::{DiagnosticFinding, GraphValidator, Severity};
-use crate::report::{DiagnosticsReport, GraphHealth};
+use crate::report::{DiagnosticsReport, DiscoveryStats, GraphHealth, ResolutionStats};
 
 pub struct DiagnosticsEngine {
     validators: Vec<Box<dyn GraphValidator>>,
@@ -24,7 +24,13 @@ impl DiagnosticsEngine {
         let total_files: i64 = db.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
         let total_symbols: i64 = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
         let total_edges: i64 = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
-        let total_raw_imports: i64 = db.conn.query_row("SELECT COUNT(*) FROM raw_imports", [], |r| r.get(0)).unwrap_or(0);
+        let total_relationships: i64 = db.conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0)).unwrap_or(0);
+
+        // Discovery stats: count relationships by kind
+        let discovery = compute_discovery_stats(db);
+
+        // Resolution stats: count relationships by resolution state
+        let resolution = compute_resolution_stats(db);
 
         let mut findings = Vec::new();
         for validator in &self.validators {
@@ -33,7 +39,6 @@ impl DiagnosticsEngine {
             }
         }
 
-        // Sort findings by severity (Critical first)
         findings.sort_by_key(|f| match f.severity {
             Severity::Critical => 0,
             Severity::Error => 1,
@@ -41,26 +46,52 @@ impl DiagnosticsEngine {
             Severity::Info => 3,
         });
 
-        // Calculate configurable health score
         let mut metrics = HashMap::new();
-        
+
         let dangling_edges = findings.iter().filter(|f| f.title.contains("Dangling Edge")).count() as i64;
         let duplicate_edges = findings.iter().filter(|f| f.title.contains("Duplicate Edge")).count() as i64;
-        let unresolved_imports = findings.iter().filter(|f| f.title.contains("Unresolved Import")).count() as i64;
-        
-        let import_resolution_rate = if total_raw_imports > 0 {
-            (total_raw_imports - unresolved_imports).max(0) as f64 / total_raw_imports as f64
-        } else {
-            1.0
+
+        // Compute success metrics
+        let compute_rate = |query: &str| -> f64 {
+            db.conn.query_row(query, [], |r| r.get::<_, Option<f64>>(0))
+                .unwrap_or(None)
+                .unwrap_or(0.0)
         };
-        metrics.insert("import_resolution_rate".to_string(), import_resolution_rate);
+
+        let import_success = compute_rate(
+            "SELECT SUM(CASE WHEN state IN ('RepositorySymbol', 'ExternalDependency', 'StandardLibrary') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships WHERE kind = 'imports' OR kind IS NULL"
+        );
         
-        let dangling_penalty = (dangling_edges as f64 * 0.1).min(1.0);
-        let duplicate_penalty = (duplicate_edges as f64 * 0.05).min(1.0);
+        let method_success = compute_rate(
+            "SELECT SUM(CASE WHEN state IN ('RepositorySymbol', 'ExternalDependency', 'Builtin', 'StandardLibrary') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships WHERE kind = 'method_call'"
+        );
         
-        let health_score = (import_resolution_rate - dangling_penalty - duplicate_penalty).max(0.0);
-        
-        // Pass if no criticals or errors
+        let type_success = compute_rate(
+            "SELECT SUM(CASE WHEN state IN ('RepositorySymbol', 'ExternalDependency', 'Builtin', 'StandardLibrary') THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships WHERE kind = 'type_ref'"
+        );
+
+        let ambiguous_rate = compute_rate(
+            "SELECT SUM(CASE WHEN state = 'Ambiguous' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships"
+        );
+
+        let missing_rate = compute_rate(
+            "SELECT SUM(CASE WHEN state = 'Missing' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships"
+        );
+
+        let dynamic_rate = compute_rate(
+            "SELECT SUM(CASE WHEN state = 'Dynamic' THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0) FROM relationships"
+        );
+
+        metrics.insert("Import Resolution Success (%)".to_string(), import_success);
+        metrics.insert("Method Resolution Success (%)".to_string(), method_success);
+        metrics.insert("Type Resolution Success (%)".to_string(), type_success);
+        metrics.insert("Ambiguous Resolution Rate (%)".to_string(), ambiguous_rate);
+        metrics.insert("Missing Resolution Rate (%)".to_string(), missing_rate);
+        metrics.insert("Dynamic Fallback Rate (%)".to_string(), dynamic_rate);
+
+        let health_score = (import_success / 100.0) - (dangling_edges as f64 * 0.1) - (duplicate_edges as f64 * 0.05);
+        let health_score = health_score.clamp(0.0, 1.0);
+
         let passed = findings.iter().all(|f| match f.severity {
             Severity::Critical | Severity::Error => false,
             _ => true,
@@ -70,7 +101,9 @@ impl DiagnosticsEngine {
             total_files,
             total_symbols,
             total_edges,
-            total_raw_imports,
+            total_relationships,
+            discovery,
+            resolution,
             findings,
             health: GraphHealth {
                 score: health_score,
@@ -79,4 +112,36 @@ impl DiagnosticsEngine {
             passed,
         })
     }
+}
+
+fn compute_discovery_stats(db: &Database) -> DiscoveryStats {
+    let mut by_kind: HashMap<String, i64> = HashMap::new();
+    let query = "SELECT COALESCE(kind, 'imports') as k, COUNT(*) as n FROM relationships GROUP BY k";
+    if let Ok(mut stmt) = db.conn.prepare(query) {
+        let _ = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).map(|rows| {
+            for row in rows.flatten() {
+                by_kind.insert(row.0, row.1);
+            }
+        });
+    }
+    let total = by_kind.values().sum();
+    DiscoveryStats { by_kind, total }
+}
+
+fn compute_resolution_stats(db: &Database) -> ResolutionStats {
+    let mut by_state: HashMap<String, i64> = HashMap::new();
+    let query = "SELECT COALESCE(state, 'Unknown') as s, COUNT(*) as n FROM relationships GROUP BY s";
+    if let Ok(mut stmt) = db.conn.prepare(query) {
+        let _ = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).map(|rows| {
+            for row in rows.flatten() {
+                by_state.insert(row.0, row.1);
+            }
+        });
+    }
+    let total = by_state.values().sum();
+    ResolutionStats { by_state, total }
 }

@@ -264,7 +264,7 @@ impl<'a> ContextResponseBuilder<'a> {
         let mut ext_stmt = self
             .db
             .conn
-            .prepare("SELECT name FROM raw_imports WHERE file_id = ?1 AND is_local = 0")?;
+            .prepare("SELECT name FROM relationships WHERE file_id = ?1 AND is_local = 0")?;
         let mut ext_rows = ext_stmt.query(rusqlite::params![self.file_id])?;
         let mut external_imports = Vec::new();
         while let Some(row) = ext_rows.next()? {
@@ -341,7 +341,7 @@ impl<'a> ContextResponseBuilder<'a> {
         };
 
         let mut raw_hook_stmt = self.db.conn.prepare(
-            "SELECT name FROM raw_imports WHERE file_id = ?1 AND kind = 'consumes_hook'",
+            "SELECT name FROM relationships WHERE file_id = ?1 AND kind = 'consumes_hook'",
         )?;
         let mut raw_hook_rows = raw_hook_stmt.query(rusqlite::params![self.file_id])?;
         while let Some(row) = raw_hook_rows.next()? {

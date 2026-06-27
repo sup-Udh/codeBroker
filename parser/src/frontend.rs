@@ -1,9 +1,12 @@
-use graph::{ImportNode, SymbolNode};
+use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 
 pub trait LanguageFrontend {
     fn can_handle(&self, path: &str) -> bool;
 
-    // parse and extract to unified domains
+    /// Parse source_code and extract symbols, relationships, and semantic bindings.
+    /// The 4th element (semantic bindings) is stored separately from relationships
+    /// so it doesn't appear in resolution metrics — it feeds the type-propagation
+    /// pre-pass in the resolver.
     fn parse_and_extract(
         &self,
         source_code: &str,
@@ -11,7 +14,8 @@ pub trait LanguageFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )>;
 }
 
@@ -35,14 +39,21 @@ impl LanguageFrontend for RustFrontend {
     ) -> Option<(
         graph::models::FileMetadata,
         Vec<SymbolNode>,
-        Vec<ImportNode>,
+        Vec<RelationshipNode>,
+        Vec<SemanticBinding>,
     )> {
-        // 1. We call your existing tree-sitter parser
         let tree = crate::treesitter::parse_rust_code(source_code)?;
-
-        // 2. We call your existing extractors
         let symbols = crate::extractor::extract_symbols(&tree, source_code);
-        let imports = crate::extractor::extract_imports(&tree, source_code);
-        Some((graph::models::FileMetadata::default(), symbols, imports))
+
+        let mut collector = crate::discovery::RelationshipCollector::new();
+        crate::discovery::LanguageVisitor::visit(
+            &crate::discovery::rust::RustVisitor,
+            &tree,
+            source_code,
+            &mut collector,
+        );
+        let relationships = collector.into_relationship_nodes();
+
+        Some((graph::models::FileMetadata::default(), symbols, relationships, Vec::new()))
     }
 }
