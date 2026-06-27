@@ -1,25 +1,57 @@
 use rusqlite::Result;
 use storage::Database;
-use crate::traits::{DiagnosticFinding, GraphValidator, Severity};
+use std::collections::HashMap;
+use crate::traits::{DiagnosticFinding, PipelineValidator, PipelineStage, StageReport, StageStatus, Severity};
+use std::time::Instant;
 
-pub struct SymbolValidator;
+pub struct ParserValidator;
 
-impl GraphValidator for SymbolValidator {
-    fn name(&self) -> &'static str {
-        "SymbolValidator"
+impl PipelineValidator for ParserValidator {
+    fn stage(&self) -> PipelineStage {
+        PipelineStage::Parser
     }
 
-    fn validate(&self, db: &Database) -> Result<Vec<DiagnosticFinding>> {
+    fn dependencies(&self) -> Vec<PipelineStage> {
+        vec![]
+    }
+
+    fn validate(&self, db: &Database) -> Result<StageReport> {
+        let start = Instant::now();
         let mut findings = Vec::new();
+        let mut metrics = HashMap::new();
+
+        // 1. Files parsed
+        let files_parsed: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM files",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        metrics.insert("Files Parsed".to_string(), files_parsed as f64);
+
+        // 2. Symbols extracted
+        let symbols_extracted: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM symbols",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        metrics.insert("Symbols Extracted".to_string(), symbols_extracted as f64);
+
+        // 3. Relationships extracted (raw)
+        let relationships_extracted: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM relationships",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        metrics.insert("Relationships Extracted".to_string(), relationships_extracted as f64);
 
         // Check for duplicate definitions
         let mut dup_stmt = db.conn.prepare(
-            "SELECT file_id, name, COUNT(*) as c 
-             FROM symbols 
+            "SELECT file_id, name, COUNT(*) as c
+             FROM symbols
              GROUP BY file_id, name, kind, start_line
              HAVING c > 1"
         )?;
-        
+
         let dup_rows = dup_stmt.query_map([], |row| {
             let file_id: i64 = row.get(0)?;
             let name: String = row.get(1)?;
@@ -63,6 +95,15 @@ impl GraphValidator for SymbolValidator {
             }
         }
 
-        Ok(findings)
+        let has_errors = findings.iter().any(|f| matches!(f.severity, Severity::Error | Severity::Critical));
+        let status = if has_errors { StageStatus::Fail } else if !findings.is_empty() { StageStatus::Warning } else { StageStatus::Pass };
+
+        Ok(StageReport {
+            stage: self.stage(),
+            status,
+            execution_time_ms: start.elapsed().as_millis(),
+            metrics,
+            findings,
+        })
     }
 }

@@ -1,146 +1,64 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use crate::traits::{PipelineReport, StageStatus};
 
-use crate::traits::{DiagnosticFinding, Severity};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GraphHealth {
-    pub score: f64,
-    pub metrics: HashMap<String, f64>,
-}
-
-/// Counts of discovered relationships broken down by kind.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DiscoveryStats {
-    pub by_kind: HashMap<String, i64>,
-    pub total: i64,
-}
-
-/// Counts of resolved relationships broken down by resolution state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ResolutionStats {
-    pub by_state: HashMap<String, i64>,
-    pub by_evidence: HashMap<String, i64>,
-    pub total: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiagnosticsReport {
-    pub total_files: i64,
-    pub total_symbols: i64,
-    pub total_edges: i64,
-    pub total_relationships: i64,
-
-    pub discovery: DiscoveryStats,
-    pub resolution: ResolutionStats,
-
-    pub findings: Vec<DiagnosticFinding>,
-    pub health: GraphHealth,
-
-    pub passed: bool,
-}
-
-impl DiagnosticsReport {
+impl PipelineReport {
     pub fn to_human_readable(&self) -> String {
         let mut out = String::new();
         out.push_str("====================================\n");
-        out.push_str("CodeBroker Graph Diagnostics\n");
+        out.push_str("CodeBroker Pipeline Diagnostics\n");
         out.push_str("====================================\n\n");
 
-        out.push_str(&format!("Files   {}\n", self.total_files));
-        out.push_str(&format!("Symbols {}\n", self.total_symbols));
-        out.push_str(&format!("Edges   {}\n", self.total_edges));
-        out.push_str("------------------------------------\n\n");
-
-        // Relationship discovery section
-        if self.discovery.total > 0 {
-            out.push_str("Relationship Discovery\n\n");
-            let mut kinds: Vec<_> = self.discovery.by_kind.iter().collect();
-            kinds.sort_by(|a, b| b.1.cmp(a.1));
-            for (kind, count) in &kinds {
-                let dots = ".".repeat(28_usize.saturating_sub(kind.len()));
-                out.push_str(&format!("{}{}{}\n", kind, dots, count));
-            }
-            let label = "Total Relationships";
-            let dots = ".".repeat(28_usize.saturating_sub(label.len()));
-            out.push_str(&format!("\n{}{}{}\n", label, dots, self.discovery.total));
-            out.push_str("------------------------------------\n\n");
+        // 1. Summary Header
+        for report in &self.stages {
+            let status_str = match report.status {
+                StageStatus::Pass => "PASS",
+                StageStatus::Warning => "WARNING",
+                StageStatus::Fail => "FAIL",
+                StageStatus::Skipped => "SKIPPED",
+            };
+            let stage_name = format!("{}", report.stage);
+            let dots = ".".repeat(30_usize.saturating_sub(stage_name.len()));
+            out.push_str(&format!("{}{} {}\n", stage_name, dots, status_str));
         }
 
-        // Resolution section
-        if self.resolution.total > 0 {
-            out.push_str("Relationship Resolution\n\n");
-            let mut states: Vec<_> = self.resolution.by_state.iter().collect();
-            states.sort_by(|a, b| b.1.cmp(a.1));
-            for (state, count) in &states {
-                let dots = ".".repeat(28_usize.saturating_sub(state.len()));
-                out.push_str(&format!("{}{}{}\n", state, dots, count));
+        out.push_str("\n====================================\n");
+        out.push_str("Stage Details\n");
+        out.push_str("====================================\n\n");
+
+        // 2. Stage Details
+        for report in &self.stages {
+            if report.status == StageStatus::Skipped {
+                continue;
             }
-            let label = "Total Resolved";
-            let dots = ".".repeat(28_usize.saturating_sub(label.len()));
-            out.push_str(&format!("\n{}{}{}\n", label, dots, self.resolution.total));
-            out.push_str("------------------------------------\n\n");
+
+            out.push_str(&format!("--- {} ---\n", report.stage));
+            out.push_str(&format!("Performance: {}ms\n", report.execution_time_ms));
             
-            if !self.resolution.by_evidence.is_empty() {
-                out.push_str("Resolution Evidence\n\n");
-                let mut evidences: Vec<_> = self.resolution.by_evidence.iter().collect();
-                evidences.sort_by(|a, b| b.1.cmp(a.1));
-                for (evidence, count) in &evidences {
-                    let dots = ".".repeat(28_usize.saturating_sub(evidence.len()));
-                    out.push_str(&format!("{}{}{}\n", evidence, dots, count));
+            if !report.metrics.is_empty() {
+                out.push_str("Metrics:\n");
+                let mut metrics: Vec<_> = report.metrics.iter().collect();
+                // Sort keys alphabetically for stable output
+                metrics.sort_by_key(|k| k.0);
+                for (k, v) in metrics {
+                    out.push_str(&format!("  {}: {}\n", k, v));
                 }
-                out.push_str("------------------------------------\n\n");
             }
-        }
-        
-        // Group findings by severity
-        let mut criticals = 0;
-        let mut errors = 0;
-        let mut warnings = 0;
-        let mut infos = 0;
-        
-        for f in &self.findings {
-            match f.severity {
-                Severity::Critical => criticals += 1,
-                Severity::Error => errors += 1,
-                Severity::Warning => warnings += 1,
-                Severity::Info => infos += 1,
+
+            if !report.findings.is_empty() {
+                out.push_str("Top Issues:\n");
+                for (i, f) in report.findings.iter().take(5).enumerate() {
+                    out.push_str(&format!("  {}. [{:?}] {}\n", i + 1, f.severity, f.title));
+                    out.push_str(&format!("     {}\n", f.description));
+                    out.push_str(&format!("     Likely cause: {}\n", f.likely_cause));
+                    out.push_str(&format!("     Suggested fix: {}\n", f.suggested_fix));
+                }
+                if report.findings.len() > 5 {
+                    out.push_str(&format!("  ... and {} more findings\n", report.findings.len() - 5));
+                }
             }
+            out.push_str("\n");
         }
-        
-        out.push_str("Findings Summary:\n");
-        out.push_str(&format!("Critical: {}\n", criticals));
-        out.push_str(&format!("Error:    {}\n", errors));
-        out.push_str(&format!("Warning:  {}\n", warnings));
-        out.push_str(&format!("Info:     {}\n", infos));
-        out.push_str("------------------------------------\n\n");
-        
-        if !self.findings.is_empty() {
-            out.push_str("Detailed Findings (Top 10):\n");
-            for (i, f) in self.findings.iter().take(10).enumerate() {
-                out.push_str(&format!("{}. [{:?}] {}\n", i + 1, f.severity, f.title));
-                out.push_str(&format!("   {}\n", f.description));
-                out.push_str(&format!("   Likely cause: {}\n", f.likely_cause));
-                out.push_str(&format!("   Suggested fix: {}\n\n", f.suggested_fix));
-            }
-            if self.findings.len() > 10 {
-                out.push_str(&format!("... and {} more findings\n\n", self.findings.len() - 10));
-            }
-        }
-        
-        out.push_str("Health Metrics:\n");
-        let mut metrics: Vec<_> = self.health.metrics.iter().collect();
-        metrics.sort_by_key(|k| k.0);
-        for (k, v) in metrics {
-            out.push_str(&format!("{}: {:.2}\n", k, v));
-        }
-        
-        out.push_str("------------------------------------\n\n");
-        let pass_str = if self.passed { "PASS" } else { "FAIL" };
-        out.push_str(&format!("Validation: {}\n", pass_str));
-        out.push_str(&format!("Overall Graph Health: {:.1}%\n", self.health.score * 100.0));
-        out.push_str("====================================\n");
-        
+
         out
     }
 }
