@@ -16,125 +16,7 @@ use crate::semantic::{
     FileSemantics, TypeBound,
     evidence::{ResolutionConfidence, SemanticEvidence},
 };
-
-/// Build a per-file `FileSemantics` by combining:
-/// 1. Semantic bindings stored in the `semantic_bindings` DB table (type
-///    annotations, return types, field types, aliases — written at parse time).
-/// 2. Constructor bindings derived from `new_call`/`instantiates` relationships
-///    with a source variable name (e.g. `const db = new Database()`).
-/// 3. Alias propagation: if `x = y` and y's type is known, x inherits it.
-/// 4. Return-type propagation: if `const x = f()` and f has a known return
-///    type, x inherits that type.
-fn build_file_semantics(
-    db: &Database,
-    relationships: &[(i64, i64, String, Option<String>, Option<String>, i64)],
-) -> HashMap<i64, FileSemantics> {
-    let mut file_semantics: HashMap<i64, FileSemantics> = HashMap::new();
-
-    // ── Step 1: semantic_bindings table ──────────────────────────────────────
-    let all_bindings = db.get_all_semantic_bindings().unwrap_or_default();
-    for (file_id, binding) in all_bindings {
-        let fs = file_semantics.entry(file_id).or_default();
-        match binding.kind {
-            SemanticBindingKind::VarType => {
-                fs.var_types.entry(binding.name).or_insert_with(|| TypeBound {
-                    type_name: binding.type_name,
-                    evidence: SemanticEvidence::Annotation,
-                    confidence: ResolutionConfidence::Certain,
-                });
-            }
-            SemanticBindingKind::ReturnType => {
-                fs.return_types.entry(binding.name).or_insert(binding.type_name);
-            }
-            SemanticBindingKind::FieldType => {
-                fs.field_types.entry(binding.name).or_insert(binding.type_name);
-            }
-            SemanticBindingKind::Alias => {
-                fs.aliases.entry(binding.name).or_insert(binding.type_name);
-            }
-        }
-    }
-
-    // ── Step 2: constructor bindings from relationships ───────────────────────
-    // new_call/instantiates with source set: source_var → constructor_type
-    for (_, file_id, name, source, kind, _) in relationships {
-        let k = kind.as_deref().unwrap_or("imports");
-        if k == "new_call" || k == "instantiates" {
-            if let Some(var_name) = source {
-                let fs = file_semantics.entry(*file_id).or_default();
-                fs.var_types.entry(var_name.clone()).or_insert_with(|| TypeBound {
-                    type_name: name.clone(),
-                    evidence: SemanticEvidence::Constructor,
-                    confidence: ResolutionConfidence::High,
-                });
-            }
-        }
-    }
-
-    // ── Step 3: alias propagation (up to 5 hops) ─────────────────────────────
-    let file_ids: Vec<i64> = file_semantics.keys().cloned().collect();
-    for file_id in &file_ids {
-        for _ in 0..5 {
-            let mut new_bindings: Vec<(String, TypeBound)> = Vec::new();
-            if let Some(fs) = file_semantics.get(file_id) {
-                for (alias_name, source_name) in &fs.aliases {
-                    if !fs.var_types.contains_key(alias_name) {
-                        if let Some(bound) = fs.var_types.get(source_name.as_str()) {
-                            new_bindings.push((alias_name.clone(), TypeBound {
-                                type_name: bound.type_name.clone(),
-                                evidence: SemanticEvidence::Alias,
-                                confidence: ResolutionConfidence::Medium,
-                            }));
-                        }
-                    }
-                }
-            }
-            if new_bindings.is_empty() {
-                break;
-            }
-            if let Some(fs) = file_semantics.get_mut(file_id) {
-                for (name, bound) in new_bindings {
-                    fs.var_types.entry(name).or_insert(bound);
-                }
-            }
-        }
-    }
-
-    // ── Step 4: return-type propagation ──────────────────────────────────────
-    // calls relationships with source set: if f() has known return type R,
-    // and `const x = f()` was captured as new_call with source=x, or as a
-    // calls with source=x, then x → R.
-    for _ in 0..2 {
-        let mut new_var_types: Vec<(i64, String, TypeBound)> = Vec::new();
-        for (_, file_id, name, source, kind, _) in relationships {
-            let k = kind.as_deref().unwrap_or("imports");
-            if k == "calls" || k == "new_call" {
-                if let Some(var_name) = source {
-                    if let Some(fs) = file_semantics.get(file_id) {
-                        if !fs.var_types.contains_key(var_name.as_str()) {
-                            if let Some(ret_type) = fs.return_types.get(name.as_str()) {
-                                new_var_types.push((*file_id, var_name.clone(), TypeBound {
-                                    type_name: ret_type.clone(),
-                                    evidence: SemanticEvidence::TypePropagation,
-                                    confidence: ResolutionConfidence::Medium,
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if new_var_types.is_empty() {
-            break;
-        }
-        for (fid, var_name, bound) in new_var_types {
-            file_semantics.entry(fid).or_default()
-                .var_types.entry(var_name).or_insert(bound);
-        }
-    }
-
-    file_semantics
-}
+use crate::flow::VariableFlowEngine;
 
 pub fn resolve_relationships(
     db: &Database,
@@ -150,8 +32,8 @@ pub fn resolve_relationships(
     // 1. Build Symbol Index
     let symbol_index = Arc::new(SymbolIndex::build(db)?);
 
-    // 2. Build FileSemantics per file (replaces the old file_var_maps pre-pass)
-    let file_semantics_map = build_file_semantics(db, &relationships);
+    // 2. Build Variable Flow Engine (replaces the old file_var_maps pre-pass)
+    let flow_engine = Arc::new(VariableFlowEngine::new(db));
 
     // 3. Build Pipeline
     let pipeline = ResolutionPipeline::new(vec![
@@ -175,11 +57,6 @@ pub fn resolve_relationships(
 
         let src_sym = db.enclosing_symbol_id(*source_file_id, *line_number).unwrap_or(None);
 
-        let file_semantics = file_semantics_map
-            .get(source_file_id)
-            .cloned()
-            .unwrap_or_default();
-
         let context = ResolutionContext::new(
             *rel_id,
             *source_file_id,
@@ -190,7 +67,7 @@ pub fn resolve_relationships(
                 kind: import_kind.clone(),
             },
             Arc::clone(&symbol_index),
-            file_semantics,
+            Arc::clone(&flow_engine),
         );
 
         let resolved_context = pipeline.execute(context)?;

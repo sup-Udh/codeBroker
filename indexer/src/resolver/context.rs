@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use graph::models::{RelationshipNode, ResolutionEvidence, ResolutionState};
 use crate::resolver::index::SymbolIndex;
-use crate::semantic::types::FileSemantics;
+use crate::flow::VariableFlowEngine;
 
 #[derive(Debug, Clone)]
 pub struct ResolutionCandidate {
@@ -18,12 +18,8 @@ pub struct ResolutionContext {
     pub symbol_index: Arc<SymbolIndex>,
     pub evidence: Vec<ResolutionEvidence>,
     pub final_state: ResolutionState,
-    /// Set to true by a stage to stop the pipeline early.
     pub resolved: bool,
-    /// Per-file semantic facts: variable types, field types, return types, aliases.
-    /// Replaces the old `file_var_map` with a richer structure that supports
-    /// type annotations, return-type propagation, and alias chains.
-    pub file_semantics: FileSemantics,
+    pub flow_engine: Arc<VariableFlowEngine>,
 }
 
 impl ResolutionContext {
@@ -32,7 +28,7 @@ impl ResolutionContext {
         source_file_id: i64,
         relationship: RelationshipNode,
         symbol_index: Arc<SymbolIndex>,
-        file_semantics: FileSemantics,
+        flow_engine: Arc<VariableFlowEngine>,
     ) -> Self {
         Self {
             relationship,
@@ -43,7 +39,7 @@ impl ResolutionContext {
             evidence: Vec::new(),
             final_state: ResolutionState::Unknown,
             resolved: false,
-            file_semantics,
+            flow_engine,
         }
     }
 }

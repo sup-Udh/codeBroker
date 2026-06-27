@@ -20,6 +20,7 @@ pub struct DiscoveryStats {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResolutionStats {
     pub by_state: HashMap<String, i64>,
+    pub by_evidence: HashMap<String, i64>,
     pub total: i64,
 }
 
@@ -79,6 +80,17 @@ impl DiagnosticsReport {
             let dots = ".".repeat(28_usize.saturating_sub(label.len()));
             out.push_str(&format!("\n{}{}{}\n", label, dots, self.resolution.total));
             out.push_str("------------------------------------\n\n");
+            
+            if !self.resolution.by_evidence.is_empty() {
+                out.push_str("Resolution Evidence\n\n");
+                let mut evidences: Vec<_> = self.resolution.by_evidence.iter().collect();
+                evidences.sort_by(|a, b| b.1.cmp(a.1));
+                for (evidence, count) in &evidences {
+                    let dots = ".".repeat(28_usize.saturating_sub(evidence.len()));
+                    out.push_str(&format!("{}{}{}\n", evidence, dots, count));
+                }
+                out.push_str("------------------------------------\n\n");
+            }
         }
         
         // Group findings by severity

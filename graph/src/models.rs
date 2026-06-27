@@ -10,6 +10,12 @@ pub enum SemanticBindingKind {
     FieldType,
     /// Simple alias assignment: `const x = y` where y is an identifier
     Alias,
+    /// Assignment from a call: `const x = foo()`
+    Assignment,
+    /// Destructuring: `const { x } = y`
+    Destructuring,
+    /// Object literal: `const x = { y: z }`
+    ObjectLiteral,
 }
 
 impl SemanticBindingKind {
@@ -19,6 +25,9 @@ impl SemanticBindingKind {
             SemanticBindingKind::ReturnType => "return_type",
             SemanticBindingKind::FieldType => "field_type",
             SemanticBindingKind::Alias => "alias",
+            SemanticBindingKind::Assignment => "assignment",
+            SemanticBindingKind::Destructuring => "destructuring",
+            SemanticBindingKind::ObjectLiteral => "object_literal",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
@@ -27,6 +36,9 @@ impl SemanticBindingKind {
             "return_type" => Some(SemanticBindingKind::ReturnType),
             "field_type" => Some(SemanticBindingKind::FieldType),
             "alias" => Some(SemanticBindingKind::Alias),
+            "assignment" => Some(SemanticBindingKind::Assignment),
+            "destructuring" => Some(SemanticBindingKind::Destructuring),
+            "object_literal" => Some(SemanticBindingKind::ObjectLiteral),
             _ => None,
         }
     }
@@ -122,14 +134,37 @@ pub enum ResolutionState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VariableOrigin {
+    Assignment,
+    Constructor,
+    ReturnValue,
+    Alias,
+    Parameter,
+    Field,
+    Destructuring,
+    ObjectLiteral,
+    Import,
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionEvidence {
     ImportMatch,
-    VariableAssignment,
-    TypeAnnotation,
-    ConstructorCall,
-    ModuleExport,
     LexicalScopeMatch,
+    ConstructorCall,
+    ReturnFlow,
+    VariableAssignment,
+    Alias,
+    ParameterType,
+    FieldType,
+    ReceiverType,
+    ObjectLiteral,
+    Destructuring,
+    GenericConstraint,
+    ModuleExport,
+    Builtin,
+    ExternalDependency,
     NamespaceMatch,
 }
 
@@ -137,11 +172,20 @@ impl ResolutionEvidence {
     pub fn as_str(&self) -> &'static str {
         match self {
             ResolutionEvidence::ImportMatch => "ImportMatch",
-            ResolutionEvidence::VariableAssignment => "VariableAssignment",
-            ResolutionEvidence::TypeAnnotation => "TypeAnnotation",
-            ResolutionEvidence::ConstructorCall => "ConstructorCall",
-            ResolutionEvidence::ModuleExport => "ModuleExport",
             ResolutionEvidence::LexicalScopeMatch => "LexicalScopeMatch",
+            ResolutionEvidence::ConstructorCall => "ConstructorCall",
+            ResolutionEvidence::ReturnFlow => "ReturnFlow",
+            ResolutionEvidence::VariableAssignment => "VariableAssignment",
+            ResolutionEvidence::Alias => "Alias",
+            ResolutionEvidence::ParameterType => "ParameterType",
+            ResolutionEvidence::FieldType => "FieldType",
+            ResolutionEvidence::ReceiverType => "ReceiverType",
+            ResolutionEvidence::ObjectLiteral => "ObjectLiteral",
+            ResolutionEvidence::Destructuring => "Destructuring",
+            ResolutionEvidence::GenericConstraint => "GenericConstraint",
+            ResolutionEvidence::ModuleExport => "ModuleExport",
+            ResolutionEvidence::Builtin => "Builtin",
+            ResolutionEvidence::ExternalDependency => "ExternalDependency",
             ResolutionEvidence::NamespaceMatch => "NamespaceMatch",
         }
     }

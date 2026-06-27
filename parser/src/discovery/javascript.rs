@@ -12,6 +12,11 @@ impl LanguageVisitor for JavaScriptVisitor {
         emit_calls(tree, source_code, &language, collector);
         emit_inheritance(tree, source_code, &language, collector);
     }
+
+    fn visit_semantic(&self, tree: &Tree, source_code: &str) -> Vec<graph::SemanticBinding> {
+        let language = tree_sitter_javascript::LANGUAGE.into();
+        emit_semantic_bindings(tree, source_code, &language)
+    }
 }
 
 fn emit_imports(
@@ -139,6 +144,155 @@ fn emit_inheritance(
             }
         }
     }
+}
+
+fn emit_semantic_bindings(
+    tree: &Tree,
+    source_code: &str,
+    language: &tree_sitter::Language,
+) -> Vec<graph::SemanticBinding> {
+    let mut bindings = Vec::new();
+
+    // ── Alias assignments: const x = y (bare identifier RHS) ────────────────
+    let q_alias = "
+        (lexical_declaration (variable_declarator name: (identifier) @alias_name value: (identifier) @source_name))
+        (variable_declaration (variable_declarator name: (identifier) @alias_name value: (identifier) @source_name))
+        (assignment_expression left: (identifier) @alias_name right: (identifier) @source_name)
+    ";
+    if let Ok(query) = Query::new(language, q_alias) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut alias_name = String::new();
+            let mut source_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "alias_name" => alias_name = text.trim().to_string(),
+                        "source_name" => source_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !alias_name.is_empty() && !source_name.is_empty() && alias_name != source_name {
+                bindings.push(graph::SemanticBinding {
+                    kind: graph::SemanticBindingKind::Alias,
+                    name: alias_name,
+                    type_name: source_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
+    // ── Assignments from function calls: const x = foo() ────────────────────
+    let q_assign_call = "
+        (lexical_declaration (variable_declarator name: (identifier) @assign_name value: (call_expression function: (identifier) @source_name)))
+        (variable_declaration (variable_declarator name: (identifier) @assign_name value: (call_expression function: (identifier) @source_name)))
+        (assignment_expression left: (identifier) @assign_name right: (call_expression function: (identifier) @source_name))
+        (lexical_declaration (variable_declarator name: (identifier) @assign_name value: (call_expression function: (member_expression property: (property_identifier) @source_name))))
+        (variable_declaration (variable_declarator name: (identifier) @assign_name value: (call_expression function: (member_expression property: (property_identifier) @source_name))))
+        (assignment_expression left: (identifier) @assign_name right: (call_expression function: (member_expression property: (property_identifier) @source_name)))
+    ";
+    if let Ok(query) = Query::new(language, q_assign_call) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut assign_name = String::new();
+            let mut source_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "assign_name" => assign_name = text.trim().to_string(),
+                        "source_name" => source_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !assign_name.is_empty() && !source_name.is_empty() {
+                bindings.push(graph::SemanticBinding {
+                    kind: graph::SemanticBindingKind::Assignment,
+                    name: assign_name,
+                    type_name: source_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
+    // ── Destructuring: const { login } = auth ──────────────────────────────
+    let q_destructuring = "
+        (lexical_declaration (variable_declarator name: (object_pattern (shorthand_property_identifier_pattern) @destruct_name) value: (identifier) @source_name))
+        (variable_declaration (variable_declarator name: (object_pattern (shorthand_property_identifier_pattern) @destruct_name) value: (identifier) @source_name))
+        (lexical_declaration (variable_declarator name: (object_pattern (pair_pattern value: (identifier) @destruct_name)) value: (identifier) @source_name))
+        (variable_declaration (variable_declarator name: (object_pattern (pair_pattern value: (identifier) @destruct_name)) value: (identifier) @source_name))
+    ";
+    if let Ok(query) = Query::new(language, q_destructuring) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut destruct_name = String::new();
+            let mut source_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "destruct_name" => destruct_name = text.trim().to_string(),
+                        "source_name" => source_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !destruct_name.is_empty() && !source_name.is_empty() {
+                bindings.push(graph::SemanticBinding {
+                    kind: graph::SemanticBindingKind::Destructuring,
+                    name: destruct_name,
+                    type_name: source_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
+    // ── Object literal: const api = { login(){} } ──────────────────────────
+    let q_obj_literal = "
+        (lexical_declaration (variable_declarator name: (identifier) @obj_name value: (object (pair key: (property_identifier) @prop_name))))
+        (variable_declaration (variable_declarator name: (identifier) @obj_name value: (object (pair key: (property_identifier) @prop_name))))
+        (lexical_declaration (variable_declarator name: (identifier) @obj_name value: (object (shorthand_property_identifier) @prop_name)))
+        (variable_declaration (variable_declarator name: (identifier) @obj_name value: (object (shorthand_property_identifier) @prop_name)))
+        (lexical_declaration (variable_declarator name: (identifier) @obj_name value: (object (method_definition name: (property_identifier) @prop_name))))
+        (variable_declaration (variable_declarator name: (identifier) @obj_name value: (object (method_definition name: (property_identifier) @prop_name))))
+    ";
+    if let Ok(query) = Query::new(language, q_obj_literal) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut obj_name = String::new();
+            let mut prop_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "obj_name" => obj_name = text.trim().to_string(),
+                        "prop_name" => prop_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !obj_name.is_empty() && !prop_name.is_empty() {
+                bindings.push(graph::SemanticBinding {
+                    kind: graph::SemanticBindingKind::ObjectLiteral,
+                    name: prop_name,
+                    type_name: obj_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
+    bindings
 }
 
 #[cfg(test)]

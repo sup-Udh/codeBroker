@@ -1,6 +1,7 @@
 pub mod features;
 pub mod interactions;
-pub mod resolver;
 pub mod reindex;
+pub mod resolver;
 pub mod semantic;
+pub mod flow;
 pub mod walker;

@@ -34,14 +34,14 @@ impl ResolutionStage for ReceiverResolutionStage {
         let type_name: Option<String> = if receiver_raw.starts_with("this.")
             || receiver_raw.starts_with("self.")
         {
-            // this.field / self.field → look up field name in file-level field types
+            // this.field / self.field → look up field name in flow engine
             let field_name = &receiver_raw[receiver_raw.find('.').unwrap() + 1..];
-            context.file_semantics.resolve_field_type(field_name)
-                .map(String::from)
+            context.flow_engine.get_var(context.source_file_id, field_name)
+                .and_then(|v| v.inferred_type.clone())
         } else {
-            // Regular variable receiver → walk var_types with alias chain
-            context.file_semantics.resolve_var_type(receiver_raw)
-                .map(|b| b.type_name.clone())
+            // Regular variable receiver → use flow engine
+            context.flow_engine.get_var(context.source_file_id, receiver_raw)
+                .and_then(|v| v.inferred_type.clone())
         };
 
         let Some(type_name) = type_name else {

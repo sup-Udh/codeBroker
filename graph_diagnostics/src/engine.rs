@@ -142,6 +142,19 @@ fn compute_resolution_stats(db: &Database) -> ResolutionStats {
             }
         });
     }
+    
+    let mut by_evidence: HashMap<String, i64> = HashMap::new();
+    let query_ev = "SELECT COALESCE(evidence, 'None') as e, COUNT(*) as n FROM relationships WHERE state != 'Unknown' AND state != 'Missing' GROUP BY e";
+    if let Ok(mut stmt) = db.conn.prepare(query_ev) {
+        let _ = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        }).map(|rows| {
+            for row in rows.flatten() {
+                by_evidence.insert(row.0, row.1);
+            }
+        });
+    }
+    
     let total = by_state.values().sum();
-    ResolutionStats { by_state, total }
+    ResolutionStats { by_state, by_evidence, total }
 }
