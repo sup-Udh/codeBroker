@@ -13,5 +13,5 @@ members = [
  "semantic"
 , "mcp",
  "analytics",
- "resolver"]
+ "resolver", "graph_diagnostics"]
 resolver = "2"

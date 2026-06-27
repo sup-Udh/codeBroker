@@ -111,6 +111,8 @@ enum Commands {
     },
     /// Instantly hooks up Claude Desktop and Antigravity to the current directory
     Bind,
+    /// Validates the structure and health of the compiled graph
+    Validate,
 }
 
 fn main() {
@@ -752,6 +754,17 @@ fn main() {
                 }
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
                 Err(e) => println!("Error assembling context: {}", e),
+            }
+        }
+        Commands::Validate => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");
+            match graph_diagnostics::run_diagnostics(&db) {
+                Ok(report) => {
+                    println!("{}", report.to_human_readable());
+                }
+                Err(e) => {
+                    eprintln!("Failed to run diagnostics: {}", e);
+                }
             }
         }
         Commands::Knowledge => {
