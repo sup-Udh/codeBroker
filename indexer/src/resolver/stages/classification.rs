@@ -69,14 +69,15 @@ impl ResolutionStage for ClassificationStage {
     }
 
     fn execute(&self, context: &mut ResolutionContext) -> Result<(), String> {
-        let kind = context.relationship.kind.as_deref().unwrap_or("imports");
+        let name = &context.ir.node.name;
+        let kind = context.ir.node.kind.as_deref().unwrap_or("imports");
 
         // ── Builtin receiver detection for method calls / member access ───────
         // If the receiver is a known JS/TS global object, classify as Builtin
         // immediately. This avoids these calls staying Dynamic (they will never
         // resolve to a repository symbol).
         if matches!(kind, "method_call" | "MEMBER_ACCESS") {
-            let file_path = context.symbol_index.file_paths.get(&context.source_file_id);
+            let file_path = context.symbol_index.file_paths.get(&context.ir.source_file_id);
             let is_js_ts_for_recv = file_path.map(|p| {
                 p.ends_with(".ts") || p.ends_with(".tsx")
                     || p.ends_with(".js") || p.ends_with(".jsx")
@@ -85,12 +86,12 @@ impl ResolutionStage for ClassificationStage {
             }).unwrap_or(false);
 
             if is_js_ts_for_recv {
-                let receiver = context.relationship.source.as_deref().unwrap_or("");
+                let receiver = context.ir.node.source.as_deref().unwrap_or("");
                 // Don't classify this./self. chains here — receiver resolution handles them
                 if !receiver.starts_with("this.") && !receiver.starts_with("self.") && !receiver.is_empty() {
                     if JS_BUILTIN_RECEIVERS.contains(&receiver) {
                         context.final_state = ResolutionState::Builtin;
-                        context.evidence.push(ResolutionEvidence::NamespaceMatch);
+                        context.evidence = Some(ResolutionEvidence::NamespaceMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::NamespaceMatch));
                         context.resolved = true;
                         return Ok(());
                     }
@@ -104,8 +105,8 @@ impl ResolutionStage for ClassificationStage {
             return Ok(());
         }
 
-        let source = context.relationship.source.as_deref().unwrap_or("");
-        let name = context.relationship.name.as_str();
+        let source = context.ir.node.source.as_deref().unwrap_or("");
+        let name = context.ir.node.name.as_str();
 
         // ── Rust stdlib / core / alloc ───────────────────────────────────────
         // These source paths are set by the Rust visitor's collect_use_leaves.
@@ -117,7 +118,7 @@ impl ResolutionStage for ClassificationStage {
             || source == "alloc"
         {
             context.final_state = ResolutionState::StandardLibrary;
-            context.evidence.push(ResolutionEvidence::ImportMatch);
+            context.evidence = Some(ResolutionEvidence::ImportMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::ImportMatch));
             context.resolved = true;
             return Ok(());
         }
@@ -135,14 +136,14 @@ impl ResolutionStage for ClassificationStage {
         }
 
         // ── Detect file language for JS/TS-specific rules ───────────────────
-        let file_path = context.symbol_index.file_paths.get(&context.source_file_id);
+        let file_path = context.symbol_index.file_paths.get(&context.ir.source_file_id);
         let is_rust = file_path.map(|p| p.ends_with(".rs")).unwrap_or(false);
         // ── Rust external crates ─────────────────────────────────────────────
         // At this point std::/core::/alloc:: and crate::/super::/self:: have already
         // been handled. Any remaining non-empty source in a Rust file is an external crate.
         if is_rust && !source.is_empty() {
             context.final_state = ResolutionState::ExternalDependency;
-            context.evidence.push(ResolutionEvidence::ImportMatch);
+            context.evidence = Some(ResolutionEvidence::ImportMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::ImportMatch));
             context.resolved = true;
             return Ok(());
         }
@@ -173,7 +174,7 @@ impl ResolutionStage for ClassificationStage {
             } else {
                 context.final_state = ResolutionState::ExternalDependency;
             }
-            context.evidence.push(ResolutionEvidence::ImportMatch);
+            context.evidence = Some(ResolutionEvidence::ImportMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::ImportMatch));
             context.resolved = true;
             return Ok(());
         }
@@ -194,7 +195,7 @@ impl ResolutionStage for ClassificationStage {
 
             if PYTHON_STDLIB.contains(&root) {
                 context.final_state = ResolutionState::StandardLibrary;
-                context.evidence.push(ResolutionEvidence::ImportMatch);
+                context.evidence = Some(ResolutionEvidence::ImportMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::ImportMatch));
                 context.resolved = true;
                 return Ok(());
             }
@@ -203,7 +204,7 @@ impl ResolutionStage for ClassificationStage {
             // This covers both `import requests` (source=None) and
             // `from flask import Flask` (source="flask").
             context.final_state = ResolutionState::ExternalDependency;
-            context.evidence.push(ResolutionEvidence::ImportMatch);
+            context.evidence = Some(ResolutionEvidence::ImportMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::ImportMatch));
             context.resolved = true;
             return Ok(());
         }

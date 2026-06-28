@@ -13,3 +13,7 @@ storage = { path = "../storage" }
 ignore="0.4"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.10.1"

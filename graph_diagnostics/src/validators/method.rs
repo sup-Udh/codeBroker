@@ -31,7 +31,9 @@ impl PipelineValidator for MethodValidator {
             "SELECT state, COUNT(*) FROM relationships WHERE kind = 'method_call' GROUP BY state"
         )?;
 
-        let mut resolved = 0;
+        let mut repo_resolved = 0;
+        let mut ext_resolved = 0;
+        let mut builtin_resolved = 0;
         let state_rows = state_stmt.query_map([], |row| {
             let state: Option<String> = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -43,17 +45,34 @@ impl PipelineValidator for MethodValidator {
                 let state_str = state.unwrap_or_else(|| "Unknown".to_string());
                 metrics.insert(format!("State: {}", state_str), count as f64);
                 if state_str == "RepositorySymbol" {
-                    resolved += count;
+                    repo_resolved += count;
+                } else if state_str == "ExternalDependency" {
+                    ext_resolved += count;
+                } else if state_str == "Builtin" || state_str == "StandardLibrary" {
+                    builtin_resolved += count;
                 }
             }
         }
 
-        let success_rate = if total_method_calls > 0 {
-            (resolved as f64 / total_method_calls as f64) * 100.0
+        let repo_success = if total_method_calls > 0 {
+            (repo_resolved as f64 / total_method_calls as f64) * 100.0
         } else {
             0.0
         };
-        metrics.insert("Method Resolution Success (%)".to_string(), success_rate);
+        let ext_success = if total_method_calls > 0 {
+            (ext_resolved as f64 / total_method_calls as f64) * 100.0
+        } else {
+            0.0
+        };
+        let builtin_success = if total_method_calls > 0 {
+            (builtin_resolved as f64 / total_method_calls as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        metrics.insert("Repository Success (%)".to_string(), repo_success);
+        metrics.insert("External Success (%)".to_string(), ext_success);
+        metrics.insert("Builtin Success (%)".to_string(), builtin_success);
 
         // Find unresolved methods to report as findings
         let mut unres_stmt = db.conn.prepare(
@@ -91,7 +110,7 @@ impl PipelineValidator for MethodValidator {
             }
         }
 
-        let status = if total_method_calls > 0 && success_rate < 20.0 {
+        let status = if total_method_calls > 0 && repo_success < 20.0 {
             StageStatus::Warning
         } else {
             StageStatus::Pass

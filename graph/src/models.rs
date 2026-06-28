@@ -121,7 +121,9 @@ pub struct SymbolNode {
     pub metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionState {
     RepositorySymbol,
     WorkspaceModule,
@@ -132,6 +134,7 @@ pub enum ResolutionState {
     Ambiguous,
     Unknown,
     Missing,
+    Recursive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +151,7 @@ pub enum VariableOrigin {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolutionEvidence {
     ImportMatch,
     LexicalScopeMatch,
@@ -156,6 +159,7 @@ pub enum ResolutionEvidence {
     ReturnFlow,
     VariableAssignment,
     Alias,
+    AliasFlow,
     ParameterType,
     FieldType,
     ReceiverType,
@@ -164,8 +168,18 @@ pub enum ResolutionEvidence {
     GenericConstraint,
     ModuleExport,
     Builtin,
+    BuiltinClassification,
     ExternalDependency,
     NamespaceMatch,
+    DynamicDispatch,
+    DynamicMemberAccess,
+    UnknownReceiver,
+    UnknownModule,
+    MissingImport,
+    MissingExport,
+    AmbiguousCandidates,
+    NoMatchingExport,
+    RecursiveCall,
 }
 
 impl ResolutionEvidence {
@@ -177,6 +191,7 @@ impl ResolutionEvidence {
             ResolutionEvidence::ReturnFlow => "ReturnFlow",
             ResolutionEvidence::VariableAssignment => "VariableAssignment",
             ResolutionEvidence::Alias => "Alias",
+            ResolutionEvidence::AliasFlow => "AliasFlow",
             ResolutionEvidence::ParameterType => "ParameterType",
             ResolutionEvidence::FieldType => "FieldType",
             ResolutionEvidence::ReceiverType => "ReceiverType",
@@ -185,8 +200,18 @@ impl ResolutionEvidence {
             ResolutionEvidence::GenericConstraint => "GenericConstraint",
             ResolutionEvidence::ModuleExport => "ModuleExport",
             ResolutionEvidence::Builtin => "Builtin",
+            ResolutionEvidence::BuiltinClassification => "BuiltinClassification",
             ResolutionEvidence::ExternalDependency => "ExternalDependency",
             ResolutionEvidence::NamespaceMatch => "NamespaceMatch",
+            ResolutionEvidence::DynamicDispatch => "DynamicDispatch",
+            ResolutionEvidence::DynamicMemberAccess => "DynamicMemberAccess",
+            ResolutionEvidence::UnknownReceiver => "UnknownReceiver",
+            ResolutionEvidence::UnknownModule => "UnknownModule",
+            ResolutionEvidence::MissingImport => "MissingImport",
+            ResolutionEvidence::MissingExport => "MissingExport",
+            ResolutionEvidence::AmbiguousCandidates => "AmbiguousCandidates",
+            ResolutionEvidence::NoMatchingExport => "NoMatchingExport",
+            ResolutionEvidence::RecursiveCall => "RecursiveCall",
         }
     }
 }
@@ -203,6 +228,7 @@ impl ResolutionState {
             ResolutionState::Ambiguous => "Ambiguous",
             ResolutionState::Unknown => "Unknown",
             ResolutionState::Missing => "Missing",
+            ResolutionState::Recursive => "Recursive",
         }
     }
 }

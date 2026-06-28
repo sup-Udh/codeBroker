@@ -5,3 +5,6 @@ pub mod resolver;
 pub mod semantic;
 pub mod flow;
 pub mod walker;
+pub mod ir;
+pub mod pipeline;
+pub mod graph_builder;

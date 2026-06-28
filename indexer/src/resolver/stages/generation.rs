@@ -10,7 +10,7 @@ impl ResolutionStage for LexicalGenerationStage {
     }
 
     fn execute(&self, context: &mut ResolutionContext) -> Result<(), String> {
-        let name = &context.relationship.name;
+        let name = &context.ir.node.name;
         if let Some(ids) = context.symbol_index.find_by_name(name) {
             for &id in ids {
                 context.candidates.push(ResolutionCandidate {

@@ -18,17 +18,17 @@ impl ResolutionStage for ReceiverResolutionStage {
     }
 
     fn execute(&self, context: &mut ResolutionContext) -> Result<(), String> {
-        let kind = context.relationship.kind.as_deref().unwrap_or("imports");
+        let kind = context.ir.node.kind.as_deref().unwrap_or("imports");
 
         if !matches!(kind, "method_call" | "MEMBER_ACCESS" | "instantiates") {
             return Ok(());
         }
 
-        let Some(receiver_raw) = context.relationship.source.as_deref() else {
+        let Some(receiver_raw) = context.ir.node.source.as_deref() else {
             return Ok(());
         };
 
-        let method_name = context.relationship.name.clone();
+        let method_name = context.ir.node.name.clone();
 
         // Determine the type of the receiver
         let type_name: Option<String> = if receiver_raw.starts_with("this.")
@@ -36,11 +36,11 @@ impl ResolutionStage for ReceiverResolutionStage {
         {
             // this.field / self.field → look up field name in flow engine
             let field_name = &receiver_raw[receiver_raw.find('.').unwrap() + 1..];
-            context.flow_engine.get_var(context.source_file_id, field_name)
+            context.flow_engine.get_var(context.ir.source_file_id, field_name)
                 .and_then(|v| v.inferred_type.clone())
         } else {
             // Regular variable receiver → use flow engine
-            context.flow_engine.get_var(context.source_file_id, receiver_raw)
+            context.flow_engine.get_var(context.ir.source_file_id, receiver_raw)
                 .and_then(|v| v.inferred_type.clone())
         };
 
@@ -50,7 +50,7 @@ impl ResolutionStage for ReceiverResolutionStage {
 
         // If the resolved type is a known JS/TS builtin, classify as Builtin now.
         // This handles e.g. `res: Response` → `res.status()` → Builtin.
-        let file_path = context.symbol_index.file_paths.get(&context.source_file_id);
+        let file_path = context.symbol_index.file_paths.get(&context.ir.source_file_id);
         let is_js_ts = file_path.map(|p| {
             p.ends_with(".ts") || p.ends_with(".tsx")
                 || p.ends_with(".js") || p.ends_with(".jsx")
@@ -60,7 +60,7 @@ impl ResolutionStage for ReceiverResolutionStage {
 
         if is_js_ts && JS_BUILTIN_RECEIVERS.contains(&type_name.as_str()) {
             context.final_state = ResolutionState::Builtin;
-            context.evidence.push(ResolutionEvidence::NamespaceMatch);
+            context.evidence = Some(ResolutionEvidence::NamespaceMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::NamespaceMatch));
             context.resolved = true;
             return Ok(());
         }
@@ -76,7 +76,17 @@ impl ResolutionStage for ReceiverResolutionStage {
                     state: ResolutionState::RepositorySymbol,
                 })
                 .collect();
-            context.evidence.push(ResolutionEvidence::VariableAssignment);
+            context.evidence = Some(ResolutionEvidence::VariableAssignment); 
+            context.emit("Stage", "Resolved", Some(ResolutionEvidence::VariableAssignment));
+            context.final_state = ResolutionState::RepositorySymbol;
+            context.resolved = true;
+        } else {
+            // We know the receiver's type, but the method doesn't exist in our index.
+            // Stop the pipeline to avoid fuzzy lexical matching.
+            context.final_state = ResolutionState::Missing;
+            context.evidence = Some(ResolutionEvidence::VariableAssignment);
+            context.emit("Stage", "MissingMethod", Some(ResolutionEvidence::VariableAssignment));
+            context.resolved = true;
         }
 
         Ok(())

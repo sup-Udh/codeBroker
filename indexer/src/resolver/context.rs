@@ -1,7 +1,9 @@
 use std::sync::Arc;
-use graph::models::{RelationshipNode, ResolutionEvidence, ResolutionState};
+use graph::models::{ResolutionEvidence, ResolutionState};
 use crate::resolver::index::SymbolIndex;
 use crate::flow::VariableFlowEngine;
+use crate::ir::RelationshipIR;
+use crate::resolver::events::ResolutionTrace;
 
 #[derive(Debug, Clone)]
 pub struct ResolutionCandidate {
@@ -11,35 +13,38 @@ pub struct ResolutionCandidate {
 }
 
 pub struct ResolutionContext {
-    pub relationship: RelationshipNode,
-    pub rel_id: i64,
-    pub source_file_id: i64,
+    pub ir: RelationshipIR,
     pub candidates: Vec<ResolutionCandidate>,
     pub symbol_index: Arc<SymbolIndex>,
-    pub evidence: Vec<ResolutionEvidence>,
+    pub evidence: Option<ResolutionEvidence>,
     pub final_state: ResolutionState,
     pub resolved: bool,
     pub flow_engine: Arc<VariableFlowEngine>,
+    pub trace: Option<ResolutionTrace>,
 }
 
 impl ResolutionContext {
     pub fn new(
-        rel_id: i64,
-        source_file_id: i64,
-        relationship: RelationshipNode,
+        ir: RelationshipIR,
         symbol_index: Arc<SymbolIndex>,
         flow_engine: Arc<VariableFlowEngine>,
+        enable_tracing: bool,
     ) -> Self {
         Self {
-            relationship,
-            rel_id,
-            source_file_id,
+            ir,
             candidates: Vec::new(),
             symbol_index,
-            evidence: Vec::new(),
+            evidence: None,
             final_state: ResolutionState::Unknown,
             resolved: false,
             flow_engine,
+            trace: if enable_tracing { Some(ResolutionTrace::new()) } else { None },
+        }
+    }
+
+    pub fn emit(&mut self, stage: &str, status: &str, evidence: Option<ResolutionEvidence>) {
+        if let Some(ref mut t) = self.trace {
+            t.emit(stage, status, evidence);
         }
     }
 }

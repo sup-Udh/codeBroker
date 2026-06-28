@@ -42,6 +42,14 @@ pub const INIT_SQL: &str = "
         FOREIGN KEY(target_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_dedup ON edges (
+        source_file_id, 
+        IFNULL(source_symbol_id, -1), 
+        target_symbol_id, 
+        kind, 
+        edge_type
+    );
+
     CREATE TABLE IF NOT EXISTS relationships (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_id INTEGER NOT NULL,
@@ -110,6 +118,21 @@ pub const INIT_SQL: &str = "
         topology_version INTEGER NOT NULL DEFAULT 1,
         model_name TEXT NOT NULL,
         overview_text TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS pipeline_manifests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version TEXT NOT NULL,
+        parser_version TEXT NOT NULL,
+        semantic_version TEXT NOT NULL,
+        resolver_version TEXT NOT NULL,
+        graph_version TEXT NOT NULL,
+        embedding_version TEXT NOT NULL,
+        total_files INTEGER NOT NULL,
+        total_symbols INTEGER NOT NULL,
+        total_relationships INTEGER NOT NULL,
+        edges_emitted INTEGER NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 

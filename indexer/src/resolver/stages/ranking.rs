@@ -16,7 +16,7 @@ impl ResolutionStage for RankingStage {
         }
 
         if context.candidates.is_empty() {
-            let kind = context.relationship.kind.as_deref().unwrap_or("imports");
+            let kind = context.ir.node.kind.as_deref().unwrap_or("imports");
             context.final_state = if matches!(
                 kind,
                 "method_call" | "MEMBER_ACCESS" | "annotation" | "generic_constraint"
@@ -28,8 +28,8 @@ impl ResolutionStage for RankingStage {
         } else if context.candidates.len() == 1 {
             context.final_state = context.candidates[0].state;
             // Use evidence already pushed by an earlier stage if present
-            if context.evidence.is_empty() {
-                context.evidence.push(ResolutionEvidence::LexicalScopeMatch);
+            if context.evidence.is_none() {
+                context.evidence = Some(ResolutionEvidence::LexicalScopeMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::LexicalScopeMatch));
             }
         } else {
             context.candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
@@ -38,8 +38,8 @@ impl ResolutionStage for RankingStage {
                 context.final_state = ResolutionState::Ambiguous;
             } else {
                 context.final_state = context.candidates[0].state;
-                if context.evidence.is_empty() {
-                    context.evidence.push(ResolutionEvidence::LexicalScopeMatch);
+                if context.evidence.is_none() {
+                    context.evidence = Some(ResolutionEvidence::LexicalScopeMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::LexicalScopeMatch));
                 }
             }
         }

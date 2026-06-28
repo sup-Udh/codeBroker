@@ -490,12 +490,11 @@ impl Database {
         rel_id: i64,
         state: &str,
         confidence: f64,
-        evidence: Option<graph::models::ResolutionEvidence>,
+        evidence: Option<&str>,
     ) -> Result<()> {
-        let evidence_str = evidence.map(|e| e.as_str());
         self.conn.execute(
             "UPDATE relationships SET state = ?1, confidence = ?2, evidence = ?3 WHERE id = ?4",
-            params![state, confidence, evidence_str, rel_id],
+            params![state, confidence, evidence, rel_id],
         )?;
         Ok(())
     }
@@ -640,25 +639,8 @@ impl Database {
         target_symbol_id: i64,
         kind: &str,
     ) -> Result<()> {
-        // A single relationship can yield the same logical edge more than once
-        // (e.g. the same name appearing in several word-split fallback
-        // matches, or being imported more than once in the same file). Without
-        // a dedup check, edge counts for hotspot/cycle scoring inflate by a
-        // factor that depends on how many times a name happened to be
-        // re-encountered — not on the actual number of relationships — which
-        // is itself a source of run-to-run-looking instability. `source_symbol_id`
-        // is compared with `IS`, not `=`, so two NULLs (both "no enclosing
-        // symbol") count as the same edge rather than always comparing unequal.
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_file_id = ?1 AND source_symbol_id IS ?2 AND target_symbol_id = ?3 AND kind = ?4)",
-            params![source_file_id, source_symbol_id, target_symbol_id, kind],
-            |row| row.get(0),
-        )?;
-        if exists {
-            return Ok(());
-        }
         self.conn.execute(
-            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
             params![source_file_id, source_symbol_id, target_symbol_id, kind],
         )?;
         Ok(())
@@ -677,22 +659,34 @@ impl Database {
         metadata: &str,
         confidence: f64,
     ) -> Result<()> {
-        let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM edges WHERE source_symbol_id IS ?1 AND target_symbol_id = ?2 AND kind = 'interaction' AND edge_type = 'logical')",
-            params![source_symbol_id, target_symbol_id],
-            |row| row.get(0),
-        )?;
-        if exists {
-            return Ok(());
-        }
         self.conn.execute(
-            "INSERT INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, edge_type, metadata, confidence) VALUES (?1, ?2, ?3, 'interaction', 'logical', ?4, ?5)",
+            "INSERT OR IGNORE INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, edge_type, metadata, confidence) VALUES (?1, ?2, ?3, 'interaction', 'logical', ?4, ?5)",
             params![source_file_id, source_symbol_id, target_symbol_id, metadata, confidence],
         )?;
         Ok(())
     }
 
     /// Layer 3: Save an AI-generated summary to the Knowledge Store
+    pub fn save_pipeline_manifest(
+        &self,
+        version: &str,
+        parser_version: &str,
+        semantic_version: &str,
+        resolver_version: &str,
+        graph_version: &str,
+        embedding_version: &str,
+        total_files: i64,
+        total_symbols: i64,
+        total_relationships: i64,
+        edges_emitted: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pipeline_manifests (version, parser_version, semantic_version, resolver_version, graph_version, embedding_version, total_files, total_symbols, total_relationships, edges_emitted) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![version, parser_version, semantic_version, resolver_version, graph_version, embedding_version, total_files, total_symbols, total_relationships, edges_emitted],
+        )?;
+        Ok(())
+    }
+
     /// Layer 3: Save an AI-generated summary to the Knowledge Store with metadata
     pub fn save_semantic_summary(
         &self,

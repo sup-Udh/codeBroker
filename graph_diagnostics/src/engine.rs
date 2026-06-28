@@ -15,10 +15,12 @@ use crate::validators::{
     semantic_index::SemanticIndexValidator,
     retrieval::RetrievalValidator,
     consistency::ConsistencyValidator,
+    version::VersionValidator,
 };
 
 pub fn run_diagnostics(db: &Database) -> Result<PipelineReport> {
     let validators: Vec<Box<dyn PipelineValidator>> = vec![
+        Box::new(VersionValidator),
         Box::new(ParserValidator),
         Box::new(SemanticValidator),
         Box::new(FlowValidator),

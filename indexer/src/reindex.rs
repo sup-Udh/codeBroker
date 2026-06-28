@@ -152,7 +152,9 @@ pub fn reindex_paths(
     // the full linker unconditionally would re-insert duplicate edges for
     // every untouched file in the repo; this keeps the scope to exactly the
     // touched files plus their known consumers.
-    let (edges_created, _) = crate::resolver::resolve_relationships(db, Some(&touched_file_ids)).unwrap_or((0,0));
+    let metrics = crate::resolver::resolve_relationships(db, Some(&touched_file_ids))
+        .unwrap_or_default();
+    let edges_created = metrics.edges_emitted;
     stats.edges_created += edges_created;
     
     // 3. Infer logical interactions
@@ -173,6 +175,14 @@ pub fn reindex_paths(
     if let Ok(metrics) = query::metrics::compute_metrics(db) {
         let _ = query::metrics::save_metrics(db, &metrics);
     }
+    
+    // 6. Save Pipeline Manifest
+    let total_files = db.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
+    let total_symbols = db.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
+    let total_relationships = db.conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0)).unwrap_or(0);
+    let edges_emitted = db.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
+    let version = env!("CARGO_PKG_VERSION");
+    let _ = db.save_pipeline_manifest(version, "1.0", "1.0", "1.0", "1.0", "1.0", total_files, total_symbols, total_relationships, edges_emitted);
 
     Ok(stats)
 }

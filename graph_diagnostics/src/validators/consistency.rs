@@ -28,30 +28,50 @@ impl PipelineValidator for ConsistencyValidator {
         let mut findings = Vec::new();
         let mut metrics = HashMap::new();
 
-        // Validate complete data flow path:
-        // relationships of kind = 'method_call' -> must have a state. If state == 'RepositorySymbol', 
-        // the target must exist in symbols and edges.
-        
-        let invalid_method_calls: i64 = db.conn.query_row(
+        // 1. Any relationship marked RepositorySymbol MUST have a corresponding edge
+        let missing_edges_for_repo_symbols: i64 = db.conn.query_row(
             "SELECT COUNT(*) FROM relationships 
-             WHERE kind = 'method_call' 
-               AND state = 'RepositorySymbol'
+             WHERE state = 'RepositorySymbol'
                AND NOT EXISTS (
                    SELECT 1 FROM edges 
-                   WHERE edges.source_symbol_id = (SELECT id FROM symbols s WHERE s.file_id = relationships.file_id AND s.start_line <= relationships.line_number ORDER BY s.start_line DESC LIMIT 1)
-                     AND edges.kind = 'method_call'
+                   WHERE edges.source_file_id = relationships.file_id 
+                     AND edges.kind = COALESCE(relationships.kind, 'imports')
                )",
             [],
             |row| row.get(0)
         ).unwrap_or(0);
 
-        if invalid_method_calls > 0 {
+        if missing_edges_for_repo_symbols > 0 {
             findings.push(DiagnosticFinding {
                 severity: Severity::Critical,
-                title: "End-to-End Pipeline Breakdown".to_string(),
-                description: format!("Found {} method_call relationships marked as successfully resolved (RepositorySymbol) but no corresponding edge exists in the graph.", invalid_method_calls),
-                likely_cause: "The resolver correctly determined the target, but the graph builder failed to link it to the enclosing symbol scope (perhaps due to missing enclosing symbol).".to_string(),
-                suggested_fix: "Check the enclosing_symbol lookup logic in graph builder for these file lines.".to_string(),
+                title: "RepositorySymbol without Graph Edge".to_string(),
+                description: format!("Found {} relationships marked RepositorySymbol but no corresponding edge exists in the graph.", missing_edges_for_repo_symbols),
+                likely_cause: "The resolver correctly determined the target, but graph builder failed to link it, possibly due to a missing enclosing symbol or duplicate collapse error.".to_string(),
+                suggested_fix: "Check the enclosing_symbol lookup logic and GraphBuilderMetrics.".to_string(),
+                file_id: None,
+                symbol_id: None,
+            });
+        }
+        
+        // 2. All symbols in edges must exist in symbol_features (Feature Extraction processed)
+        let unfeatured_nodes: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT source_symbol_id as sid FROM edges WHERE source_symbol_id IS NOT NULL
+                UNION
+                SELECT target_symbol_id as sid FROM edges
+             ) AS nodes
+             WHERE NOT EXISTS (SELECT 1 FROM symbol_features sf WHERE sf.symbol_id = nodes.sid)",
+             [],
+             |row| row.get(0)
+        ).unwrap_or(0);
+        
+        if unfeatured_nodes > 0 {
+            findings.push(DiagnosticFinding {
+                severity: Severity::Error,
+                title: "Nodes Missing Feature Extraction".to_string(),
+                description: format!("Found {} symbols participating in graph edges that have no feature rows.", unfeatured_nodes),
+                likely_cause: "Feature extraction stage crashed, skipped nodes, or ran out of order.".to_string(),
+                suggested_fix: "Ensure feature extraction runs after graph building completes.".to_string(),
                 file_id: None,
                 symbol_id: None,
             });
@@ -60,7 +80,8 @@ impl PipelineValidator for ConsistencyValidator {
         let has_errors = findings.iter().any(|f| matches!(f.severity, Severity::Error | Severity::Critical));
         let status = if has_errors { StageStatus::Fail } else if !findings.is_empty() { StageStatus::Warning } else { StageStatus::Pass };
 
-        metrics.insert("Pipeline Breakdown Errors".to_string(), invalid_method_calls as f64);
+        metrics.insert("Repository Symbols Missing Edges".to_string(), missing_edges_for_repo_symbols as f64);
+        metrics.insert("Graph Nodes Missing Features".to_string(), unfeatured_nodes as f64);
 
         Ok(StageReport {
             stage: self.stage(),

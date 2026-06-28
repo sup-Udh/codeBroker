@@ -45,6 +45,10 @@ enum Commands {
     Bind,
     /// Validates the structure and health of the compiled graph
     Validate,
+    /// Inspects a single relationship's deterministic resolution trace
+    Inspect {
+        relationship_id: i64,
+    },
 }
 
 fn main() {
@@ -276,9 +280,12 @@ fn main() {
                 // --- PASS 2: THE LINKER ---
                 println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
                 let t_pass2 = std::time::Instant::now();
-                let (edges_created, total_relationships) =
-        indexer::resolver::resolve_relationships(&db, None).expect("Linker failed");
+                let metrics = indexer::resolver::resolve_relationships(&db, None).expect("Linker failed");
+                let edges_created = metrics.edges_emitted;
+                let total_relationships = metrics.relationships_received;
                 println!("Linking complete. Created {} true graph edges from {} relationships.", edges_created, total_relationships);
+                let version = env!("CARGO_PKG_VERSION");
+                let _ = db.save_pipeline_manifest(version, "1.0", "1.0", "1.0", "1.0", "1.0", pass1_files as i64, pass1_symbols as i64, total_relationships as i64, edges_created as i64);
                 eprintln!("[TIMING] Pass 2 (edge linking): {}ms", t_pass2.elapsed().as_millis());
 
                 // 4.4 Infer logical interaction edges (HTTP/WebSocket runtime
@@ -491,6 +498,66 @@ fn main() {
                 }
                 Ok(None) => println!("Symbol '{}' not found in the graph.", symbol),
                 Err(e) => println!("Error assembling context: {}", e),
+            }
+        }
+        Commands::Inspect { relationship_id } => {
+            let current_dir = std::env::current_dir().unwrap();
+            let db_path = current_dir.join(".codebroker").join("codebroker.db");
+            if !db_path.exists() {
+                eprintln!("Error: Not a CodeBroker repository. Run `codebroker init` first.");
+                std::process::exit(1);
+            }
+            let db = storage::Database::new(db_path.to_str().unwrap()).expect("Failed to open DB");
+            let raw_rel = db.conn.query_row(
+                "SELECT file_id, name, source, kind, line_number FROM relationships WHERE id = ?1",
+                rusqlite::params![relationship_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                }
+            );
+
+            match raw_rel {
+                Ok((file_id, name, source, kind, line_number)) => {
+                    let enclosing_symbol = db.enclosing_symbol_id(file_id, line_number).unwrap_or(None);
+                    
+                    let input_ir = indexer::ir::RelationshipIR {
+                        id: *relationship_id,
+                        source_file_id: file_id,
+                        node: graph::models::RelationshipNode {
+                            name,
+                            source,
+                            line_number: line_number as usize,
+                            kind,
+                        },
+                        enclosing_symbol_id: enclosing_symbol,
+                    };
+
+                    println!("Replaying resolution for Relationship ID: {}", relationship_id);
+                    println!("Input IR: {:#?}", input_ir);
+                    
+                    use indexer::pipeline::PipelineStage;
+                    // Run resolver with tracing enabled
+                    let resolver = indexer::resolver::Resolver::new(&db, true);
+                    let resolved = resolver.execute(vec![input_ir]).unwrap();
+                    
+                    if let Some(res) = resolved.first() {
+                        println!("\nFinal State: {:?}", res.state);
+                        println!("Target Symbols: {:?}", res.target_symbol_ids);
+                        println!("Confidence: {}", res.confidence);
+                        // Trace should have been printed by Resolver to stderr.
+                        // We can also print it explicitly if we changed Resolver to attach it.
+                    }
+                }
+                Err(_) => {
+                    eprintln!("Error: Relationship ID {} not found.", relationship_id);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Validate => {

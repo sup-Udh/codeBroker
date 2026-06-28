@@ -2,6 +2,7 @@ pub mod index;
 pub mod context;
 pub mod pipeline;
 pub mod stages;
+pub mod events;
 
 pub use pipeline::ResolutionPipeline;
 pub use index::SymbolIndex;
@@ -17,76 +18,119 @@ use crate::semantic::{
     evidence::{ResolutionConfidence, SemanticEvidence},
 };
 use crate::flow::VariableFlowEngine;
+use crate::ir::{RelationshipIR, ResolvedRelationshipIR};
+use crate::pipeline::PipelineStage;
+use crate::graph_builder::{GraphBuilder, GraphBuilderMetrics};
+
+pub struct Resolver<'a> {
+    pub db: &'a Database,
+    pub enable_tracing: bool,
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(db: &'a Database, enable_tracing: bool) -> Self {
+        Self { db, enable_tracing }
+    }
+}
+
+impl<'a> PipelineStage for Resolver<'a> {
+    type Input = Vec<RelationshipIR>;
+    type Output = Vec<ResolvedRelationshipIR>;
+
+    fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
+        let symbol_index = Arc::new(SymbolIndex::build(self.db)?);
+        let flow_engine = Arc::new(VariableFlowEngine::new(self.db));
+
+        let pipeline = ResolutionPipeline::new(vec![
+            Box::new(stages::classification::ClassificationStage),
+            Box::new(stages::receiver::ReceiverResolutionStage),
+            Box::new(stages::generation::LexicalGenerationStage),
+            Box::new(stages::filtering::ScopeFilterStage),
+            Box::new(stages::filtering::ModuleFilterStage),
+            Box::new(stages::ranking::RankingStage),
+        ]);
+
+        let mut output = Vec::with_capacity(input.len());
+
+        for ir in input {
+            let mut context = ResolutionContext::new(
+                ir.clone(),
+                Arc::clone(&symbol_index),
+                Arc::clone(&flow_engine),
+                self.enable_tracing,
+            );
+
+            let resolved_context = pipeline.execute(context)?;
+
+            // For diagnostics inspect, we might need to print the trace here or return it
+            if let Some(t) = resolved_context.trace {
+                // We could attach it to ResolvedRelationshipIR if we want, but for now we just print it if tracing is on
+                if self.enable_tracing {
+                    let trace_json = serde_json::to_string_pretty(&t).unwrap_or_default();
+                    eprintln!("TRACE for {}:\n{}", ir.id, trace_json);
+                }
+            }
+            
+            // Only update the evidence enum string in db
+            let evidence_str = resolved_context.evidence.map(|e| e.as_str().to_string());
+            let _ = self.db.update_relationship_state(
+                ir.id, 
+                resolved_context.final_state.as_str(), 
+                1.0, 
+                evidence_str.as_deref()
+            );
+
+            let target_ids = resolved_context.candidates.into_iter().map(|c| c.symbol_id).collect();
+
+            output.push(ResolvedRelationshipIR {
+                original: ir,
+                state: resolved_context.final_state,
+                target_symbol_ids: target_ids,
+                confidence: 1.0,
+            });
+        }
+
+        Ok(output)
+    }
+}
 
 pub fn resolve_relationships(
     db: &Database,
     restrict_to_files: Option<&[i64]>,
-) -> Result<(usize, usize), String> {
-    let relationships = db
+) -> Result<GraphBuilderMetrics, String> {
+    let raw_relationships = db
         .get_all_relationships_with_lines()
         .map_err(|e| e.to_string())?;
-
-    let total_relationships = relationships.len();
-    let mut edges_created = 0;
-
-    // 1. Build Symbol Index
-    let symbol_index = Arc::new(SymbolIndex::build(db)?);
-
-    // 2. Build Variable Flow Engine (replaces the old file_var_maps pre-pass)
-    let flow_engine = Arc::new(VariableFlowEngine::new(db));
-
-    // 3. Build Pipeline
-    let pipeline = ResolutionPipeline::new(vec![
-        Box::new(stages::classification::ClassificationStage),
-        Box::new(stages::receiver::ReceiverResolutionStage),
-        Box::new(stages::generation::LexicalGenerationStage),
-        Box::new(stages::filtering::ScopeFilterStage),
-        Box::new(stages::filtering::ModuleFilterStage),
-        Box::new(stages::ranking::RankingStage),
-    ]);
-
-    // 4. Process each relationship
-    for (rel_id, source_file_id, import_name, import_source, import_kind, line_number) in &relationships {
+        
+    let mut input_ir = Vec::new();
+    for (rel_id, source_file_id, import_name, import_source, import_kind, line_number) in raw_relationships {
         if let Some(files) = restrict_to_files {
-            if !files.contains(source_file_id) {
-                let _ = files; // incremental: re-link touched files (caller decides scope)
+            if !files.contains(&source_file_id) {
+                // If it's not a touched file, we still need to process it if it might be a consumer
+                // of the touched file. For now, since the previous code didn't actually filter,
+                // we'll just not `continue` to preserve correctness.
+                // TODO: Optimize to only re-resolve consumers of touched files.
             }
         }
-
-        let edge_kind = import_kind.clone().unwrap_or_else(|| "imports".to_string());
-
-        let src_sym = db.enclosing_symbol_id(*source_file_id, *line_number).unwrap_or(None);
-
-        let context = ResolutionContext::new(
-            *rel_id,
-            *source_file_id,
-            graph::models::RelationshipNode {
-                name: import_name.clone(),
-                source: import_source.clone(),
-                line_number: *line_number as usize,
-                kind: import_kind.clone(),
+        let src_sym = db.enclosing_symbol_id(source_file_id, line_number).unwrap_or(None);
+        input_ir.push(RelationshipIR {
+            id: rel_id,
+            source_file_id,
+            node: graph::models::RelationshipNode {
+                name: import_name,
+                source: import_source,
+                line_number: line_number as usize,
+                kind: import_kind,
             },
-            Arc::clone(&symbol_index),
-            Arc::clone(&flow_engine),
-        );
-
-        let resolved_context = pipeline.execute(context)?;
-
-        let final_state = resolved_context.final_state;
-        let evidence = resolved_context.evidence.first().cloned();
-
-        if final_state == ResolutionState::RepositorySymbol
-            && !resolved_context.candidates.is_empty()
-        {
-            let target_id = resolved_context.candidates[0].symbol_id;
-            if Some(target_id) != src_sym {
-                let _ = db.insert_edge_attributed(*source_file_id, src_sym, target_id, &edge_kind);
-                edges_created += 1;
-            }
-        }
-
-        let _ = db.update_relationship_state(*rel_id, final_state.as_str(), 1.0, evidence);
+            enclosing_symbol_id: src_sym,
+        });
     }
 
-    Ok((edges_created, total_relationships))
+    let resolver = Resolver::new(db, false);
+    let resolved_ir = resolver.execute(input_ir)?;
+
+    let graph_builder = GraphBuilder::new(db);
+    let metrics = graph_builder.execute(resolved_ir)?;
+
+    Ok(metrics)
 }

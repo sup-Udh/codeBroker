@@ -74,11 +74,11 @@ impl PipelineValidator for GraphValidatorObj {
 
         if duplicate_edges > 0 {
             findings.push(DiagnosticFinding {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 title: "Duplicate Edges Detected".to_string(),
                 description: format!("Found {} duplicate graph edges.", duplicate_edges),
-                likely_cause: "Resolver process ran multiple times without deduplication, or multiple identical calls exist without grouping.".to_string(),
-                suggested_fix: "Ensure graph edge insertions use INSERT OR IGNORE, or deduplicate relationships prior to linking.".to_string(),
+                likely_cause: "Resolver process ran multiple times without deduplication, or database constraint failed.".to_string(),
+                suggested_fix: "Ensure graph edge insertions use UNIQUE constraints and memory deduplication.".to_string(),
                 file_id: None,
                 symbol_id: None,
             });
@@ -93,11 +93,11 @@ impl PipelineValidator for GraphValidatorObj {
 
         if self_loops > 0 {
             findings.push(DiagnosticFinding {
-                severity: Severity::Info,
+                severity: Severity::Error,
                 title: "Self-Looping Edges Detected".to_string(),
                 description: format!("Found {} self-looping graph edges.", self_loops),
-                likely_cause: "Recursive functions, or incorrect scope resolution assigning an edge to the enclosing scope.".to_string(),
-                suggested_fix: "Verify if self-loops are expected (e.g. recursive). If not, ensure resolution skips the immediate enclosing scope.".to_string(),
+                likely_cause: "Recursive functions resulted in graph edges instead of relationship states.".to_string(),
+                suggested_fix: "Ensure resolution pipeline converts self-loops to Recursive state rather than emitting edges.".to_string(),
                 file_id: None,
                 symbol_id: None,
             });
