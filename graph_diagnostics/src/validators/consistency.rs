@@ -18,7 +18,7 @@ impl PipelineValidator for ConsistencyValidator {
             PipelineStage::Flow,
             PipelineStage::Receiver,
             PipelineStage::Method,
-            PipelineStage::Resolver,
+            PipelineStage::ResolutionQuality,
             PipelineStage::Graph,
         ]
     }

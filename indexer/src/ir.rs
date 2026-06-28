@@ -1,4 +1,5 @@
 use graph::models::{RelationshipNode, ResolutionState};
+use crate::resolver::decisions::StageDecision;
 
 /// A stable, immutable intermediate representation of an unresolved relationship.
 /// This acts as the single source of truth for the Resolver pipeline.
@@ -17,4 +18,5 @@ pub struct ResolvedRelationshipIR {
     pub state: ResolutionState,
     pub target_symbol_ids: Vec<i64>,
     pub confidence: f64,
+    pub decisions: Vec<StageDecision>,
 }

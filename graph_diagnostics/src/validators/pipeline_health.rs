@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use crate::traits::{DiagnosticFinding, PipelineValidator, PipelineStage, StageReport, StageStatus, Severity};
 use std::time::Instant;
 
-pub struct ResolverValidator;
+pub struct PipelineHealthValidator;
 
-impl PipelineValidator for ResolverValidator {
+impl PipelineValidator for PipelineHealthValidator {
     fn stage(&self) -> PipelineStage {
-        PipelineStage::Resolver
+        PipelineStage::PipelineHealth
     }
 
     fn dependencies(&self) -> Vec<PipelineStage> {
@@ -25,36 +25,7 @@ impl PipelineValidator for ResolverValidator {
             [],
             |row| row.get(0)
         ).unwrap_or(0);
-        metrics.insert("Relationships Entering Resolver".to_string(), total_rel as f64);
-
-        let mut state_stmt = db.conn.prepare("SELECT state, COUNT(*) FROM relationships GROUP BY state")?;
-        let state_rows = state_stmt.query_map([], |row| {
-            let state: Option<String> = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((state, count))
-        })?;
-
-        for row in state_rows {
-            if let Ok((state, count)) = row {
-                let state_str = state.unwrap_or_else(|| "Unknown".to_string());
-                metrics.insert(format!("State: {}", state_str), count as f64);
-            }
-        }
-
-        let mut ev_stmt = db.conn.prepare("SELECT evidence, COUNT(*) FROM relationships GROUP BY evidence")?;
-        let ev_rows = ev_stmt.query_map([], |row| {
-            let ev: Option<String> = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((ev, count))
-        })?;
-
-        for row in ev_rows {
-            if let Ok((ev, count)) = row {
-                if let Some(ev_str) = ev {
-                    metrics.insert(format!("Evidence: {}", ev_str), count as f64);
-                }
-            }
-        }
+        metrics.insert("Relationships Analyzed".to_string(), total_rel as f64);
 
         // Validate invariants
         let invalid_repo_sym: i64 = db.conn.query_row(
@@ -68,7 +39,7 @@ impl PipelineValidator for ResolverValidator {
                 severity: Severity::Critical,
                 title: "Invalid RepositorySymbol State".to_string(),
                 description: format!("Found {} relationships marked as RepositorySymbol but missing evidence.", invalid_repo_sym),
-                likely_cause: "Resolver assigned RepositorySymbol state without supplying the resolution evidence.".to_string(),
+                likely_cause: "Pipeline Contract Violation".to_string(),
                 suggested_fix: "Ensure all successful resolutions return a populated evidence context.".to_string(),
                 file_id: None,
                 symbol_id: None,
@@ -83,11 +54,47 @@ impl PipelineValidator for ResolverValidator {
 
         if missing_reason > 0 {
             findings.push(DiagnosticFinding {
-                severity: Severity::Warning,
+                severity: Severity::Critical,
                 title: "Missing Resolution Reason".to_string(),
                 description: format!("Found {} relationships marked as Missing or Dynamic but without a reason logged in evidence.", missing_reason),
-                likely_cause: "Pipeline stage returned Missing/Dynamic without specifying why the resolution was halted.".to_string(),
+                likely_cause: "Pipeline Contract Violation".to_string(),
                 suggested_fix: "Attach a fallback evidence string explaining why it was marked dynamic or missing.".to_string(),
+                file_id: None,
+                symbol_id: None,
+            });
+        }
+        
+        let invalid_builtin: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM relationships WHERE state = 'Builtin' AND evidence != 'BuiltinClassification'",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        
+        if invalid_builtin > 0 {
+            findings.push(DiagnosticFinding {
+                severity: Severity::Critical,
+                title: "Invalid Classification Evidence".to_string(),
+                description: format!("Found {} relationships marked as Builtin without BuiltinClassification evidence.", invalid_builtin),
+                likely_cause: "Pipeline Contract Violation".to_string(),
+                suggested_fix: "Ensure Builtin only comes from BuiltinClassification.".to_string(),
+                file_id: None,
+                symbol_id: None,
+            });
+        }
+
+        let invalid_ext: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM relationships WHERE state = 'ExternalDependency' AND evidence != 'ExternalDependency'",
+            [],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        
+        if invalid_ext > 0 {
+            findings.push(DiagnosticFinding {
+                severity: Severity::Critical,
+                title: "Invalid Classification Evidence".to_string(),
+                description: format!("Found {} relationships marked as ExternalDependency without ExternalDependency evidence.", invalid_ext),
+                likely_cause: "Pipeline Contract Violation".to_string(),
+                suggested_fix: "Ensure ExternalDependency only comes from ExternalDependency evidence.".to_string(),
                 file_id: None,
                 symbol_id: None,
             });

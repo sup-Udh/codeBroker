@@ -2,6 +2,7 @@ use crate::resolver::stages::ResolutionStage;
 use crate::resolver::context::{ResolutionCandidate, ResolutionContext};
 use crate::resolver::stages::classification::JS_BUILTIN_RECEIVERS;
 use graph::models::{ResolutionEvidence, ResolutionState};
+use crate::resolver::decisions::{PipelineStageType, DecisionReason};
 
 /// Resolves method calls using the file's semantic type map.
 ///
@@ -17,14 +18,20 @@ impl ResolutionStage for ReceiverResolutionStage {
         "ReceiverResolutionStage"
     }
 
+    fn stage_type(&self) -> PipelineStageType {
+        PipelineStageType::ReceiverResolution
+    }
+
     fn execute(&self, context: &mut ResolutionContext) -> Result<(), String> {
         let kind = context.ir.node.kind.as_deref().unwrap_or("imports");
 
         if !matches!(kind, "method_call" | "MEMBER_ACCESS" | "instantiates") {
+            context.skip_stage(self.stage_type());
             return Ok(());
         }
 
         let Some(receiver_raw) = context.ir.node.source.as_deref() else {
+            context.fail_stage(self.stage_type(), DecisionReason::UnknownReceiver, None);
             return Ok(());
         };
 
@@ -45,6 +52,7 @@ impl ResolutionStage for ReceiverResolutionStage {
         };
 
         let Some(type_name) = type_name else {
+            context.fail_stage(self.stage_type(), DecisionReason::UnknownReceiverType, None);
             return Ok(());
         };
 
@@ -59,16 +67,19 @@ impl ResolutionStage for ReceiverResolutionStage {
         }).unwrap_or(false);
 
         if is_js_ts && JS_BUILTIN_RECEIVERS.contains(&type_name.as_str()) {
-            context.final_state = ResolutionState::Builtin;
-            context.evidence = Some(ResolutionEvidence::NamespaceMatch); context.emit("Stage", "Resolved", Some(ResolutionEvidence::NamespaceMatch));
-            context.resolved = true;
+            context.resolve_with(
+                self.stage_type(),
+                ResolutionState::Builtin,
+                DecisionReason::BuiltinClassification,
+                None
+            );
             return Ok(());
         }
 
         let candidates = context.symbol_index.find_method_in_type(&method_name, &type_name);
 
         if !candidates.is_empty() {
-            context.candidates = candidates
+            let resolution_candidates = candidates
                 .into_iter()
                 .map(|id| ResolutionCandidate {
                     symbol_id: id,
@@ -76,19 +87,30 @@ impl ResolutionStage for ReceiverResolutionStage {
                     state: ResolutionState::RepositorySymbol,
                 })
                 .collect();
-            context.evidence = Some(ResolutionEvidence::VariableAssignment); 
-            context.emit("Stage", "Resolved", Some(ResolutionEvidence::VariableAssignment));
-            context.final_state = ResolutionState::RepositorySymbol;
-            context.resolved = true;
+                
+            context.add_candidates(
+                self.stage_type(),
+                resolution_candidates,
+                Some(DecisionReason::RepositoryMatch),
+                Some(format!("Receiver type: {}", type_name))
+            );
+            context.resolve_with(
+                self.stage_type(),
+                ResolutionState::RepositorySymbol,
+                DecisionReason::VariableAssignment,
+                None
+            );
         } else {
             // We know the receiver's type, but the method doesn't exist in our index.
             // Stop the pipeline to avoid fuzzy lexical matching.
-            context.final_state = ResolutionState::Missing;
-            context.evidence = Some(ResolutionEvidence::VariableAssignment);
-            context.emit("Stage", "MissingMethod", Some(ResolutionEvidence::VariableAssignment));
-            context.resolved = true;
+            context.resolve_with(
+                self.stage_type(),
+                ResolutionState::Missing,
+                DecisionReason::MissingImport,
+                Some(format!("Method missing on type: {}", type_name))
+            );
         }
-
+        
         Ok(())
     }
 }

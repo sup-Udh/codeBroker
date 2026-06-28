@@ -49,6 +49,8 @@ enum Commands {
     Inspect {
         relationship_id: i64,
     },
+    /// Analyzes the resolution pipeline and outputs aggregate statistics
+    AnalyzeResolution,
 }
 
 fn main() {
@@ -196,7 +198,6 @@ fn main() {
                         // C. If we have a parser for this language, process it!
                         if let Some(frontend) = matched_frontend {
                             let content_hash = storage::hash_content(source_code.as_bytes());
-
                             let t_parse = std::time::Instant::now();
                             let parsed = frontend.parse_and_extract(&source_code, &file_path);
                             pass1_parse_ms += t_parse.elapsed().as_millis();
@@ -281,8 +282,8 @@ fn main() {
                 println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
                 let t_pass2 = std::time::Instant::now();
                 let metrics = indexer::resolver::resolve_relationships(&db, None).expect("Linker failed");
-                let edges_created = metrics.edges_emitted;
-                let total_relationships = metrics.relationships_received;
+                let edges_created = metrics.relationships_emitted;
+                let total_relationships = metrics.relationships_input;
                 println!("Linking complete. Created {} true graph edges from {} relationships.", edges_created, total_relationships);
                 let version = env!("CARGO_PKG_VERSION");
                 let _ = db.save_pipeline_manifest(version, "1.0", "1.0", "1.0", "1.0", "1.0", pass1_files as i64, pass1_symbols as i64, total_relationships as i64, edges_created as i64);
@@ -530,8 +531,8 @@ fn main() {
                         id: *relationship_id,
                         source_file_id: file_id,
                         node: graph::models::RelationshipNode {
-                            name,
-                            source,
+                            name: name.clone(),
+                            source: source.clone(),
                             line_number: line_number as usize,
                             kind,
                         },
@@ -539,7 +540,7 @@ fn main() {
                     };
 
                     println!("Replaying resolution for Relationship ID: {}", relationship_id);
-                    println!("Input IR: {:#?}", input_ir);
+                    println!("Relationship: {} (Source: {:?})\n", name, source);
                     
                     use indexer::pipeline::PipelineStage;
                     // Run resolver with tracing enabled
@@ -547,11 +548,23 @@ fn main() {
                     let resolved = resolver.execute(vec![input_ir]).unwrap();
                     
                     if let Some(res) = resolved.first() {
-                        println!("\nFinal State: {:?}", res.state);
-                        println!("Target Symbols: {:?}", res.target_symbol_ids);
-                        println!("Confidence: {}", res.confidence);
-                        // Trace should have been printed by Resolver to stderr.
-                        // We can also print it explicitly if we changed Resolver to attach it.
+                        for decision in &res.decisions {
+                            println!("\n──────────────────────────");
+                            println!("{}", decision.stage.as_str());
+                            match decision.status {
+                                indexer::resolver::decisions::StageStatus::Success => println!("SUCCESS"),
+                                indexer::resolver::decisions::StageStatus::Failed => println!("FAILED"),
+                                indexer::resolver::decisions::StageStatus::NotApplicable => println!("NotApplicable"),
+                            }
+                            if let Some(reason) = &decision.reason {
+                                println!("{}", reason.as_str());
+                            }
+                            if let Some(notes) = &decision.notes {
+                                println!("{}", notes);
+                            }
+                        }
+                        println!("──────────────────────────");
+                        println!("\nFinal State\n{:?}", res.state);
                     }
                 }
                 Err(_) => {
@@ -559,6 +572,97 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::AnalyzeResolution => {
+            println!("Analyzing resolution pipeline...");
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");
+            let raw_relationships = db.get_all_relationships_with_lines().unwrap();
+            let mut input_ir = Vec::new();
+            for (rel_id, source_file_id, import_name, import_source, import_kind, line_number) in raw_relationships {
+                let src_sym = db.enclosing_symbol_id(source_file_id, line_number).unwrap_or(None);
+                input_ir.push(indexer::ir::RelationshipIR {
+                    id: rel_id,
+                    source_file_id,
+                    node: graph::models::RelationshipNode {
+                        name: import_name,
+                        source: import_source,
+                        line_number: line_number as usize,
+                        kind: import_kind,
+                    },
+                    enclosing_symbol_id: src_sym,
+                });
+            }
+            
+            let symbol_index = std::sync::Arc::new(indexer::resolver::SymbolIndex::build(&db).unwrap());
+            let flow_engine = std::sync::Arc::new(indexer::flow::VariableFlowEngine::new(&db));
+            let pipeline = indexer::resolver::ResolutionPipeline::new(vec![
+                Box::new(indexer::resolver::stages::classification::ClassificationStage),
+                Box::new(indexer::resolver::stages::receiver::ReceiverResolutionStage),
+                Box::new(indexer::resolver::stages::generation::LexicalGenerationStage),
+                Box::new(indexer::resolver::stages::filtering::ScopeFilterStage),
+                Box::new(indexer::resolver::stages::filtering::ModuleFilterStage),
+                Box::new(indexer::resolver::stages::ranking::RankingStage),
+            ]);
+            
+            let mut stage_counts = std::collections::HashMap::new();
+            let mut reason_counts = std::collections::HashMap::new();
+            let mut recoverability_counts = std::collections::HashMap::new();
+            
+            let total_relationships = input_ir.len();
+            
+            for ir in input_ir {
+                let context = indexer::resolver::ResolutionContext::new(
+                    ir,
+                    std::sync::Arc::clone(&symbol_index),
+                    std::sync::Arc::clone(&flow_engine),
+                    true, // enable tracing for analytics
+                );
+                if let Ok(resolved_context) = pipeline.execute(context) {
+                    for decision in resolved_context.decisions {
+                        let stage_name = decision.stage.as_str();
+                        let counts = stage_counts.entry(stage_name).or_insert((0, 0, 0)); // executed, success, failed
+                        counts.0 += 1;
+                        match decision.status {
+                            indexer::resolver::decisions::StageStatus::Success => counts.1 += 1,
+                            indexer::resolver::decisions::StageStatus::Failed => {
+                                counts.2 += 1;
+                                if let Some(reason) = decision.reason {
+                                    *reason_counts.entry(reason.as_str()).or_insert(0) += 1;
+                                    let rec_str = match reason.recoverability() {
+                                        indexer::resolver::decisions::Recoverability::Expected => "Expected",
+                                        indexer::resolver::decisions::Recoverability::Recoverable => "Recoverable",
+                                        indexer::resolver::decisions::Recoverability::Unrecoverable => "Unrecoverable",
+                                    };
+                                    *recoverability_counts.entry(rec_str).or_insert(0) += 1;
+                                }
+                            }
+                            indexer::resolver::decisions::StageStatus::NotApplicable => {} // skip
+                        }
+                    }
+                }
+            }
+            
+            println!("\n=== Pipeline Decision Engine Analytics ===");
+            println!("Total Relationships Analyzed: {}", total_relationships);
+            println!("\n-- Stage Execution --");
+            for (stage, (exec, succ, fail)) in &stage_counts {
+                println!("{}: Executed {}, Success {}, Failed {}", stage, exec, succ, fail);
+            }
+            
+            println!("\n-- Failure Breakdown --");
+            for (reason, count) in &reason_counts {
+                println!("{}: {}", reason, count);
+            }
+            
+            println!("\n-- Recoverability Breakdown --");
+            let total_failures: usize = recoverability_counts.values().sum();
+            if total_failures > 0 {
+                for (rec, count) in &recoverability_counts {
+                    let pct = (*count as f64 / total_failures as f64) * 100.0;
+                    println!("{}: {:.1}% ({})", rec, pct, count);
+                }
+            }
+            println!("=========================================\n");
         }
         Commands::Validate => {
             let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found. Run init first.");

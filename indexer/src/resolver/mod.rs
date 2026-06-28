@@ -2,7 +2,8 @@ pub mod index;
 pub mod context;
 pub mod pipeline;
 pub mod stages;
-pub mod events;
+pub mod decisions;
+pub mod assertions;
 
 pub use pipeline::ResolutionPipeline;
 pub use index::SymbolIndex;
@@ -20,7 +21,7 @@ use crate::semantic::{
 use crate::flow::VariableFlowEngine;
 use crate::ir::{RelationshipIR, ResolvedRelationshipIR};
 use crate::pipeline::PipelineStage;
-use crate::graph_builder::{GraphBuilder, GraphBuilderMetrics};
+use crate::graph_builder::{GraphBuilder, StorageWriter, GraphBuilderMetrics};
 
 pub struct Resolver<'a> {
     pub db: &'a Database,
@@ -53,7 +54,7 @@ impl<'a> PipelineStage for Resolver<'a> {
         let mut output = Vec::with_capacity(input.len());
 
         for ir in input {
-            let mut context = ResolutionContext::new(
+            let context = ResolutionContext::new(
                 ir.clone(),
                 Arc::clone(&symbol_index),
                 Arc::clone(&flow_engine),
@@ -63,13 +64,7 @@ impl<'a> PipelineStage for Resolver<'a> {
             let resolved_context = pipeline.execute(context)?;
 
             // For diagnostics inspect, we might need to print the trace here or return it
-            if let Some(t) = resolved_context.trace {
-                // We could attach it to ResolvedRelationshipIR if we want, but for now we just print it if tracing is on
-                if self.enable_tracing {
-                    let trace_json = serde_json::to_string_pretty(&t).unwrap_or_default();
-                    eprintln!("TRACE for {}:\n{}", ir.id, trace_json);
-                }
-            }
+            // We now return decisions in ResolvedRelationshipIR for the caller to format.
             
             // Only update the evidence enum string in db
             let evidence_str = resolved_context.evidence.map(|e| e.as_str().to_string());
@@ -87,6 +82,7 @@ impl<'a> PipelineStage for Resolver<'a> {
                 state: resolved_context.final_state,
                 target_symbol_ids: target_ids,
                 confidence: 1.0,
+                decisions: resolved_context.decisions,
             });
         }
 
@@ -94,10 +90,10 @@ impl<'a> PipelineStage for Resolver<'a> {
     }
 }
 
-pub fn resolve_relationships(
+pub fn run_resolver(
     db: &Database,
     restrict_to_files: Option<&[i64]>,
-) -> Result<GraphBuilderMetrics, String> {
+) -> Result<Vec<ResolvedRelationshipIR>, String> {
     let raw_relationships = db
         .get_all_relationships_with_lines()
         .map_err(|e| e.to_string())?;
@@ -127,10 +123,17 @@ pub fn resolve_relationships(
     }
 
     let resolver = Resolver::new(db, false);
-    let resolved_ir = resolver.execute(input_ir)?;
+    resolver.execute(input_ir)
+}
 
-    let graph_builder = GraphBuilder::new(db);
-    let metrics = graph_builder.execute(resolved_ir)?;
+pub fn resolve_relationships(
+    db: &Database,
+    restrict_to_files: Option<&[i64]>,
+) -> Result<GraphBuilderMetrics, String> {
+    let resolved_ir = run_resolver(db, restrict_to_files)?;
+    
+    let build_result = GraphBuilder::build(resolved_ir);
+    let metrics = StorageWriter::flush_edges(db, build_result)?;
 
     Ok(metrics)
 }

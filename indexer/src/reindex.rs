@@ -154,7 +154,7 @@ pub fn reindex_paths(
     // touched files plus their known consumers.
     let metrics = crate::resolver::resolve_relationships(db, Some(&touched_file_ids))
         .unwrap_or_default();
-    let edges_created = metrics.edges_emitted;
+    let edges_created = metrics.edges_after_deduplication;
     stats.edges_created += edges_created;
     
     // 3. Infer logical interactions
