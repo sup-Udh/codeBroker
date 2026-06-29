@@ -1,8 +1,10 @@
-use crate::resolver::context::{ResolutionContext, ResolutionCandidate};
+use crate::resolver::context::{ResolutionContext, ResolutionCandidate, ResolverContext};
 use crate::resolver::assertions::PipelineAssertions;
 use graph::models::{ResolutionState, ResolutionEvidence};
 use crate::ir::{RelationshipIR, SymbolNode};
 use crate::resolver::index::SymbolIndex;
+use crate::resolver::type_graph::TypeGraph;
+use crate::resolver::import_resolver::ImportResolver;
 use crate::flow::VariableFlowEngine;
 use std::sync::Arc;
 use crate::resolver::decisions::{PipelineStageType, DecisionReason, StageStatus};
@@ -19,10 +21,19 @@ fn dummy_context() -> ResolutionContext {
             is_exported: false,
         },
     };
+    // Mock db isn't easy here, let's just make empty ones if we can, or we need empty constructors.
+    // Assuming we can create empty ones. SymbolIndex doesn't have `new()`, but we can add one.
+    // The previous code had `SymbolIndex::new()` so it must exist.
+    let ctx = Arc::new(ResolverContext {
+        symbol_index: Arc::new(SymbolIndex::new()),
+        type_graph: Arc::new(TypeGraph::new()),
+        import_resolver: Arc::new(ImportResolver::new()),
+        flow_engine: Arc::new(VariableFlowEngine::new()),
+    });
+    
     ResolutionContext::new(
         ir,
-        Arc::new(SymbolIndex::new()),
-        Arc::new(VariableFlowEngine::new()),
+        ctx,
         true
     )
 }

@@ -594,10 +594,18 @@ fn main() {
             }
             
             let symbol_index = std::sync::Arc::new(indexer::resolver::SymbolIndex::build(&db).unwrap());
-            let flow_engine = std::sync::Arc::new(indexer::flow::VariableFlowEngine::new(&db));
+            let type_graph = std::sync::Arc::new(indexer::resolver::TypeGraph::build(&db).unwrap());
+            let import_resolver = std::sync::Arc::new(indexer::resolver::ImportResolver::build(&db, &symbol_index).unwrap());
+            let flow_engine = std::sync::Arc::new(indexer::flow::VariableFlowEngine::new(&db, symbol_index.clone(), import_resolver.clone()));
+            let resolver_ctx = std::sync::Arc::new(indexer::resolver::ResolverContext {
+                symbol_index,
+                type_graph,
+                import_resolver,
+                flow_engine,
+            });
             let pipeline = indexer::resolver::ResolutionPipeline::new(vec![
                 Box::new(indexer::resolver::stages::classification::ClassificationStage),
-                Box::new(indexer::resolver::stages::receiver::ReceiverResolutionStage),
+                Box::new(indexer::resolver::stages::receiver::MemberResolverStage),
                 Box::new(indexer::resolver::stages::generation::LexicalGenerationStage),
                 Box::new(indexer::resolver::stages::filtering::ScopeFilterStage),
                 Box::new(indexer::resolver::stages::filtering::ModuleFilterStage),
@@ -613,8 +621,7 @@ fn main() {
             for ir in input_ir {
                 let context = indexer::resolver::ResolutionContext::new(
                     ir,
-                    std::sync::Arc::clone(&symbol_index),
-                    std::sync::Arc::clone(&flow_engine),
+                    std::sync::Arc::clone(&resolver_ctx),
                     true, // enable tracing for analytics
                 );
                 if let Ok(resolved_context) = pipeline.execute(context) {

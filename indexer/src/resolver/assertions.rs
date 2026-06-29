@@ -22,11 +22,13 @@ impl PipelineAssertions {
                     context.evidence.is_some(),
                     "{:?} state must have evidence", context.final_state
                 );
-                let has_reason = context.decisions.iter().any(|d| d.reason.is_some());
-                debug_assert!(
-                    has_reason,
-                    "{:?} state must have a DecisionReason", context.final_state
-                );
+                if context.enable_tracing {
+                    let has_reason = context.decisions.iter().any(|d| d.reason.is_some());
+                    debug_assert!(
+                        has_reason,
+                        "{:?} state must have a DecisionReason", context.final_state
+                    );
+                }
             }
             ResolutionState::Unknown => {
                 panic!("Relationship cannot finish in Unknown state");

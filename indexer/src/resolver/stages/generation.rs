@@ -16,7 +16,7 @@ impl ResolutionStage for LexicalGenerationStage {
 
     fn execute(&self, context: &mut ResolutionContext) -> Result<(), String> {
         let name = &context.ir.node.name;
-        if let Some(ids) = context.symbol_index.find_by_name(name) {
+        if let Some(ids) = context.ctx.symbol_index.find_by_name(name) {
             let mut candidates = Vec::new();
             for &id in ids {
                 candidates.push(ResolutionCandidate {

@@ -4,6 +4,17 @@ use crate::resolver::index::SymbolIndex;
 use crate::flow::VariableFlowEngine;
 use crate::ir::RelationshipIR;
 use crate::resolver::decisions::{StageDecision, PipelineStageType, StageStatus, DecisionReason};
+use crate::resolver::type_graph::TypeGraph;
+use crate::resolver::import_resolver::ImportResolver;
+use crate::resolver::type_resolver::TypeResolver;
+
+#[derive(Clone)]
+pub struct ResolverContext {
+    pub symbol_index: Arc<SymbolIndex>,
+    pub type_graph: Arc<TypeGraph>,
+    pub import_resolver: Arc<ImportResolver>,
+    pub flow_engine: Arc<VariableFlowEngine>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolutionCandidate {
@@ -15,11 +26,10 @@ pub struct ResolutionCandidate {
 pub struct ResolutionContext {
     pub ir: RelationshipIR,
     pub candidates: Vec<ResolutionCandidate>,
-    pub symbol_index: Arc<SymbolIndex>,
+    pub ctx: Arc<ResolverContext>,
     pub evidence: Option<ResolutionEvidence>,
     pub final_state: ResolutionState,
     pub resolved: bool,
-    pub flow_engine: Arc<VariableFlowEngine>,
     pub decisions: Vec<StageDecision>,
     pub enable_tracing: bool,
 }
@@ -27,21 +37,28 @@ pub struct ResolutionContext {
 impl ResolutionContext {
     pub fn new(
         ir: RelationshipIR,
-        symbol_index: Arc<SymbolIndex>,
-        flow_engine: Arc<VariableFlowEngine>,
+        ctx: Arc<ResolverContext>,
         enable_tracing: bool,
     ) -> Self {
         Self {
             ir,
             candidates: Vec::new(),
-            symbol_index,
+            ctx,
             evidence: None,
             final_state: ResolutionState::Unknown,
             resolved: false,
-            flow_engine,
             decisions: Vec::new(),
             enable_tracing,
         }
+    }
+    
+    pub fn type_resolver(&self) -> TypeResolver<'_> {
+        TypeResolver::new(
+            &self.ctx.symbol_index,
+            &self.ctx.type_graph,
+            &self.ctx.import_resolver,
+            &self.ctx.flow_engine,
+        )
     }
 
     pub fn emit_decision(&mut self, stage: PipelineStageType, status: StageStatus, reason: Option<DecisionReason>, notes: Option<String>, candidates_before: Vec<i64>) {

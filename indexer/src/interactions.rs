@@ -105,7 +105,7 @@ pub fn infer_interactions(db: &Database) -> Result<(), String> {
                     );
 
                     // Find enclosing symbol for the file
-                    let mut src_sym = None;
+                    let src_sym = None;
                     // Approximating source_symbol_id by finding the first symbol in the file (or just leaving it file-level for now)
                     // We can refine this by getting line numbers of matches.
 

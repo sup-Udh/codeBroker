@@ -16,6 +16,50 @@ impl LanguageVisitor for RustVisitor {
         emit_attributes(tree, source_code, &language, collector);
         emit_generic_constraints(tree, source_code, &language, collector);
     }
+
+    fn visit_semantic(&self, tree: &Tree, source_code: &str) -> Vec<graph::SemanticBinding> {
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let mut bindings = Vec::new();
+
+        // ── Import alias: use foo::Bar as Baz ────────────────────────
+        let q_import_alias = "
+            (use_as_clause path: (_) @source_name alias: (identifier) @alias_name)
+        ";
+        if let Ok(query) = Query::new(&language, q_import_alias) {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+            while let Some(m) = matches.next() {
+                let mut alias_name = String::new();
+                let mut source_name = String::new();
+                for capture in m.captures {
+                    let cn = &query.capture_names()[capture.index as usize];
+                    if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                        match *cn {
+                            "alias_name" => alias_name = text.trim().to_string(),
+                            "source_name" => {
+                                // Extract just the leaf name from path (e.g., `foo::Bar` -> `Bar`)
+                                let raw = text.trim();
+                                if let Some(last) = raw.split("::").last() {
+                                    source_name = last.trim().to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !alias_name.is_empty() && !source_name.is_empty() {
+                    bindings.push(graph::SemanticBinding {
+                        kind: graph::SemanticBindingKind::ImportAlias,
+                        name: alias_name,
+                        type_name: source_name,
+                        context: None,
+                    });
+                }
+            }
+        }
+
+        bindings
+    }
 }
 
 fn emit_imports(
@@ -387,9 +431,9 @@ fn is_noisy_rust_call(name: &str) -> bool {
         | "into_os_string" | "as_os_str" | "to_path_buf"
         // Ordering / comparison
         | "cmp" | "partial_cmp" | "eq" | "ne" | "lt" | "le" | "gt" | "ge"
-        | "min" | "max" | "clamp"
+        | "clamp"
         // Path / fs methods
-        | "join" | "parent" | "file_name" | "extension" | "file_stem"
+        | "parent" | "file_name" | "extension" | "file_stem"
         | "display" | "exists" | "is_file" | "is_dir" | "canonicalize"
         | "read_to_string" | "write_all" | "flush"
         | "metadata" | "read_dir"
@@ -409,7 +453,7 @@ fn is_noisy_rust_call(name: &str) -> bool {
         | "elapsed" | "as_millis" | "as_secs" | "as_secs_f64" | "as_nanos"
         | "duration_since" | "saturating_sub" | "saturating_add"
         // Path / OsStr conversion methods
-        | "to_str" | "to_string_lossy" | "to_path_buf" | "as_path"
+        | "to_str" | "to_string_lossy" | "as_path"
         // Arc / Rc / Box / Cell / Mutex
         | "lock" | "try_lock" | "upgrade" | "downgrade" | "strong_count" | "weak_count"
         // Regex

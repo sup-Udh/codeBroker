@@ -451,6 +451,37 @@ fn emit_semantic_bindings(
         }
     }
 
+    // ── Import alias: from module import Foo as Bar ────────────────────────
+    let q_import_alias = "
+        (import_from_statement (aliased_import name: (_) @source_name alias: (identifier) @alias_name))
+    ";
+    if let Ok(query) = Query::new(language, q_import_alias) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut alias_name = String::new();
+            let mut source_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "alias_name" => alias_name = text.trim().to_string(),
+                        "source_name" => source_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !alias_name.is_empty() && !source_name.is_empty() {
+                bindings.push(SemanticBinding {
+                    kind: SemanticBindingKind::ImportAlias,
+                    name: alias_name,
+                    type_name: source_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
     bindings
 }
 
@@ -500,6 +531,17 @@ mod python_visitor_tests {
         let src = "class UserService(BaseService): pass";
         let rels = parse_and_collect(src);
         assert!(rels.iter().any(|r| r.name == "BaseService" && r.kind.as_deref() == Some("inherits")));
+    }
+
+
+    #[test]
+    fn dump_python_import_alias_ast() {
+        let src = "from module import Foo as Bar";
+        let language = tree_sitter_python::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        println!("AST_DUMP_PY: {}", tree.root_node().to_sexp());
     }
 
     #[test]

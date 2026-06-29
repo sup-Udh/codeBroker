@@ -4,11 +4,17 @@ pub mod pipeline;
 pub mod stages;
 pub mod decisions;
 pub mod assertions;
+pub mod type_graph;
+pub mod import_resolver;
+pub mod type_resolver;
 
 pub use pipeline::ResolutionPipeline;
 pub use index::SymbolIndex;
-pub use context::{ResolutionContext, ResolutionCandidate};
+pub use context::{ResolutionContext, ResolutionCandidate, ResolverContext};
 pub use stages::ResolutionStage;
+pub use type_graph::TypeGraph;
+pub use import_resolver::ImportResolver;
+pub use type_resolver::TypeResolver;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,11 +46,20 @@ impl<'a> PipelineStage for Resolver<'a> {
 
     fn execute(&self, input: Self::Input) -> Result<Self::Output, String> {
         let symbol_index = Arc::new(SymbolIndex::build(self.db)?);
-        let flow_engine = Arc::new(VariableFlowEngine::new(self.db));
+        let type_graph = Arc::new(TypeGraph::build(self.db)?);
+        let import_resolver = Arc::new(ImportResolver::build(self.db, &symbol_index)?);
+        let flow_engine = Arc::new(VariableFlowEngine::new(self.db, symbol_index.clone(), import_resolver.clone()));
+
+        let resolver_ctx = Arc::new(ResolverContext {
+            symbol_index,
+            type_graph,
+            import_resolver,
+            flow_engine,
+        });
 
         let pipeline = ResolutionPipeline::new(vec![
             Box::new(stages::classification::ClassificationStage),
-            Box::new(stages::receiver::ReceiverResolutionStage),
+            Box::new(stages::receiver::MemberResolverStage),
             Box::new(stages::generation::LexicalGenerationStage),
             Box::new(stages::filtering::ScopeFilterStage),
             Box::new(stages::filtering::ModuleFilterStage),
@@ -56,8 +71,7 @@ impl<'a> PipelineStage for Resolver<'a> {
         for ir in input {
             let context = ResolutionContext::new(
                 ir.clone(),
-                Arc::clone(&symbol_index),
-                Arc::clone(&flow_engine),
+                Arc::clone(&resolver_ctx),
                 self.enable_tracing,
             );
 

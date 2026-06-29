@@ -16,6 +16,8 @@ pub enum SemanticBindingKind {
     Destructuring,
     /// Object literal: `const x = { y: z }`
     ObjectLiteral,
+    /// Imported alias: `import { Foo as Bar }`
+    ImportAlias,
 }
 
 impl SemanticBindingKind {
@@ -28,6 +30,7 @@ impl SemanticBindingKind {
             SemanticBindingKind::Assignment => "assignment",
             SemanticBindingKind::Destructuring => "destructuring",
             SemanticBindingKind::ObjectLiteral => "object_literal",
+            SemanticBindingKind::ImportAlias => "import_alias",
         }
     }
     pub fn from_str(s: &str) -> Option<Self> {
@@ -39,6 +42,7 @@ impl SemanticBindingKind {
             "assignment" => Some(SemanticBindingKind::Assignment),
             "destructuring" => Some(SemanticBindingKind::Destructuring),
             "object_literal" => Some(SemanticBindingKind::ObjectLiteral),
+            "import_alias" => Some(SemanticBindingKind::ImportAlias),
             _ => None,
         }
     }
@@ -147,6 +151,7 @@ pub enum VariableOrigin {
     Field,
     Destructuring,
     ObjectLiteral,
+    /// Originates from a cross-file import
     Import,
     Unknown,
 }
@@ -169,6 +174,8 @@ pub enum ResolutionEvidence {
     ModuleExport,
     Builtin,
     BuiltinClassification,
+    /// Type propagated through cross-file import
+    ImportFlow,
     ExternalDependency,
     NamespaceMatch,
     DynamicDispatch,
@@ -201,6 +208,7 @@ impl ResolutionEvidence {
             ResolutionEvidence::ModuleExport => "ModuleExport",
             ResolutionEvidence::Builtin => "Builtin",
             ResolutionEvidence::BuiltinClassification => "BuiltinClassification",
+            ResolutionEvidence::ImportFlow => "ImportFlow",
             ResolutionEvidence::ExternalDependency => "ExternalDependency",
             ResolutionEvidence::NamespaceMatch => "NamespaceMatch",
             ResolutionEvidence::DynamicDispatch => "DynamicDispatch",

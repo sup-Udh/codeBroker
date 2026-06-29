@@ -76,7 +76,7 @@ impl ResolutionStage for ClassificationStage {
         let kind = context.ir.node.kind.as_deref().unwrap_or("imports");
 
         if matches!(kind, "method_call" | "MEMBER_ACCESS") {
-            let file_path = context.symbol_index.file_paths.get(&context.ir.source_file_id);
+            let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
             let is_js_ts_for_recv = file_path.map(|p| {
                 p.ends_with(".ts") || p.ends_with(".tsx")
                     || p.ends_with(".js") || p.ends_with(".jsx")
@@ -135,7 +135,7 @@ impl ResolutionStage for ClassificationStage {
             return Ok(());
         }
 
-        let file_path = context.symbol_index.file_paths.get(&context.ir.source_file_id);
+        let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
         let is_rust = file_path.map(|p| p.ends_with(".rs")).unwrap_or(false);
         if is_rust && !source.is_empty() {
             context.resolve_with(
