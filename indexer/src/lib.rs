@@ -8,3 +8,4 @@ pub mod walker;
 pub mod ir;
 pub mod pipeline;
 pub mod graph_builder;
+pub mod developer;

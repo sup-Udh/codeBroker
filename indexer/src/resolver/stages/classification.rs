@@ -62,6 +62,70 @@ static NODE_BUILTINS: &[&str] = &[
 
 pub struct ClassificationStage;
 
+pub fn classify_import_source(source: &str, name: &str, is_rust: bool, is_js_ts: bool, is_python: bool) -> ResolutionState {
+    if source.starts_with("std::")
+        || source.starts_with("core::")
+        || source.starts_with("alloc::")
+        || source == "std"
+        || source == "core"
+        || source == "alloc"
+    {
+        return ResolutionState::StandardLibrary;
+    }
+
+    if source.starts_with("crate::")
+        || source.starts_with("super::")
+        || source.starts_with("self::")
+        || source == "crate"
+        || source == "super"
+        || source == "self"
+    {
+        return ResolutionState::RepositorySymbol;
+    }
+
+    if is_rust && !source.is_empty() {
+        return ResolutionState::ExternalDependency;
+    }
+
+    if is_js_ts && !source.is_empty()
+        && !source.starts_with("./")
+        && !source.starts_with("../")
+        && !source.starts_with('/')
+    {
+        let base = source.split('/').next().unwrap_or(source);
+        let base_trimmed = base.trim_start_matches('@');
+        let is_node_builtin = NODE_BUILTINS.contains(&base)
+            || source.starts_with("node:")
+            || NODE_BUILTINS.contains(&base_trimmed);
+
+        if is_node_builtin {
+            return ResolutionState::Builtin;
+        } else {
+            return ResolutionState::ExternalDependency;
+        }
+    }
+
+    if is_python {
+        if source.starts_with('.') {
+            return ResolutionState::RepositorySymbol;
+        }
+
+        let root = if !source.is_empty() {
+            source.split('.').next().unwrap_or(source)
+        } else {
+            name.split('.').next().unwrap_or(name)
+        };
+
+        if PYTHON_STDLIB.contains(&root) {
+            return ResolutionState::StandardLibrary;
+        } else {
+            return ResolutionState::ExternalDependency;
+        }
+    }
+
+    ResolutionState::RepositorySymbol
+}
+
 impl ResolutionStage for ClassificationStage {
     fn name(&self) -> &'static str {
         "ClassificationStage"
@@ -155,55 +219,25 @@ impl ResolutionStage for ClassificationStage {
         }).unwrap_or(false);
         let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
 
-        if is_js_ts && !source.is_empty()
-            && !source.starts_with("./")
-            && !source.starts_with("../")
-            && !source.starts_with('/')
-        {
-            let base = source.split('/').next().unwrap_or(source);
-            let base_trimmed = base.trim_start_matches('@');
-            let is_node_builtin = NODE_BUILTINS.contains(&base)
-                || source.starts_with("node:")
-                || NODE_BUILTINS.contains(&base_trimmed);
-
-            if is_node_builtin {
-                context.resolve_with(
-                    self.stage_type(),
-                    ResolutionState::Builtin,
-                    DecisionReason::BuiltinClassification,
-                    None
-                );
-            } else {
-                context.resolve_with(
-                    self.stage_type(),
-                    ResolutionState::ExternalDependency,
-                    DecisionReason::ExternalDependencyClassification,
-                    None
-                );
-            }
-            return Ok(());
-        }
-
-        if is_python {
-            if source.starts_with('.') {
-                context.emit_decision(self.stage_type(), crate::resolver::decisions::StageStatus::Success, Some(DecisionReason::RepositoryMatch), None, vec![]);
-                return Ok(());
-            }
-
-            let root = if !source.is_empty() {
-                source.split('.').next().unwrap_or(source)
-            } else {
-                name.split('.').next().unwrap_or(name)
-            };
-
-            if PYTHON_STDLIB.contains(&root) {
+        let state = classify_import_source(source, name, is_rust, is_js_ts, is_python);
+        match state {
+            ResolutionState::StandardLibrary => {
                 context.resolve_with(
                     self.stage_type(),
                     ResolutionState::StandardLibrary,
                     DecisionReason::StandardLibraryClassification,
                     None
                 );
-            } else {
+            }
+            ResolutionState::Builtin => {
+                context.resolve_with(
+                    self.stage_type(),
+                    ResolutionState::Builtin,
+                    DecisionReason::BuiltinClassification,
+                    None
+                );
+            }
+            ResolutionState::ExternalDependency => {
                 context.resolve_with(
                     self.stage_type(),
                     ResolutionState::ExternalDependency,
@@ -211,10 +245,13 @@ impl ResolutionStage for ClassificationStage {
                     None
                 );
             }
-            return Ok(());
+            ResolutionState::RepositorySymbol => {
+                context.emit_decision(self.stage_type(), crate::resolver::decisions::StageStatus::Success, Some(DecisionReason::RepositoryMatch), None, vec![]);
+            }
+            _ => {
+                context.emit_decision(self.stage_type(), crate::resolver::decisions::StageStatus::Success, Some(DecisionReason::RepositoryMatch), None, vec![]);
+            }
         }
-
-        context.emit_decision(self.stage_type(), crate::resolver::decisions::StageStatus::Success, Some(DecisionReason::RepositoryMatch), None, vec![]);
         Ok(())
     }
 }

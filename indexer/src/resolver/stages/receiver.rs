@@ -54,50 +54,11 @@ impl ResolutionStage for MemberResolverStage {
         let method_name = context.ir.node.name.clone();
         let chain = ReceiverChain::parse(receiver_raw);
         
-        let mut current_type: Option<String> = None;
-        let mut start_idx = 0;
+        let mut origin = crate::resolver::context::SymbolOrigin::Unknown;
+        let mut type_name_to_use = None;
+        let mut imported_source = None;
+        let mut resolved_state = None;
 
-        // Step 1: Resolve the base variable (or base field if starts with this/self)
-        if !chain.tokens.is_empty() {
-            if chain.tokens[0] == "this" || chain.tokens[0] == "self" {
-                if chain.tokens.len() > 1 {
-                    let field_name = &chain.tokens[1];
-                    current_type = context.ctx.flow_engine.get_var(context.ir.source_file_id, field_name)
-                        .and_then(|v| v.inferred_type.clone());
-                    start_idx = 2;
-                }
-            } else {
-                current_type = context.ctx.flow_engine.get_var(context.ir.source_file_id, &chain.tokens[0])
-                    .and_then(|v| v.inferred_type.clone());
-                start_idx = 1;
-            }
-        }
-
-        // Step 2: Resolve property chain (bar.baz) on the type
-        for i in start_idx..chain.tokens.len() {
-            let token = &chain.tokens[i];
-            if let Some(t) = current_type {
-                // Find property `token` on type `t`
-                let candidates = context.ctx.symbol_index.find_method_in_type(token, &t);
-                if !candidates.is_empty() {
-                    // We found the property, we need its type. But wait, if it's a property, its type might be in the type graph or semantic bindings.
-                    // For now, if we don't have a way to get property types easily from the index, we just assume the property name is its type,
-                    // OR we check the flow engine? Actually, the SymbolIndex doesn't store field types directly unless we check semantic bindings.
-                    // BUT for phase 14A, we just need to resolve it step-by-step.
-                    // Since we can't easily extract property types yet without TypeGraph, if we hit a chain we might just fail if we can't find it.
-                    // Let's look up the field in the flow engine under the base variable instead. Flow engine tracks nested variables!
-                    
-                    // Actually, the FlowEngine already tracks `foo.bar.baz`. 
-                    // So we can just ask the FlowEngine for the full receiver string!
-                }
-            }
-            
-            // Simpler approach leveraging FlowEngine's existing nested variable support:
-            // FlowEngine creates variables like `foo.bar.baz` if we query it!
-            break; 
-        }
-        
-        // Let's just ask FlowEngine for the full receiver directly, since FlowEngine handles nested fields (like foo.bar, this.db).
         let type_name: Option<String> = if receiver_raw.starts_with("this.") || receiver_raw.starts_with("self.") {
             let field_name = &receiver_raw[receiver_raw.find('.').unwrap() + 1..];
             context.ctx.flow_engine.get_var(context.ir.source_file_id, field_name)
@@ -107,10 +68,67 @@ impl ResolutionStage for MemberResolverStage {
                 .and_then(|v| v.inferred_type.clone())
         };
 
-        let Some(type_name) = type_name else {
-            context.fail_stage(self.stage_type(), DecisionReason::UnknownReceiverType, None);
-            return Ok(());
-        };
+        if let Some(t_name) = type_name {
+            type_name_to_use = Some(t_name.clone());
+            origin = crate::resolver::context::SymbolOrigin::LocalVariable;
+            
+            // Check if it's an import by looking up its type_name in import_resolver
+            if let Some(imported) = context.ctx.import_resolver.resolve(context.ir.source_file_id, &t_name) {
+                let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
+                let is_rust = file_path.map(|p| p.ends_with(".rs")).unwrap_or(false);
+                let is_js_ts = file_path.map(|p| {
+                    p.ends_with(".ts") || p.ends_with(".tsx")
+                        || p.ends_with(".js") || p.ends_with(".jsx")
+                        || p.ends_with(".mjs") || p.ends_with(".cjs")
+                        || p.ends_with(".vue") || p.ends_with(".svelte")
+                }).unwrap_or(false);
+                let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
+
+                let state = crate::resolver::stages::classification::classify_import_source(
+                    &imported.source, &imported.name, is_rust, is_js_ts, is_python
+                );
+                
+                match state {
+                    ResolutionState::RepositorySymbol => origin = crate::resolver::context::SymbolOrigin::RepositoryImport,
+                    ResolutionState::ExternalDependency => origin = crate::resolver::context::SymbolOrigin::ExternalImport,
+                    ResolutionState::StandardLibrary => origin = crate::resolver::context::SymbolOrigin::StandardLibrary,
+                    ResolutionState::Builtin => origin = crate::resolver::context::SymbolOrigin::Builtin,
+                    _ => origin = crate::resolver::context::SymbolOrigin::Unknown,
+                }
+                
+                imported_source = Some(imported.source);
+                resolved_state = Some(state);
+            }
+        } else {
+            // Check if the receiver raw itself is an import (just in case flow engine missed it)
+            if let Some(imported) = context.ctx.import_resolver.resolve(context.ir.source_file_id, receiver_raw) {
+                type_name_to_use = Some(imported.name.clone());
+                let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
+                let is_rust = file_path.map(|p| p.ends_with(".rs")).unwrap_or(false);
+                let is_js_ts = file_path.map(|p| {
+                    p.ends_with(".ts") || p.ends_with(".tsx")
+                        || p.ends_with(".js") || p.ends_with(".jsx")
+                        || p.ends_with(".mjs") || p.ends_with(".cjs")
+                        || p.ends_with(".vue") || p.ends_with(".svelte")
+                }).unwrap_or(false);
+                let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
+
+                let state = crate::resolver::stages::classification::classify_import_source(
+                    &imported.source, &imported.name, is_rust, is_js_ts, is_python
+                );
+                
+                match state {
+                    ResolutionState::RepositorySymbol => origin = crate::resolver::context::SymbolOrigin::RepositoryImport,
+                    ResolutionState::ExternalDependency => origin = crate::resolver::context::SymbolOrigin::ExternalImport,
+                    ResolutionState::StandardLibrary => origin = crate::resolver::context::SymbolOrigin::StandardLibrary,
+                    ResolutionState::Builtin => origin = crate::resolver::context::SymbolOrigin::Builtin,
+                    _ => origin = crate::resolver::context::SymbolOrigin::Unknown,
+                }
+                
+                imported_source = Some(imported.source);
+                resolved_state = Some(state);
+            }
+        }
 
         let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
         let is_js_ts = file_path.map(|p| {
@@ -120,14 +138,58 @@ impl ResolutionStage for MemberResolverStage {
                 || p.ends_with(".vue") || p.ends_with(".svelte")
         }).unwrap_or(false);
 
-        if is_js_ts && JS_BUILTIN_RECEIVERS.contains(&type_name.as_str()) {
-            context.resolve_with(
-                self.stage_type(),
-                ResolutionState::Builtin,
-                DecisionReason::BuiltinClassification,
+        if origin == crate::resolver::context::SymbolOrigin::Unknown && is_js_ts {
+            if JS_BUILTIN_RECEIVERS.contains(&receiver_raw) {
+                origin = crate::resolver::context::SymbolOrigin::Builtin;
+                resolved_state = Some(ResolutionState::Builtin);
+            }
+        }
+        
+        let Some(type_name) = type_name_to_use.or_else(|| {
+            if origin == crate::resolver::context::SymbolOrigin::Builtin {
+                Some(receiver_raw.to_string())
+            } else {
                 None
-            );
+            }
+        }) else {
+            context.fail_stage(self.stage_type(), DecisionReason::UnknownReceiverType, None);
             return Ok(());
+        };
+
+        match origin {
+            crate::resolver::context::SymbolOrigin::ExternalImport => {
+                context.resolve_with(
+                    self.stage_type(),
+                    ResolutionState::ExternalDependency,
+                    DecisionReason::ExternalDependencyClassification,
+                    Some(format!("External receiver from: {}", imported_source.unwrap_or_default()))
+                );
+                return Ok(());
+            }
+            crate::resolver::context::SymbolOrigin::StandardLibrary => {
+                context.resolve_with(
+                    self.stage_type(),
+                    ResolutionState::StandardLibrary,
+                    DecisionReason::StandardLibraryClassification,
+                    Some(format!("Stdlib receiver from: {}", imported_source.unwrap_or_default()))
+                );
+                return Ok(());
+            }
+            crate::resolver::context::SymbolOrigin::Builtin => {
+                context.resolve_with(
+                    self.stage_type(),
+                    ResolutionState::Builtin,
+                    DecisionReason::BuiltinClassification,
+                    Some(format!("Builtin receiver: {}", type_name))
+                );
+                return Ok(());
+            }
+            crate::resolver::context::SymbolOrigin::LocalVariable | crate::resolver::context::SymbolOrigin::RepositoryImport => {
+                // proceed
+            }
+            crate::resolver::context::SymbolOrigin::Unknown => {
+                // proceed
+            }
         }
 
         // Step 3: Resolve method on the final type
@@ -155,16 +217,22 @@ impl ResolutionStage for MemberResolverStage {
                 })
                 .collect();
                 
+            let reason = if origin == crate::resolver::context::SymbolOrigin::RepositoryImport {
+                DecisionReason::RepositoryMatch
+            } else {
+                DecisionReason::VariableAssignment
+            };
+
             context.add_candidates(
                 self.stage_type(),
                 resolution_candidates,
-                Some(DecisionReason::RepositoryMatch),
+                Some(reason.clone()),
                 Some(format!("Receiver type: {}", type_name))
             );
             context.resolve_with(
                 self.stage_type(),
                 ResolutionState::RepositorySymbol,
-                DecisionReason::VariableAssignment,
+                reason,
                 None
             );
         } else {

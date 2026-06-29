@@ -93,15 +93,13 @@ impl VariableFlowEngine {
                     }
                     SemanticBindingKind::ImportAlias => {
                         let var = self.get_or_create_var(file_id, &binding.name);
-                        if let Some(sym_id) = import_resolver.resolve(file_id, &binding.type_name) {
-                            if let Some(symbol) = symbol_index.get_symbol(sym_id) {
-                                var.apply_type(
-                                    symbol.name.clone(),
-                                    VariableOrigin::Import,
-                                    ResolutionConfidence::Certain,
-                                    ResolutionEvidence::ImportFlow,
-                                );
-                            }
+                        if let Some(imported) = import_resolver.resolve(file_id, &binding.type_name) {
+                            var.apply_type(
+                                imported.name.clone(),
+                                VariableOrigin::Import,
+                                ResolutionConfidence::Certain,
+                                ResolutionEvidence::ImportFlow,
+                            );
                         }
                     }
                     _ => {}
@@ -114,16 +112,14 @@ impl VariableFlowEngine {
         if let Ok(relationships) = db.get_all_relationships_with_lines() {
             for (_, file_id, name, _, kind, _) in relationships {
                 if kind.as_deref() == Some("imports") {
-                    if let Some(sym_id) = import_resolver.resolve(file_id, &name) {
-                        if let Some(symbol) = symbol_index.get_symbol(sym_id) {
-                            let var = self.get_or_create_var(file_id, &name);
-                            var.apply_type(
-                                symbol.name.clone(),
-                                VariableOrigin::Import,
-                                ResolutionConfidence::Certain,
-                                ResolutionEvidence::ImportFlow,
-                            );
-                        }
+                    if let Some(imported) = import_resolver.resolve(file_id, &name) {
+                        let var = self.get_or_create_var(file_id, &name);
+                        var.apply_type(
+                            imported.name.clone(),
+                            VariableOrigin::Import,
+                            ResolutionConfidence::Certain,
+                            ResolutionEvidence::ImportFlow,
+                        );
                     }
                 }
             }

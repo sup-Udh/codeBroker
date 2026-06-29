@@ -17,6 +17,7 @@ use crate::validators::{
     retrieval::RetrievalValidator,
     consistency::ConsistencyValidator,
     version::VersionValidator,
+    developer_intelligence::DeveloperIntelligenceValidator,
 };
 
 pub fn run_diagnostics(db: &Database) -> Result<PipelineReport> {
@@ -34,6 +35,7 @@ pub fn run_diagnostics(db: &Database) -> Result<PipelineReport> {
         Box::new(SemanticIndexValidator),
         Box::new(RetrievalValidator),
         Box::new(ConsistencyValidator),
+        Box::new(DeveloperIntelligenceValidator),
     ];
 
     let mut stages = Vec::new();

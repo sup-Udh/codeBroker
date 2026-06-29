@@ -8,6 +8,16 @@ use crate::resolver::type_graph::TypeGraph;
 use crate::resolver::import_resolver::ImportResolver;
 use crate::resolver::type_resolver::TypeResolver;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolOrigin {
+    LocalVariable,
+    RepositoryImport,
+    ExternalImport,
+    Builtin,
+    StandardLibrary,
+    Unknown,
+}
+
 #[derive(Clone)]
 pub struct ResolverContext {
     pub symbol_index: Arc<SymbolIndex>,

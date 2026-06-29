@@ -11,3 +11,4 @@ pub mod semantic_index;
 pub mod retrieval;
 pub mod consistency;
 pub mod version;
+pub mod developer_intelligence;

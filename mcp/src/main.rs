@@ -1137,7 +1137,17 @@ Treat native tools as the repository's implementation layer."#;
                                             "required": ["subsystem_name"]
                                         }
                                     },
-
+                                    {
+                                        "name": "prepare_context",
+                                        "description": "A high-level tool to gather full context (Summary, Architecture, Files, Symbols, Tests, Routes, Dependencies, Impact, and Hotspots) for a specific subsystem. This is the preferred way for LLMs to understand a subsystem.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "target": { "type": "string", "description": "The target subsystem name (e.g. 'authentication')" }
+                                            },
+                                            "required": ["target"]
+                                        }
+                                    },
                                     {
                                         "name": "list_entrypoints",
                                         "description": "Repo-wide enumeration of every entrypoint (API routes/endpoints and Next.js page/layout files) with no subsystem name required. Use this for 'what are this repo's entrypoints' questions instead of guessing subsystem names to feed into subsystem_stats.",
@@ -1661,6 +1671,24 @@ Treat native tools as the repository's implementation layer."#;
                                         }
                                     }
                                     Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
+                                }
+                            }
+                            "prepare_context" => {
+                                let target = arguments.get("target").and_then(|t| t.as_str()).unwrap_or_default();
+                                match storage::Database::new(&db_path) {
+                                    Ok(db) => {
+                                        if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                                            let symbol_index = indexer::resolver::index::SymbolIndex::build(&db).unwrap();
+                                            if let Some(capsule) = indexer::developer::capsules::CapsuleBuilder::build(target, &manifest.subsystems, &symbol_index, &manifest.hotspots) {
+                                                serde_json::to_string_pretty(&capsule).unwrap_or_default()
+                                            } else {
+                                                serde_json::json!({"error": format!("Subsystem '{}' not found.", target)}).to_string()
+                                            }
+                                        } else {
+                                            serde_json::json!({"error": "Failed to analyze repository."}).to_string()
+                                        }
+                                    }
+                                    Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
                             "project_overview" => {

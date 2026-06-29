@@ -51,6 +51,20 @@ enum Commands {
     },
     /// Analyzes the resolution pipeline and outputs aggregate statistics
     AnalyzeResolution,
+    /// Prints a high-level summary of the project
+    Summary,
+    /// Prints a logical overview of the project's subsystems
+    Overview,
+    /// Prints project structural hotspots
+    Hotspots,
+    /// Prints architectural layers inferred from dependencies
+    Architecture,
+    /// Prints categorized entrypoints
+    Entrypoints,
+    /// Prepares context for a subsystem
+    PrepareContext {
+        target: String,
+    },
 }
 
 fn main() {
@@ -1377,6 +1391,65 @@ Treat native tools as the repository's implementation layer."#;
                 .status();
 
             println!("Done! Restart Claude Desktop or Antigravity to begin.");
+        }
+        Commands::Summary => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                println!("Project Summary");
+                println!("===============");
+                println!("Type: {}", manifest.fingerprint.project_type);
+                println!("Languages: {}", manifest.fingerprint.primary_languages.join(", "));
+                println!("Frameworks: {}", manifest.fingerprint.main_frameworks.join(", "));
+                println!("Complexity: {}", manifest.fingerprint.complexity);
+                println!("Architecture: {}", manifest.fingerprint.architecture_style);
+            } else {
+                println!("Failed to generate project summary.");
+            }
+        }
+        Commands::Overview => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                println!("Project Overview");
+                println!("================");
+                for layer in manifest.architecture_layers {
+                    println!("[{}]", layer.name);
+                    for sub in layer.subsystems {
+                        println!("  - {}", sub);
+                    }
+                    println!("");
+                }
+            }
+        }
+        Commands::Hotspots => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                println!("{:#?}", manifest.hotspots);
+            }
+        }
+        Commands::Architecture => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                println!("{:#?}", manifest.architecture_layers);
+            }
+        }
+        Commands::Entrypoints => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                for ep in manifest.entrypoints {
+                    println!("[{}] {} (Symbol ID: {})", ep.category, ep.name, ep.symbol_id);
+                }
+            }
+        }
+        Commands::PrepareContext { target } => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");
+            if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
+                let symbol_index = indexer::resolver::index::SymbolIndex::build(&db).unwrap();
+                if let Some(capsule) = indexer::developer::capsules::CapsuleBuilder::build(target, &manifest.subsystems, &symbol_index, &manifest.hotspots) {
+                    println!("{:#?}", capsule);
+                } else {
+                    println!("Subsystem '{}' not found.", target);
+                }
+            }
         }
     }
 }

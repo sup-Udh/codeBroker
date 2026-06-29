@@ -17,6 +17,7 @@ pub enum PipelineStage {
     SemanticIndex,
     Retrieval,
     Consistency,
+    DeveloperIntelligence,
 }
 
 impl std::fmt::Display for PipelineStage {
@@ -34,6 +35,7 @@ impl std::fmt::Display for PipelineStage {
             PipelineStage::SemanticIndex => write!(f, "Semantic Index"),
             PipelineStage::Retrieval => write!(f, "Retrieval"),
             PipelineStage::Consistency => write!(f, "Consistency"),
+            PipelineStage::DeveloperIntelligence => write!(f, "Developer Intelligence"),
         }
     }
 }
