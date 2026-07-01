@@ -20,6 +20,7 @@ rusqlite = "0.40.1"
 regex = "1.12.4"
 graph = { version = "0.1.0", path = "../graph" }
 graph_diagnostics = { path = "../graph_diagnostics" }
+rayon = "1.10"
 
 [[bin]]
 name = "codebroker"

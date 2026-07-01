@@ -66,41 +66,72 @@ impl<'a> PipelineStage for Resolver<'a> {
             Box::new(stages::ranking::RankingStage),
         ]);
 
-        let mut output = Vec::with_capacity(input.len());
+        // Resolve every relationship in parallel — each ResolutionContext is
+        // independent given the shared, read-only Arc<ResolverContext> and
+        // the pipeline's stages are all `Send + Sync`. No database access
+        // happens in this phase; the per-relationship state/evidence writes
+        // are batched into one transaction below instead.
+        let enable_tracing = self.enable_tracing;
+        let mut resolved: Vec<(i64, ResolvedRelationshipIR, String, Option<String>)> = {
+            use rayon::prelude::*;
+            input
+                .into_par_iter()
+                .map(|ir| -> Result<(i64, ResolvedRelationshipIR, String, Option<String>), String> {
+                    let rel_id = ir.id;
+                    let context =
+                        ResolutionContext::new(ir.clone(), Arc::clone(&resolver_ctx), enable_tracing);
 
-        for ir in input {
-            let context = ResolutionContext::new(
-                ir.clone(),
-                Arc::clone(&resolver_ctx),
-                self.enable_tracing,
-            );
+                    let resolved_context = pipeline.execute(context)?;
 
-            let resolved_context = pipeline.execute(context)?;
+                    // For diagnostics inspect, we might need to print the trace here or return it
+                    // We now return decisions in ResolvedRelationshipIR for the caller to format.
+                    let evidence_str = resolved_context.evidence.map(|e| e.as_str().to_string());
+                    let state_str = resolved_context.final_state.as_str().to_string();
+                    let target_ids =
+                        resolved_context.candidates.into_iter().map(|c| c.symbol_id).collect();
 
-            // For diagnostics inspect, we might need to print the trace here or return it
-            // We now return decisions in ResolvedRelationshipIR for the caller to format.
-            
-            // Only update the evidence enum string in db
-            let evidence_str = resolved_context.evidence.map(|e| e.as_str().to_string());
-            let _ = self.db.update_relationship_state(
-                ir.id, 
-                resolved_context.final_state.as_str(), 
-                1.0, 
-                evidence_str.as_deref()
-            );
+                    Ok((
+                        rel_id,
+                        ResolvedRelationshipIR {
+                            original: ir,
+                            state: resolved_context.final_state,
+                            target_symbol_ids: target_ids,
+                            confidence: 1.0,
+                            decisions: resolved_context.decisions,
+                        },
+                        state_str,
+                        evidence_str,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
 
-            let target_ids = resolved_context.candidates.into_iter().map(|c| c.symbol_id).collect();
+        // Deterministic ordering before persistence, regardless of which
+        // worker finished first.
+        resolved.sort_by_key(|(rel_id, ..)| *rel_id);
 
-            output.push(ResolvedRelationshipIR {
-                original: ir,
-                state: resolved_context.final_state,
-                target_symbol_ids: target_ids,
-                confidence: 1.0,
-                decisions: resolved_context.decisions,
-            });
+        self.db
+            .conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = self
+                .db
+                .conn
+                .prepare_cached(
+                    "UPDATE relationships SET state = ?1, confidence = ?2, evidence = ?3 WHERE id = ?4",
+                )
+                .map_err(|e| e.to_string())?;
+            for (rel_id, _, state_str, evidence_str) in &resolved {
+                let _ = stmt.execute(rusqlite::params![state_str, 1.0, evidence_str, rel_id]);
+            }
         }
+        self.db
+            .conn
+            .execute_batch("COMMIT")
+            .map_err(|e| e.to_string())?;
 
-        Ok(output)
+        Ok(resolved.into_iter().map(|(_, r, _, _)| r).collect())
     }
 }
 

@@ -65,6 +65,13 @@ enum Commands {
     PrepareContext {
         target: String,
     },
+    /// Internal: backfills missing symbol embeddings against the already-
+    /// published database. Spawned as a detached background process by
+    /// `init` so semantic-search embedding calls (network-bound, can take
+    /// tens of seconds) never block indexing completion. Not meant to be
+    /// invoked directly.
+    #[command(hide = true, name = "_embed-backfill")]
+    EmbedBackfill,
 }
 
 fn main() {
@@ -83,6 +90,12 @@ fn main() {
             // in place via delete+repopulate creates exactly that window.
             const FINAL_DB_PATH: &str = ".codebroker/codebroker.db";
             const TMP_DB_PATH: &str = ".codebroker/codebroker.db.tmp";
+            // Bump whenever a change to parsing/extraction/schema means a
+            // file's stored content_hash can no longer be trusted to predict
+            // its old parse output — every file is then treated as changed
+            // on the next `init` regardless of whether its hash still
+            // matches, even though this is otherwise an incremental run.
+            const PIPELINE_VERSION: &str = "1";
 
             // Load embeddings from the OLD database before wiping it.
             // On every full `init`, the temp DB starts empty, so without
@@ -100,6 +113,21 @@ fn main() {
             let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
             let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
 
+            // True incremental init: if a previous index exists, copy it into
+            // the temp path instead of starting empty, then only reparse the
+            // files that actually changed below — unchanged files' rows are
+            // simply never touched, already sitting correctly in the copy.
+            // Checkpoint the live DB first so the plain file copy is a
+            // complete, self-contained snapshot (its WAL may hold commits —
+            // e.g. from an MCP-triggered `reindex_paths` — never checkpointed).
+            let has_previous_index = std::path::Path::new(FINAL_DB_PATH).exists();
+            if has_previous_index {
+                if let Ok(old_db) = storage::Database::new(FINAL_DB_PATH) {
+                    let _ = old_db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                }
+                let _ = fs::copy(FINAL_DB_PATH, TMP_DB_PATH);
+            }
+
             // 1. Boot up the database
             // Scoped so `db` (and every Statement borrowed from it) is fully dropped,
             // releasing the file, before we checkpoint/rename below.
@@ -108,6 +136,46 @@ fn main() {
                 let db = storage::Database::new(TMP_DB_PATH).expect("Failed to create DB");
                 db.init_schema().expect("Failed to initialize schema");
                 eprintln!("[TIMING] DB open + schema init: {}ms", t_db_open.elapsed().as_millis());
+
+                // Trust content hashes to predict old parse output only if
+                // the copied index was built by this same pipeline version.
+                let stored_version: Option<String> = db
+                    .conn
+                    .query_row(
+                        "SELECT value FROM metadata WHERE key = 'pipeline_version'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let trust_hashes =
+                    has_previous_index && stored_version.as_deref() == Some(PIPELINE_VERSION);
+                let full_rebuild = !trust_hashes;
+                if has_previous_index && !trust_hashes {
+                    println!("Pipeline version changed since last index — reparsing every file.");
+                }
+
+                let t_old_hashes = std::time::Instant::now();
+                let mut old_hashes: std::collections::HashMap<String, (i64, String)> =
+                    std::collections::HashMap::new();
+                {
+                    let mut stmt = db
+                        .conn
+                        .prepare("SELECT id, path, content_hash FROM files WHERE content_hash IS NOT NULL")
+                        .expect("Failed to query existing files");
+                    let mut rows = stmt.query([]).expect("Failed to read existing files");
+                    while let Some(row) = rows.next().expect("Failed to step existing files") {
+                        let id: i64 = row.get(0).unwrap();
+                        let path: String = row.get(1).unwrap();
+                        let hash: String = row.get(2).unwrap();
+                        old_hashes.insert(path, (id, hash));
+                    }
+                }
+                eprintln!(
+                    "[TIMING] Load previous file hashes: {}ms ({} files known)",
+                    t_old_hashes.elapsed().as_millis(),
+                    old_hashes.len()
+                );
+
                 use parser::config_frontend::ConfigFrontend;
                 use parser::frontend::{LanguageFrontend, RustFrontend};
                 use parser::javascript_frontend::JavaScriptFrontend;
@@ -185,118 +253,143 @@ fn main() {
                 eprintln!("[TIMING] File walk: {}ms ({} files found)", t_walk.elapsed().as_millis(), files.len());
                 println!("Found {} files to index.", files.len());
 
-                // 3. The Main Indexing Loop
+                // 3. The Main Indexing Loop — classify each file against the
+                // previous index and parse only the changed ones, fused into
+                // one rayon pass (each worker thread pools its own
+                // tree-sitter Parser/Query per language, see parser::pool)
+                // so every file is read from disk exactly once. Sorting the
+                // changed set before insertion is what keeps file ids and
+                // everything downstream from them deterministic regardless
+                // of which worker finished first.
                 let t_pass1 = std::time::Instant::now();
+                let t_parse = std::time::Instant::now();
+                let statuses: Vec<indexer::parsed_file::FileStatus> = {
+                    use rayon::prelude::*;
+                    files
+                        .par_iter()
+                        .filter_map(|file_path| {
+                            indexer::parsed_file::classify_and_parse(
+                                file_path,
+                                &old_hashes,
+                                trust_hashes,
+                                &frontends,
+                            )
+                        })
+                        .collect()
+                };
+                let mut parsed_files: Vec<indexer::parsed_file::ParsedFile> = Vec::new();
+                let mut unchanged_count = 0usize;
+                for status in statuses {
+                    match status {
+                        indexer::parsed_file::FileStatus::Unchanged => unchanged_count += 1,
+                        indexer::parsed_file::FileStatus::Changed(pf) => parsed_files.push(pf),
+                    }
+                }
+                parsed_files.sort_by(|a, b| a.path.cmp(&b.path));
+                let pass1_parse_ms = t_parse.elapsed().as_millis();
+
+                // Files that existed in the previous index but weren't seen
+                // in this walk at all — deleted from disk since last `init`.
+                let current_paths: std::collections::HashSet<&str> =
+                    files.iter().map(|s| s.as_str()).collect();
+                let deleted_file_ids: Vec<i64> = old_hashes
+                    .iter()
+                    .filter(|(path, _)| !current_paths.contains(path.as_str()))
+                    .map(|(_, (id, _))| *id)
+                    .collect();
+
+                let t_db_ins = std::time::Instant::now();
                 let mut pass1_files = 0usize;
                 let mut pass1_symbols = 0usize;
                 let mut pass1_imports = 0usize;
-                let mut pass1_parse_ms = 0u128;
-                let mut pass1_db_insert_ms = 0u128;
-                for file_path in files {
-                    if let Ok(source_code) = fs::read_to_string(&file_path) {
-                        // A. Extract the file extension
-                        let _extension = std::path::Path::new(&file_path)
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .unwrap_or("");
+                let mut touched_file_ids: Vec<i64> = Vec::new();
+                // One transaction for every delete/file/symbol/relationship/
+                // binding write in this pass instead of an implicit
+                // autocommit per statement — the dominant cost at larger
+                // file counts.
+                db.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                for &old_id in &deleted_file_ids {
+                    let _ = db.delete_file_data(old_id);
+                }
+                for pf in &parsed_files {
+                    // A changed file that already had a row copied forward
+                    // from the previous index must have that stale row (and
+                    // its now-dangling edges) removed first — its symbols
+                    // are about to get new auto-increment ids.
+                    if let Some((old_id, _)) = old_hashes.get(&pf.path) {
+                        let _ = db.delete_file_data(*old_id);
+                    }
+                    let metadata_str = pf.metadata.metadata.as_deref().unwrap_or("{}");
+                    let file_id = db.insert_file(&pf.path, &pf.content_hash).unwrap();
+                    touched_file_ids.push(file_id);
+                    let _ = db.update_file_metadata(file_id, Some(metadata_str));
+                    pass1_files += 1;
 
-                        // B. Find the correct language parser from our registry
-                        let mut matched_frontend = None;
-                        for frontend in &frontends {
-                            if frontend.can_handle(&file_path) {
-                                matched_frontend = Some(frontend);
-                                break;
-                            }
-                        }
-
-                        // C. If we have a parser for this language, process it!
-                        if let Some(frontend) = matched_frontend {
-                            let content_hash = storage::hash_content(source_code.as_bytes());
-                            let t_parse = std::time::Instant::now();
-                            let parsed = frontend.parse_and_extract(&source_code, &file_path);
-                            pass1_parse_ms += t_parse.elapsed().as_millis();
-
-                            let t_db_ins = std::time::Instant::now();
-                            let file_id = db.insert_file(&file_path, &content_hash).unwrap();
-                            pass1_files += 1;
-
-                            // D. The Universal Extraction (Zero language-specific code here!)
-                            if let Some((metadata, symbols, imports, semantic_bindings)) = parsed {
-                                let metadata_str = metadata.metadata.as_deref().unwrap_or("{}");
-                                let _ = db.update_file_metadata(file_id, Some(metadata_str));
-
-                                // Deduplicate symbols by (name, kind, start_byte) before
-                                // insertion to prevent duplicate DB rows from overlapping
-                                // tree-sitter query captures.
-                                let mut seen_syms = std::collections::HashSet::new();
-                                for symbol in symbols {
-                                    let key = (symbol.name.clone(), symbol.kind.clone(), symbol.start_byte);
-                                    if seen_syms.insert(key) {
-                                        db.insert_symbol(file_id, &symbol).unwrap();
-                                        pass1_symbols += 1;
-                                    }
-                                }
-
-                                for import in imports {
-                                    db.insert_relationship(file_id, &import).unwrap();
-                                    pass1_imports += 1;
-                                }
-
-                                for binding in semantic_bindings {
-                                    let _ = db.insert_semantic_binding(file_id, &binding);
-                                }
-
-                                // Angular split file logic
-                                if file_path.ends_with(".component.ts") {
-                                    let html_path = file_path.replace(".ts", ".html");
-                                    if std::path::Path::new(&html_path).exists() {
-                                        if let Ok(html_content) =
-                                            std::fs::read_to_string(&html_path)
-                                        {
-                                            // A simple regex to find (event)="handler(" or (event)="handler"
-                                            let re = regex::Regex::new(
-                                                r#"\([a-zA-Z0-9_\-]+\)="([a-zA-Z0-9_]+)(?:\(|")"#,
-                                            )
-                                            .unwrap();
-                                            for (line_idx, line_str) in
-                                                html_content.lines().enumerate()
-                                            {
-                                                for cap in re.captures_iter(line_str) {
-                                                    if let Some(handler) = cap.get(1) {
-                                                        let import_node = graph::RelationshipNode {
-                                                            name: handler.as_str().to_string(),
-                                                            source: None,
-                                                            line_number: line_idx + 1,
-                                                            kind: Some("calls".to_string()),
-                                                        };
-                                                        db.insert_relationship(file_id, &import_node)
-                                                            .unwrap();
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            pass1_db_insert_ms += t_db_ins.elapsed().as_millis();
+                    // Deduplicate symbols by (name, kind, start_byte) before
+                    // insertion to prevent duplicate DB rows from overlapping
+                    // tree-sitter query captures.
+                    let mut seen_syms = std::collections::HashSet::new();
+                    for symbol in &pf.symbols {
+                        let key = (symbol.name.clone(), symbol.kind.clone(), symbol.start_byte);
+                        if seen_syms.insert(key) {
+                            db.insert_symbol(file_id, symbol).unwrap();
+                            pass1_symbols += 1;
                         }
                     }
+
+                    for import in &pf.relationships {
+                        db.insert_relationship(file_id, import).unwrap();
+                        pass1_imports += 1;
+                    }
+
+                    for binding in &pf.semantic_bindings {
+                        let _ = db.insert_semantic_binding(file_id, binding);
+                    }
                 }
+                db.conn.execute_batch("COMMIT").unwrap();
+                let pass1_db_insert_ms = t_db_ins.elapsed().as_millis();
                 eprintln!(
-                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | files={} symbols={} relationships={}",
+                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | changed={} unchanged={} deleted={} symbols={} relationships={}",
                     t_pass1.elapsed().as_millis(),
                     pass1_parse_ms,
                     pass1_db_insert_ms,
                     pass1_files,
+                    unchanged_count,
+                    deleted_file_ids.len(),
                     pass1_symbols,
                     pass1_imports
                 );
 
-                // --- PASS 2: THE LINKER ---
+                // Nothing to relink/recompute/re-embed if this was a true
+                // incremental run and literally no file changed or was
+                // deleted — this is the fast path that gets a no-op `init`
+                // down toward the sub-200ms target instead of re-running a
+                // full-repo linker/feature/embedding pass for no reason.
+                let nothing_changed =
+                    !full_rebuild && touched_file_ids.is_empty() && deleted_file_ids.is_empty();
+
+                let mut edges_created: usize = 0;
+
+              if nothing_changed {
+                println!("No changes since last index — skipping linking, feature extraction, validation, and embeddings.");
+              } else {
+                // --- PASS 2: THE LINKER --- A full rebuild (first-ever
+                // `init`, or a pipeline-version mismatch that forced every
+                // file to be treated as changed) relinks everything, exactly
+                // like before. A true incremental run scopes the linker to
+                // only the files that actually changed or were deleted —
+                // the same scoped, full-fidelity resolution `reindex_paths`
+                // already uses (it's the identical `resolve_relationships`
+                // call, just restricted to file ids instead of `None`).
                 println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
                 let t_pass2 = std::time::Instant::now();
-                let metrics = indexer::resolver::resolve_relationships(&db, None).expect("Linker failed");
-                let edges_created = metrics.relationships_emitted;
+                let metrics = if full_rebuild {
+                    indexer::resolver::resolve_relationships(&db, None).expect("Linker failed")
+                } else {
+                    indexer::resolver::resolve_relationships(&db, Some(&touched_file_ids))
+                        .unwrap_or_default()
+                };
+                edges_created = metrics.relationships_emitted;
                 let total_relationships = metrics.relationships_input;
                 println!("Linking complete. Created {} true graph edges from {} relationships.", edges_created, total_relationships);
                 let version = env!("CARGO_PKG_VERSION");
@@ -373,18 +466,16 @@ fn main() {
                 }
                 eprintln!("[TIMING] tag_concepts: {}ms", t_concepts.elapsed().as_millis());
 
-                // 4.5 Embed symbols for semantic search, if a key is configured.
-                // Silently skipped (not an error) without OPENAI_API_KEY, matching
-                // every other AI-backed feature's degrade-gracefully behavior —
-                // deterministic indexing must never require a network call to
-                // complete.
+                // 4.5 Replay embeddings for symbols the pre-wipe cache still
+                // covers, if a key is configured. Silently skipped (not an
+                // error) without OPENAI_API_KEY, matching every other
+                // AI-backed feature's degrade-gracefully behavior. This is
+                // DB-only (no network calls), so it stays synchronous here —
+                // it's the actual `backfill_missing_embeddings` API calls
+                // (network-bound, can take tens of seconds) that get deferred
+                // to a detached background process after publish, below.
                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                let t_embed = std::time::Instant::now();
                 if !openai_key.is_empty() {
-                    println!("Generating embeddings for semantic search...");
-                    let provider = semantic::openai::OpenAiProvider::new(openai_key);
-
-                    // Replay unchanged embeddings from the old DB — no API call for these.
                     let t_apply = std::time::Instant::now();
                     let cache_hits = semantic::embeddings::apply_embedding_cache(&db, &embedding_cache);
                     eprintln!(
@@ -392,32 +483,8 @@ fn main() {
                         t_apply.elapsed().as_millis(),
                         cache_hits
                     );
-
-                    match semantic::embeddings::backfill_missing_embeddings(&db, &provider, None) {
-                        Ok(stats) => {
-                            if stats.failed_batches > 0 {
-                                println!(
-                                    "Embedded {} symbols ({} from cache, {} via API in {} batch(es)). {} batch(es) failed after retries — those symbols will be embedded on the next run.",
-                                    stats.embedded + cache_hits,
-                                    cache_hits,
-                                    stats.embedded,
-                                    stats.batches,
-                                    stats.failed_batches
-                                );
-                            } else {
-                                println!(
-                                    "Embedded {} symbols ({} from cache, {} via API in {} batch(es)).",
-                                    stats.embedded + cache_hits,
-                                    cache_hits,
-                                    stats.embedded,
-                                    stats.batches
-                                );
-                            }
-                        }
-                        Err(e) => println!("Warning: embedding generation failed: {}", e),
-                    }
                 }
-                eprintln!("[TIMING] backfill_embeddings (total incl. cache): {}ms", t_embed.elapsed().as_millis());
+              }
 
                 // 5. Update Metadata timestamp
                 if let Ok(timestamp) =
@@ -428,13 +495,32 @@ fn main() {
                     rusqlite::params![timestamp.as_secs().to_string()]
                 );
                 }
+                // Stamp the pipeline version that produced this index so the
+                // next `init` knows whether it can trust stored content
+                // hashes to predict old parse output.
+                let _ = db.conn.execute(
+                    "INSERT OR REPLACE INTO metadata (key, value) VALUES ('pipeline_version', ?1)",
+                    rusqlite::params![PIPELINE_VERSION],
+                );
 
                 // Flush WAL into the main file before closing, so the temp file is a
                 // single self-contained snapshot before we publish it.
                 let t_wal = std::time::Instant::now();
                 let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                 eprintln!("[TIMING] WAL checkpoint: {}ms", t_wal.elapsed().as_millis());
+                let pipeline_secs = (t_pipeline.elapsed().as_millis() as f64 / 1000.0).max(0.001);
                 eprintln!("[TIMING] === PIPELINE TOTAL (inside DB scope): {}ms ===", t_pipeline.elapsed().as_millis());
+                eprintln!(
+                    "[TIMING] === THROUGHPUT: {:.1} files/sec | {:.1} symbols/sec | {:.1} relationships/sec | {:.1} edges/sec (changed={}, symbols={}, relationships={}, edges={}) ===",
+                    pass1_files as f64 / pipeline_secs,
+                    pass1_symbols as f64 / pipeline_secs,
+                    pass1_imports as f64 / pipeline_secs,
+                    edges_created as f64 / pipeline_secs,
+                    pass1_files,
+                    pass1_symbols,
+                    pass1_imports,
+                    edges_created,
+                );
             }
 
             let _ = fs::remove_file(format!("{}-wal", FINAL_DB_PATH));
@@ -442,6 +528,21 @@ fn main() {
             fs::rename(TMP_DB_PATH, FINAL_DB_PATH).expect("Failed to publish rebuilt index");
             let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
             let _ = fs::remove_file(format!("{}-shm", TMP_DB_PATH));
+
+            // Backfill any embeddings the pre-wipe cache couldn't cover
+            // (genuinely new/changed symbols) in a detached background
+            // process against the now-published database, instead of
+            // blocking this process on OpenAI API calls before returning.
+            if !std::env::var("OPENAI_API_KEY").unwrap_or_default().is_empty() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe)
+                        .arg("_embed-backfill")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
 
             eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
             println!("Indexing complete! Run a query to test it.");
@@ -1450,6 +1551,23 @@ Treat native tools as the repository's implementation layer."#;
                     println!("Subsystem '{}' not found.", target);
                 }
             }
+        }
+        Commands::EmbedBackfill => {
+            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            if openai_key.is_empty() {
+                return;
+            }
+            let db = match storage::Database::new(".codebroker/codebroker.db") {
+                Ok(db) => db,
+                Err(_) => return,
+            };
+            let provider = semantic::openai::OpenAiProvider::new(openai_key);
+            let _ = semantic::embeddings::backfill_missing_embeddings(&db, &provider, None);
+            // Checkpoint before exiting — this process writes to the
+            // already-published DB well after `init` did its own
+            // end-of-run checkpoint, so without this its WAL/SHM sidecar
+            // files would linger indefinitely.
+            let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
     }
 }

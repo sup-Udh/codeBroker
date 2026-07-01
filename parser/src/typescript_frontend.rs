@@ -20,10 +20,9 @@ impl LanguageFrontend for TypeScriptFrontend {
         Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language).ok()?;
-
-        let tree = parser.parse(source_code, None)?;
+        let tree = crate::pool::with_parser("typescript", &language, |parser| {
+            parser.parse(source_code, None)
+        })?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
@@ -52,10 +51,9 @@ impl LanguageFrontend for TsxFrontend {
         Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_typescript::LANGUAGE_TSX.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language).ok()?;
-
-        let tree = parser.parse(source_code, None)?;
+        let tree = crate::pool::with_parser("tsx", &language, |parser| {
+            parser.parse(source_code, None)
+        })?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
         let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
@@ -72,7 +70,6 @@ fn extract_ts_symbols(
     language: tree_sitter::Language,
     path: &str,
 ) -> Vec<SymbolNode> {
-    let mut symbols = Vec::new();
     let filename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -125,9 +122,15 @@ fn extract_ts_symbols(
         );
     }
 
-    let query = Query::new(&language, &query_str).expect("Invalid Tree-sitter query");
+    let query_key = if is_tsx {
+        "tsx_symbols"
+    } else {
+        "typescript_symbols"
+    };
+    crate::pool::with_query(query_key, &language, &query_str, |query| {
+    let mut symbols = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
         let mut symbol_name = String::new();
@@ -260,6 +263,7 @@ fn extract_ts_symbols(
         }
     }
     symbols
+    })
 }
 
 pub(crate) fn extract_ts_relationships(

@@ -1,6 +1,9 @@
 use graph::{RelationshipNode, SemanticBinding, SymbolNode};
 
-pub trait LanguageFrontend {
+// `Send + Sync` supertrait bounds let `Box<dyn LanguageFrontend>` be shared
+// across rayon worker threads (each frontend impl below is a stateless unit
+// struct, so both bounds are free).
+pub trait LanguageFrontend: Send + Sync {
     fn can_handle(&self, path: &str) -> bool;
 
     /// Parse source_code and extract symbols, relationships, and semantic bindings.

@@ -9,8 +9,6 @@ use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 /// intentionally skipped because they are not independently reachable as
 /// graph nodes.
 pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
-    let mut symbols = Vec::new();
-
     let query_str = "
         (function_item name: (identifier) @function)
         (struct_item name: (type_identifier) @struct)
@@ -23,33 +21,35 @@ pub fn extract_symbols(tree: &Tree, source_code: &str) -> Vec<SymbolNode> {
         (mod_item name: (identifier) @module)
     ";
 
-    let language = tree_sitter_rust::LANGUAGE.into();
-    let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
-    let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    crate::pool::with_query("rust_symbols", &language, query_str, |query| {
+        let mut symbols = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, tree.root_node(), source_code.as_bytes());
 
-    while let Some(m) = matches.next() {
-        for capture in m.captures {
-            let node = capture.node;
-            let capture_kind = &query.capture_names()[capture.index as usize];
-            if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
-                let parent = node.parent().unwrap_or(node);
-                symbols.push(SymbolNode {
-                    name: name.to_string(),
-                    kind: capture_kind.to_string(),
-                    start_line: node.start_position().row + 1,
-                    end_line: parent.end_position().row + 1,
-                    start_byte: parent.start_byte(),
-                    end_byte: parent.end_byte(),
-                    signature: None,
-                    attributes: Vec::new(),
-                    metadata: None,
-                });
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let node = capture.node;
+                let capture_kind = &query.capture_names()[capture.index as usize];
+                if let Ok(name) = node.utf8_text(source_code.as_bytes()) {
+                    let parent = node.parent().unwrap_or(node);
+                    symbols.push(SymbolNode {
+                        name: name.to_string(),
+                        kind: capture_kind.to_string(),
+                        start_line: node.start_position().row + 1,
+                        end_line: parent.end_position().row + 1,
+                        start_byte: parent.start_byte(),
+                        end_byte: parent.end_byte(),
+                        signature: None,
+                        attributes: Vec::new(),
+                        metadata: None,
+                    });
+                }
             }
         }
-    }
 
-    symbols
+        symbols
+    })
 }
 
 /// Extracts Rust edges (imports via `use`, function calls, trait

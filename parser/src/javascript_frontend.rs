@@ -1,6 +1,6 @@
 use crate::frontend::LanguageFrontend;
 use graph::{RelationshipNode, SemanticBinding, SymbolNode};
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct JavaScriptFrontend;
 
@@ -20,10 +20,9 @@ impl LanguageFrontend for JavaScriptFrontend {
         Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_javascript::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language).ok()?;
-
-        let tree = parser.parse(source_code, None)?;
+        let tree = crate::pool::with_parser("javascript", &language, |parser| {
+            parser.parse(source_code, None)
+        })?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
         let symbols = extract_js_symbols(&tree, source_code, language, path);
@@ -44,10 +43,9 @@ impl LanguageFrontend for JavaScriptFrontend {
 fn extract_js_symbols(
     tree: &Tree,
     source_code: &str,
-    _language: tree_sitter::Language,
+    language: tree_sitter::Language,
     path: &str,
 ) -> Vec<SymbolNode> {
-    let mut symbols = Vec::new();
     let filename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -58,24 +56,24 @@ fn extract_js_symbols(
         (function_declaration name: (identifier) @function)
         (return_statement (jsx_element) @jsx_render)
         (return_statement (parenthesized_expression (jsx_element) @jsx_render))
-        (lexical_declaration 
-            (variable_declarator 
-                name: (identifier) @function 
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @function
                 value: (arrow_function)
             )
         )
-        (lexical_declaration 
-            (variable_declarator 
-                name: (identifier) @function 
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @function
                 value: (call_expression)
             )
         )
     ";
 
-    let language = tree_sitter_javascript::LANGUAGE.into();
-    let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
+    crate::pool::with_query("javascript_symbols", &language, query_str, |query| {
+    let mut symbols = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
         for capture in m.captures {
@@ -171,6 +169,7 @@ fn extract_js_symbols(
         }
     }
     symbols
+    })
 }
 
 #[allow(dead_code)]

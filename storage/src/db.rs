@@ -121,6 +121,13 @@ impl Database {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Negative cache_size is "KiB", not pages — 64MB page cache instead of
+        // SQLite's default ~2MB, so a full-repo index's random-ish symbol/edge
+        // lookups don't keep falling back to disk. mmap_size lets SQLite read
+        // pages straight from the page cache via mmap instead of read(2) for
+        // files up to 256MB, which covers every repo this indexer targets.
+        conn.pragma_update(None, "cache_size", -64000)?;
+        conn.pragma_update(None, "mmap_size", 256 * 1024 * 1024i64)?;
 
         // Canonicalize the db_path to absolute, then get parent (.codebroker), then get its parent (project root)
         let abs_db_path = std::path::Path::new(db_path)
@@ -277,18 +284,16 @@ impl Database {
     /// about to extract `start_byte`/`end_byte` offsets from, so later reads
     /// can detect drift between the index and the file on disk.
     pub fn insert_file(&self, path: &str, content_hash: &str) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO files (path, content_hash) VALUES (?1, ?2)",
-            params![path, content_hash],
-        )?;
+        self.conn
+            .prepare_cached("INSERT INTO files (path, content_hash) VALUES (?1, ?2)")?
+            .execute(params![path, content_hash])?;
         Ok(self.conn.last_insert_rowid())
     }
 
     pub fn update_file_metadata(&self, file_id: i64, metadata: Option<&str>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE files SET metadata = ?1 WHERE id = ?2",
-            params![metadata, file_id],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE files SET metadata = ?1 WHERE id = ?2")?
+            .execute(params![metadata, file_id])?;
         Ok(())
     }
 
@@ -299,10 +304,11 @@ impl Database {
         } else {
             serde_json::to_string(&symbol.attributes).ok()
         };
-        self.conn.execute(
-            "INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature, attributes, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![file_id, symbol.name, symbol.kind, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64, symbol.signature, attributes_json, symbol.metadata],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO symbols (file_id, name, kind, start_line, end_line, start_byte, end_byte, signature, attributes, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?
+            .execute(params![file_id, symbol.name, symbol.kind, symbol.start_line as i64, symbol.end_line as i64, symbol.start_byte as i64, symbol.end_byte as i64, symbol.signature, attributes_json, symbol.metadata])?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -389,19 +395,21 @@ impl Database {
 
     /// Inserts a generic relationship (import, call, reference)
     pub fn insert_relationship(&self, file_id: i64, rel: &RelationshipNode) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO relationships (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, rel.name, rel.source, rel.line_number as i64, rel.kind],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO relationships (file_id, name, source, line_number, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![file_id, rel.name, rel.source, rel.line_number as i64, rel.kind])?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Insert a semantic binding (type annotation, field type, return type, alias).
     pub fn insert_semantic_binding(&self, file_id: i64, binding: &SemanticBinding) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO semantic_bindings (file_id, kind, name, type_name, context) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![file_id, binding.kind.as_str(), binding.name, binding.type_name, binding.context],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO semantic_bindings (file_id, kind, name, type_name, context) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![file_id, binding.kind.as_str(), binding.name, binding.type_name, binding.context])?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -639,10 +647,11 @@ impl Database {
         target_symbol_id: i64,
         kind: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
-            params![source_file_id, source_symbol_id, target_symbol_id, kind],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind) VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![source_file_id, source_symbol_id, target_symbol_id, kind])?;
         Ok(())
     }
 

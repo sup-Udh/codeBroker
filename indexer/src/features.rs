@@ -203,27 +203,33 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
 
     eprintln!("[TIMING:features] Community detection: {}ms", t3.elapsed().as_millis());
 
-    // 5. Update SQLite Database
+    // 5. Update SQLite Database. DELETE + the re-INSERT loop below share one
+    // transaction so a concurrent WAL reader (e.g. an MCP query mid-flight)
+    // never observes the table in its briefly-empty state between the two.
     let t4 = Instant::now();
+    let _ = db.conn.execute_batch("BEGIN IMMEDIATE");
     let _ = db.conn.execute("DELETE FROM symbol_features", []);
     eprintln!("[TIMING:features] DELETE symbol_features: {}ms", t4.elapsed().as_millis());
 
     let t5 = Instant::now();
-    for (id, sym) in &symbols {
-        let pr = pagerank.get(id).unwrap_or(&0.0);
-        let cid = community.get(id).unwrap_or(id);
-        let _ = db.conn.execute(
+    {
+        let mut stmt = db.conn.prepare_cached(
             "INSERT INTO symbol_features
              (symbol_id, pagerank, fan_in, fan_out, interaction_count, community_id,
               is_entrypoint, is_exported, is_public, is_callable, is_type, is_constant, is_local, is_generated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-             rusqlite::params![id, pr, sym.fan_in, sym.fan_out, sym.interaction_count, cid,
-                sym.is_entrypoint, sym.is_exported, sym.is_public, sym.is_callable, sym.is_type, sym.is_constant, sym.is_local, sym.is_generated]
-        ).map_err(|e| e.to_string());
+        ).map_err(|e| e.to_string())?;
+        for (id, sym) in &symbols {
+            let pr = pagerank.get(id).unwrap_or(&0.0);
+            let cid = community.get(id).unwrap_or(id);
+            let _ = stmt.execute(rusqlite::params![id, pr, sym.fan_in, sym.fan_out, sym.interaction_count, cid,
+                sym.is_entrypoint, sym.is_exported, sym.is_public, sym.is_callable, sym.is_type, sym.is_constant, sym.is_local, sym.is_generated]);
+        }
     }
+    let _ = db.conn.execute_batch("COMMIT");
     let insert_count = symbols.len();
     eprintln!(
-        "[TIMING:features] INSERT symbol_features ({} rows, individual INSERTs, no transaction): {}ms ({:.2}ms/row)",
+        "[TIMING:features] INSERT symbol_features ({} rows, batched in one transaction): {}ms ({:.2}ms/row)",
         insert_count,
         t5.elapsed().as_millis(),
         t5.elapsed().as_millis() as f64 / insert_count.max(1) as f64

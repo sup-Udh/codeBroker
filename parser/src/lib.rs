@@ -4,6 +4,7 @@ pub mod extractor;
 pub mod frontend;
 pub mod javascript_frontend;
 pub mod normalize;
+pub mod pool;
 pub mod python_frontend;
 pub mod svelte_frontend;
 pub mod treesitter;

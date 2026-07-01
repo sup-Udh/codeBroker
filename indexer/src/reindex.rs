@@ -76,6 +76,10 @@ pub fn reindex_paths(
     let mut touched_symbol_names: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // Resolve each raw path to the "./relative" stored-path format. Pure
+    // string/path logic, no DB access, so it stays outside the transaction
+    // below and ahead of the parallel parse phase.
+    let mut to_parse: Vec<(std::path::PathBuf, String)> = Vec::new();
     for raw_path in changed_paths {
         let abs = std::path::Path::new(raw_path);
         let abs = if abs.is_absolute() {
@@ -90,58 +94,83 @@ pub fn reindex_paths(
         // Match the "./relative/path" format `codebroker init` stores (it walks
         // from "." so every stored path carries that prefix).
         let stored_path = format!("./{}", rel.trim_start_matches("./"));
+        to_parse.push((abs, stored_path));
+    }
 
-        if let Ok(Some(existing_id)) = db.get_file_id_by_path(&stored_path) {
-            db.delete_file_data(existing_id)
-                .map_err(|e| e.to_string())?;
+    // Parse the survivors in parallel — each rayon worker pools its own
+    // tree-sitter Parser/Query per language (see parser::pool) — then sort
+    // deterministically before any DB writes. No DB access happens during
+    // this phase, so it doesn't need to run inside the write transaction.
+    let mut parsed: Vec<crate::parsed_file::ParsedFile> = {
+        use rayon::prelude::*;
+        to_parse
+            .par_iter()
+            .filter_map(|(abs, stored_path)| {
+                crate::parsed_file::read_hash_parse(abs, stored_path, &frontends)
+            })
+            .collect()
+    };
+    parsed.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let parsed_paths: std::collections::HashSet<&str> =
+        parsed.iter().map(|p| p.path.as_str()).collect();
+    for (_, stored_path) in &to_parse {
+        if !parsed_paths.contains(stored_path.as_str()) {
+            stats.skipped.push(stored_path.clone());
+        }
+    }
+
+    // One transaction for every delete + insert below, instead of an
+    // implicit autocommit per statement. Any error inside rolls the whole
+    // batch back explicitly — this connection is long-lived (shared by the
+    // MCP server across calls), so an early `?` return must never leave an
+    // open, never-committed transaction sitting on it.
+    db.conn
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| e.to_string())?;
+    let write_result: Result<(), String> = (|| {
+        for (_, stored_path) in &to_parse {
+            if let Ok(Some(existing_id)) = db.get_file_id_by_path(stored_path) {
+                db.delete_file_data(existing_id)
+                    .map_err(|e| e.to_string())?;
+            }
         }
 
-        let source_code = match fs::read_to_string(&abs) {
-            Ok(s) => s,
-            Err(_) => {
-                stats.skipped.push(raw_path.clone());
-                continue;
-            }
-        };
+        for pf in &parsed {
+            let file_id = db
+                .insert_file(&pf.path, &pf.content_hash)
+                .map_err(|e| e.to_string())?;
+            touched_file_ids.push(file_id);
+            stats.files_processed += 1;
 
-        let matched_frontend = frontends.iter().find(|f| f.can_handle(&stored_path));
-        let frontend = match matched_frontend {
-            Some(f) => f,
-            None => {
-                stats.skipped.push(raw_path.clone());
-                continue;
-            }
-        };
-
-        let content_hash = storage::hash_content(source_code.as_bytes());
-        let file_id = db
-            .insert_file(&stored_path, &content_hash)
-            .map_err(|e| e.to_string())?;
-        touched_file_ids.push(file_id);
-        stats.files_processed += 1;
-
-        if let Some((metadata, symbols, imports, semantic_bindings)) =
-            frontend.parse_and_extract(&source_code, &stored_path)
-        {
-            let _ = db.update_file_metadata(file_id, metadata.metadata.as_deref());
+            let _ = db.update_file_metadata(file_id, pf.metadata.metadata.as_deref());
             let mut seen_syms = std::collections::HashSet::new();
-            for symbol in symbols {
+            for symbol in &pf.symbols {
                 let key = (symbol.name.clone(), symbol.kind.clone(), symbol.start_byte);
                 if !seen_syms.insert(key) {
                     continue; // duplicate from overlapping tree-sitter captures
                 }
-                if let Ok(symbol_id) = db.insert_symbol(file_id, &symbol) {
+                if let Ok(symbol_id) = db.insert_symbol(file_id, symbol) {
                     stats.symbols_inserted += 1;
                     stats.touched_symbol_ids.push(symbol_id);
                     touched_symbol_names.insert(symbol.name.clone());
                 }
             }
-            for import in imports {
-                let _ = db.insert_relationship(file_id, &import);
+            for import in &pf.relationships {
+                let _ = db.insert_relationship(file_id, import);
             }
-            for binding in semantic_bindings {
-                let _ = db.insert_semantic_binding(file_id, &binding);
+            for binding in &pf.semantic_bindings {
+                let _ = db.insert_semantic_binding(file_id, binding);
             }
+        }
+        Ok(())
+    })();
+
+    match write_result {
+        Ok(()) => db.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+        Err(e) => {
+            let _ = db.conn.execute_batch("ROLLBACK");
+            return Err(e);
         }
     }
 

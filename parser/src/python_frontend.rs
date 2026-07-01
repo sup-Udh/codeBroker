@@ -1,6 +1,6 @@
 use crate::frontend::LanguageFrontend;
 use graph::{RelationshipNode, SemanticBinding, SymbolNode};
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Query, QueryCursor, StreamingIterator, Tree};
 
 pub struct PythonFrontend;
 
@@ -20,10 +20,9 @@ impl LanguageFrontend for PythonFrontend {
         Vec<SemanticBinding>,
     )> {
         let language = tree_sitter_python::LANGUAGE.into();
-        let mut parser = Parser::new();
-        parser.set_language(&language).ok()?;
-
-        let tree = parser.parse(source_code, None)?;
+        let tree = crate::pool::with_parser("python", &language, |parser| {
+            parser.parse(source_code, None)
+        })?;
 
         let symbols = extract_py_symbols(&tree, source_code, language);
 
@@ -50,16 +49,16 @@ fn extract_py_symbols(
     source_code: &str,
     language: tree_sitter::Language,
 ) -> Vec<SymbolNode> {
-    let mut symbols = Vec::new();
     let query_str = "
         (class_definition name: (identifier) @name) @class
         (function_definition name: (identifier) @name) @function
         (expression_statement (assignment left: (identifier) @name)) @variable
     ";
 
-    let query = Query::new(&language, query_str).expect("Invalid Tree-sitter query");
+    crate::pool::with_query("python_symbols", &language, query_str, |query| {
+    let mut symbols = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), source_code.as_bytes());
 
     while let Some(m) = matches.next() {
         let mut name = String::new();
@@ -172,6 +171,7 @@ fn extract_py_symbols(
     symbols.dedup_by_key(|s| s.start_byte);
 
     symbols
+    })
 }
 
 #[cfg(test)]

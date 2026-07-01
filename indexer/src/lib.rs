@@ -1,5 +1,6 @@
 pub mod features;
 pub mod interactions;
+pub mod parsed_file;
 pub mod reindex;
 pub mod resolver;
 pub mod semantic;
