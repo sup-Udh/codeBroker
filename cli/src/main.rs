@@ -78,23 +78,28 @@ fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Commands::Init => {
-            println!("Initializing CodeBroker...");
+            use indicatif::{ProgressBar, ProgressStyle};
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
             let t_pipeline = std::time::Instant::now();
+            let show_timing = std::env::var("CODEBROKER_TIMING").is_ok();
+
+            let spinner_style = ProgressStyle::with_template(
+                "  🔴 {spinner:.red}  {wide_msg}",
+            )
+            .unwrap()
+            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏",""]);
+
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(spinner_style);
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+            pb.set_message("Churning  —  loading cache & warming database");
 
             let _ = fs::create_dir_all(".codebroker");
 
-            // Build the new index into a temp file and atomically rename it into place
-            // once fully populated. A concurrent reader (e.g. another live
-            // codebroker-mcp process, perhaps from a second Claude session on the
-            // same project) must never observe a partially-rebuilt database; rebuilding
-            // in place via delete+repopulate creates exactly that window.
             const FINAL_DB_PATH: &str = ".codebroker/codebroker.db";
             const TMP_DB_PATH: &str = ".codebroker/codebroker.db.tmp";
-            // Bump whenever a change to parsing/extraction/schema means a
-            // file's stored content_hash can no longer be trusted to predict
-            // its old parse output — every file is then treated as changed
-            // on the next `init` regardless of whether its hash still
-            // matches, even though this is otherwise an incremental run.
             const PIPELINE_VERSION: &str = "1";
 
             // Load embeddings from the OLD database before wiping it.
@@ -103,11 +108,10 @@ fn main() {
             // if it hasn't changed — the dominant bottleneck as codebases grow.
             let t_cache_load = std::time::Instant::now();
             let embedding_cache = semantic::embeddings::load_embedding_cache(FINAL_DB_PATH);
-            eprintln!(
-                "[TIMING] Load old embedding cache: {}ms ({} cached embeddings)",
-                t_cache_load.elapsed().as_millis(),
-                embedding_cache.len()
-            );
+            if show_timing {
+                eprintln!("[TIMING] Load old embedding cache: {}ms ({} cached embeddings)",
+                    t_cache_load.elapsed().as_millis(), embedding_cache.len());
+            }
 
             let _ = fs::remove_file(TMP_DB_PATH);
             let _ = fs::remove_file(format!("{}-wal", TMP_DB_PATH));
@@ -135,7 +139,7 @@ fn main() {
                 let t_db_open = std::time::Instant::now();
                 let db = storage::Database::new(TMP_DB_PATH).expect("Failed to create DB");
                 db.init_schema().expect("Failed to initialize schema");
-                eprintln!("[TIMING] DB open + schema init: {}ms", t_db_open.elapsed().as_millis());
+                if show_timing { eprintln!("[TIMING] DB open + schema init: {}ms", t_db_open.elapsed().as_millis()); }
 
                 // Trust content hashes to predict old parse output only if
                 // the copied index was built by this same pipeline version.
@@ -170,11 +174,10 @@ fn main() {
                         old_hashes.insert(path, (id, hash));
                     }
                 }
-                eprintln!(
-                    "[TIMING] Load previous file hashes: {}ms ({} files known)",
-                    t_old_hashes.elapsed().as_millis(),
-                    old_hashes.len()
-                );
+                if show_timing {
+                    eprintln!("[TIMING] Load previous file hashes: {}ms ({} files known)",
+                        t_old_hashes.elapsed().as_millis(), old_hashes.len());
+                }
 
                 use parser::config_frontend::ConfigFrontend;
                 use parser::frontend::{LanguageFrontend, RustFrontend};
@@ -248,35 +251,66 @@ fn main() {
                 }
 
                 // 2. Walk the file system
+                pb.set_message("Discovering  —  walking the filesystem");
                 let t_walk = std::time::Instant::now();
                 let files = indexer::walker::collect_files(".");
-                eprintln!("[TIMING] File walk: {}ms ({} files found)", t_walk.elapsed().as_millis(), files.len());
-                println!("Found {} files to index.", files.len());
+                let total_files = files.len();
+                if show_timing {
+                    eprintln!("[TIMING] File walk: {}ms ({} files found)", t_walk.elapsed().as_millis(), total_files);
+                }
+                pb.println(format!("     Found {} files to index.", total_files));
 
-                // 3. The Main Indexing Loop — classify each file against the
-                // previous index and parse only the changed ones, fused into
-                // one rayon pass (each worker thread pools its own
-                // tree-sitter Parser/Query per language, see parser::pool)
-                // so every file is read from disk exactly once. Sorting the
-                // changed set before insertion is what keeps file ids and
-                // everything downstream from them deterministic regardless
-                // of which worker finished first.
+                // 3. The Main Indexing Loop — track per-file progress via an
+                // AtomicUsize polled by a background thread that refreshes the
+                // spinner message every 80 ms with a live count + ETA.
                 let t_pass1 = std::time::Instant::now();
                 let t_parse = std::time::Instant::now();
+
+                let processed = Arc::new(AtomicUsize::new(0));
+
+                // Background watcher thread: updates message with count + ETA
+                let pb_watcher = pb.clone();
+                let processed_watcher = processed.clone();
+                let watcher = std::thread::spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    loop {
+                        let n = processed_watcher.load(Ordering::Relaxed);
+                        let eta_str = if n > 1 {
+                            let rate = n as f64 / t0.elapsed().as_secs_f64().max(0.001);
+                            let rem = total_files.saturating_sub(n);
+                            let secs = (rem as f64 / rate).ceil() as u64;
+                            if secs < 60 { format!("~{}s left", secs) }
+                            else { format!("~{}m {}s left", secs / 60, secs % 60) }
+                        } else {
+                            "calculating…".to_string()
+                        };
+                        pb_watcher.set_message(format!(
+                            "Indexing  —  {}/{} files  ·  {}",
+                            n, total_files, eta_str
+                        ));
+                        if n >= total_files { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(80));
+                    }
+                });
+
+                let processed_rayon = processed.clone();
                 let statuses: Vec<indexer::parsed_file::FileStatus> = {
                     use rayon::prelude::*;
                     files
                         .par_iter()
                         .filter_map(|file_path| {
-                            indexer::parsed_file::classify_and_parse(
+                            let r = indexer::parsed_file::classify_and_parse(
                                 file_path,
                                 &old_hashes,
                                 trust_hashes,
                                 &frontends,
-                            )
+                            );
+                            processed_rayon.fetch_add(1, Ordering::Relaxed);
+                            r
                         })
                         .collect()
                 };
+                let _ = watcher.join();
                 let mut parsed_files: Vec<indexer::parsed_file::ParsedFile> = Vec::new();
                 let mut unchanged_count = 0usize;
                 for status in statuses {
@@ -348,17 +382,13 @@ fn main() {
                 }
                 db.conn.execute_batch("COMMIT").unwrap();
                 let pass1_db_insert_ms = t_db_ins.elapsed().as_millis();
-                eprintln!(
-                    "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | changed={} unchanged={} deleted={} symbols={} relationships={}",
-                    t_pass1.elapsed().as_millis(),
-                    pass1_parse_ms,
-                    pass1_db_insert_ms,
-                    pass1_files,
-                    unchanged_count,
-                    deleted_file_ids.len(),
-                    pass1_symbols,
-                    pass1_imports
-                );
+                if show_timing {
+                    eprintln!(
+                        "[TIMING] Pass 1 (parse + DB inserts): {}ms total | parse={}ms db_inserts={}ms | changed={} unchanged={} deleted={} symbols={} relationships={}",
+                        t_pass1.elapsed().as_millis(), pass1_parse_ms, pass1_db_insert_ms,
+                        pass1_files, unchanged_count, deleted_file_ids.len(), pass1_symbols, pass1_imports
+                    );
+                }
 
                 // Nothing to relink/recompute/re-embed if this was a true
                 // incremental run and literally no file changed or was
@@ -371,17 +401,9 @@ fn main() {
                 let mut edges_created: usize = 0;
 
               if nothing_changed {
-                println!("No changes since last index — skipping linking, feature extraction, validation, and embeddings.");
+                pb.set_message("Already up to date  —  no files changed since last index");
               } else {
-                // --- PASS 2: THE LINKER --- A full rebuild (first-ever
-                // `init`, or a pipeline-version mismatch that forced every
-                // file to be treated as changed) relinks everything, exactly
-                // like before. A true incremental run scopes the linker to
-                // only the files that actually changed or were deleted —
-                // the same scoped, full-fidelity resolution `reindex_paths`
-                // already uses (it's the identical `resolve_relationships`
-                // call, just restricted to file ids instead of `None`).
-                println!("Pass 1 complete. Starting Pass 2: Linking graph edges...");
+                pb.set_message("Linking  —  weaving graph edges");
                 let t_pass2 = std::time::Instant::now();
                 let metrics = if full_rebuild {
                     indexer::resolver::resolve_relationships(&db, None).expect("Linker failed")
@@ -391,10 +413,9 @@ fn main() {
                 };
                 edges_created = metrics.relationships_emitted;
                 let total_relationships = metrics.relationships_input;
-                println!("Linking complete. Created {} true graph edges from {} relationships.", edges_created, total_relationships);
                 let version = env!("CARGO_PKG_VERSION");
                 let _ = db.save_pipeline_manifest(version, "1.0", "1.0", "1.0", "1.0", "1.0", pass1_files as i64, pass1_symbols as i64, total_relationships as i64, edges_created as i64);
-                eprintln!("[TIMING] Pass 2 (edge linking): {}ms", t_pass2.elapsed().as_millis());
+                if show_timing { eprintln!("[TIMING] Pass 2 (edge linking): {}ms", t_pass2.elapsed().as_millis()); }
 
                 // 4.4 Infer logical interaction edges (HTTP/WebSocket runtime
                 // boundaries) and then precompute graph features (pagerank,
@@ -408,63 +429,36 @@ fn main() {
                 // entrypoints on a clean index regardless of how routes were
                 // detected. Running them here makes a full index complete and
                 // identical in shape to the incremental path.
+                pb.set_message("Wiring  —  inferring runtime interaction edges");
                 let t_interactions = std::time::Instant::now();
-                match indexer::interactions::infer_interactions(&db) {
-                    Ok(()) => println!("Inferred logical interaction edges."),
-                    Err(e) => println!("Warning: interaction inference failed: {}", e),
-                }
-                eprintln!("[TIMING] infer_interactions: {}ms", t_interactions.elapsed().as_millis());
+                let _ = indexer::interactions::infer_interactions(&db);
+                if show_timing { eprintln!("[TIMING] infer_interactions: {}ms", t_interactions.elapsed().as_millis()); }
 
+                pb.set_message("Wiring  —  computing pagerank & entrypoints");
                 let t_features = std::time::Instant::now();
-                match indexer::features::extract_features(&db) {
-                    Ok(()) => println!("Computed graph features (pagerank, entrypoints, ...)."),
-                    Err(e) => println!("Warning: feature extraction failed: {}", e),
-                }
-                eprintln!("[TIMING] extract_features: {}ms", t_features.elapsed().as_millis());
+                let _ = indexer::features::extract_features(&db);
+                if show_timing { eprintln!("[TIMING] extract_features: {}ms", t_features.elapsed().as_millis()); }
 
-                // 4.4 Validate graph structure and persist completeness metrics.
+                pb.set_message("Wiring  —  validating graph structure");
                 let t_validate = std::time::Instant::now();
-                match query::validation::validate(&db) {
-                    Ok(report) => {
-                        println!(
-                            "Graph validation: {} symbols, {} edges, import_resolution={:.1}%, connectivity={:.1}%",
-                            report.total_symbols,
-                            report.total_edges,
-                            report.import_resolution_rate() * 100.0,
-                            report.graph_connectivity() * 100.0,
-                        );
-                        if !report.is_valid() {
-                            println!(
-                                "  Issues: {} dangling edges, {} duplicates, {} self-loops",
-                                report.dangling_edges, report.duplicate_edges, report.self_loops
-                            );
-                        }
-                    }
-                    Err(e) => println!("Warning: graph validation failed: {}", e),
-                }
+                let validation_summary = match query::validation::validate(&db) {
+                    Ok(report) => format!(
+                        "     Graph: {} symbols  ·  {} edges  ·  {:.1}% resolution",
+                        report.total_symbols, report.total_edges,
+                        report.import_resolution_rate() * 100.0,
+                    ),
+                    Err(_) => String::new(),
+                };
                 match query::metrics::compute_metrics(&db) {
-                    Ok(metrics) => {
-                        println!(
-                            "Graph metrics: density={:.4}, orphans={}, isolated_files={}",
-                            metrics.graph_density, metrics.orphan_symbols, metrics.isolated_files
-                        );
-                        let _ = query::metrics::save_metrics(&db, &metrics);
-                    }
-                    Err(e) => println!("Warning: graph metrics failed: {}", e),
+                    Ok(metrics) => { let _ = query::metrics::save_metrics(&db, &metrics); }
+                    Err(_) => {}
                 }
-                eprintln!("[TIMING] validate+metrics: {}ms", t_validate.elapsed().as_millis());
+                if show_timing { eprintln!("[TIMING] validate+metrics: {}ms", t_validate.elapsed().as_millis()); }
 
-                // 4.45 Tag symbols with domain concepts (auth, realtime,
-                // notifications, database, ...) independent of literal
-                // name/path matching, so natural-language discovery doesn't
-                // depend entirely on a query term appearing verbatim in a
-                // symbol or file name.
+                pb.set_message("Wiring  —  tagging domain concepts");
                 let t_concepts = std::time::Instant::now();
-                match query::concepts::tag_concepts(&db) {
-                    Ok(count) => println!("Tagged {} symbol/concept matches.", count),
-                    Err(e) => println!("Warning: concept tagging failed: {}", e),
-                }
-                eprintln!("[TIMING] tag_concepts: {}ms", t_concepts.elapsed().as_millis());
+                let _ = query::concepts::tag_concepts(&db);
+                if show_timing { eprintln!("[TIMING] tag_concepts: {}ms", t_concepts.elapsed().as_millis()); }
 
                 // 4.5 Replay embeddings for symbols the pre-wipe cache still
                 // covers, if a key is configured. Silently skipped (not an
@@ -476,13 +470,18 @@ fn main() {
                 // to a detached background process after publish, below.
                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
                 if !openai_key.is_empty() {
+                    pb.set_message("Embedding  —  replaying semantic cache");
                     let t_apply = std::time::Instant::now();
                     let cache_hits = semantic::embeddings::apply_embedding_cache(&db, &embedding_cache);
-                    eprintln!(
-                        "[TIMING] Apply embedding cache: {}ms ({} hits from cache, bypassed API)",
-                        t_apply.elapsed().as_millis(),
-                        cache_hits
-                    );
+                    if show_timing {
+                        eprintln!("[TIMING] Apply embedding cache: {}ms ({} hits from cache, bypassed API)",
+                            t_apply.elapsed().as_millis(), cache_hits);
+                    }
+                }
+
+                // Print the validation summary line (persists above final Done line)
+                if !validation_summary.is_empty() {
+                    pb.println(&validation_summary);
                 }
               }
 
@@ -505,21 +504,32 @@ fn main() {
 
                 // Flush WAL into the main file before closing, so the temp file is a
                 // single self-contained snapshot before we publish it.
+                pb.set_message("Publishing  —  checkpointing & finalizing index");
                 let t_wal = std::time::Instant::now();
                 let _ = db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-                eprintln!("[TIMING] WAL checkpoint: {}ms", t_wal.elapsed().as_millis());
-                let pipeline_secs = (t_pipeline.elapsed().as_millis() as f64 / 1000.0).max(0.001);
-                eprintln!("[TIMING] === PIPELINE TOTAL (inside DB scope): {}ms ===", t_pipeline.elapsed().as_millis());
-                eprintln!(
-                    "[TIMING] === THROUGHPUT: {:.1} files/sec | {:.1} symbols/sec | {:.1} relationships/sec | {:.1} edges/sec (changed={}, symbols={}, relationships={}, edges={}) ===",
-                    pass1_files as f64 / pipeline_secs,
-                    pass1_symbols as f64 / pipeline_secs,
-                    pass1_imports as f64 / pipeline_secs,
-                    edges_created as f64 / pipeline_secs,
-                    pass1_files,
-                    pass1_symbols,
-                    pass1_imports,
-                    edges_created,
+                if show_timing {
+                    let pipeline_secs = (t_pipeline.elapsed().as_millis() as f64 / 1000.0).max(0.001);
+                    eprintln!("[TIMING] WAL checkpoint: {}ms", t_wal.elapsed().as_millis());
+                    eprintln!("[TIMING] === PIPELINE TOTAL (inside DB scope): {}ms ===", t_pipeline.elapsed().as_millis());
+                    eprintln!(
+                        "[TIMING] === THROUGHPUT: {:.1} files/sec | {:.1} symbols/sec | {:.1} relationships/sec | {:.1} edges/sec ===",
+                        pass1_files as f64 / pipeline_secs,
+                        pass1_symbols as f64 / pipeline_secs,
+                        pass1_imports as f64 / pipeline_secs,
+                        edges_created as f64 / pipeline_secs,
+                    );
+                }
+
+                let elapsed_secs = t_pipeline.elapsed().as_secs_f64();
+                let elapsed_str = if elapsed_secs < 60.0 {
+                    format!("{:.1}s", elapsed_secs)
+                } else {
+                    format!("{}m {}s", elapsed_secs as u64 / 60, elapsed_secs as u64 % 60)
+                };
+                pb.finish_and_clear();
+                println!(
+                    "  ✅  Done  —  {} files  ·  {} symbols  ·  {} edges  ·  {}",
+                    total_files, pass1_symbols, edges_created, elapsed_str
                 );
             }
 
@@ -544,8 +554,9 @@ fn main() {
                 }
             }
 
-            eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
-            println!("Indexing complete! Run a query to test it.");
+            if show_timing {
+                eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
+            }
         }
         Commands::Query { text } => {
             // Connect to the existing DB

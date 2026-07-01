@@ -21,6 +21,7 @@ regex = "1.12.4"
 graph = { version = "0.1.0", path = "../graph" }
 graph_diagnostics = { path = "../graph_diagnostics" }
 rayon = "1.10"
+indicatif = "0.17"
 
 [[bin]]
 name = "codebroker"
