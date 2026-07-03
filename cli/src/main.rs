@@ -628,10 +628,38 @@ fn main() {
 
             let exe_name = if os == "windows" { "codebroker.exe" } else { "codebroker" };
             let new_binary = tmp_dir.path().join(exe_name);
-            
+
+            // The archive also contains codebroker-mcp — self_replace only
+            // swaps the currently-running binary, so the sibling MCP server
+            // binary has to be copied into place separately or `update`
+            // leaves it stale (or entirely absent on a first-time install).
+            let mcp_exe_name = format!("codebroker-mcp{}", runtime::platform::exe_suffix());
+            let new_mcp_binary = tmp_dir.path().join(&mcp_exe_name);
+            if new_mcp_binary.exists() {
+                let current_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(exe_name));
+                let bin_dir = current_exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+                let mcp_dest = bin_dir.join(&mcp_exe_name);
+                match std::fs::copy(&new_mcp_binary, &mcp_dest) {
+                    Ok(_) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(&mcp_dest, std::fs::Permissions::from_mode(0o755));
+                        }
+                        println!("Updated {}", mcp_dest.display());
+                    }
+                    Err(e) => println!("Warning: failed to update {}: {}", mcp_exe_name, e),
+                }
+            } else {
+                println!(
+                    "Warning: release archive did not contain {} — the MCP server was not updated.",
+                    mcp_exe_name
+                );
+            }
+
             println!("Replacing executable...");
             self_replace::self_replace(&new_binary).unwrap();
-            
+
             println!("Successfully updated to version {}!", latest_version);
         }
         Commands::Query { text } => {
@@ -1109,18 +1137,30 @@ fn main() {
                 .to_string_lossy()
                 .to_string();
 
-            let current_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("codebroker"));
-            let bin_dir = current_exe.parent().unwrap_or_else(|| std::path::Path::new(""));
-            let mcp_binary = if std::env::consts::OS == "windows" {
-                "codebroker-mcp.exe"
-            } else {
-                "codebroker-mcp"
+            let codebroker_cmd = match runtime::executables::find_mcp_binary() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(e) => {
+                    // Surface the real problem instead of silently writing a
+                    // config that points at nothing, but still fall back to
+                    // the sibling-of-current-exe guess so `bind` finishes —
+                    // useful e.g. right after a local `cargo build` before
+                    // the mcp binary has been placed alongside this one.
+                    println!("Warning: {}", e);
+                    let current_exe = std::env::current_exe()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("codebroker"));
+                    let bin_dir = current_exe
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(""));
+                    bin_dir
+                        .join(format!("codebroker-mcp{}", runtime::platform::exe_suffix()))
+                        .to_string_lossy()
+                        .to_string()
+                }
             };
-            let codebroker_cmd = bin_dir.join(mcp_binary).to_string_lossy().replace("\\\\", "\\").to_string();
 
             // 2. Paths to configs
-            let home_dir = std::env::var("HOME")
-                .or_else(|_| std::env::var("USERPROFILE"))
+            let home_dir = runtime::environment::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default();
 
             let claude_path = match std::env::consts::OS {
@@ -1222,7 +1262,12 @@ fn main() {
                 add_args.push(&env_arg);
             }
             add_args.push("--");
-            add_args.push("codebroker-mcp");
+            // Use the same resolved absolute path as the JSON configs above —
+            // registering the bare "codebroker-mcp" name here relied on PATH,
+            // which is exactly the inconsistency that caused "executable not
+            // found" for claude-code registrations while Desktop/Gemini
+            // configs (already absolute) worked.
+            add_args.push(&codebroker_cmd);
             let add_status = std::process::Command::new(claude_bin)
                 .args(&add_args)
                 .status();
@@ -1596,15 +1641,23 @@ Treat native tools as the repository's implementation layer."#;
             }
 
             // 3. Write the active project pointer so codebroker-mcp always finds the right database
-            let active_project_dir = format!("{}/.codebroker", home_dir);
-            let _ = fs::create_dir_all(&active_project_dir);
-            let active_project_path = format!("{}/active_project", active_project_dir);
             let current_dir_str = std::env::current_dir()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            if fs::write(&active_project_path, &current_dir_str).is_ok() {
-                println!("Set active project to: {}", current_dir_str);
+            match (
+                runtime::environment::codebroker_dir(),
+                runtime::environment::active_project_path(),
+            ) {
+                (Some(dir), Some(active_project_path)) => {
+                    let _ = fs::create_dir_all(&dir);
+                    if fs::write(&active_project_path, &current_dir_str).is_ok() {
+                        println!("Set active project to: {}", current_dir_str);
+                    }
+                }
+                _ => println!(
+                    "Warning: Could not determine the user's home directory — active project pointer was not written."
+                ),
             }
 
             // 4. Auto-Init the directory so it's ready!

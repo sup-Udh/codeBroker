@@ -33,12 +33,15 @@ struct ResolvedWorkspace {
 /// switching workspaces. Only when no active_project pointer exists at all
 /// do we fall back to a CWD-relative database (first-run behavior).
 fn resolve_workspace() -> ResolvedWorkspace {
-    if let Ok(home) = std::env::var("HOME") {
-        let active_file = format!("{}/.codebroker/active_project", home);
+    if let Some(active_file) = runtime::environment::active_project_path() {
         if let Ok(project_path) = std::fs::read_to_string(&active_file) {
             let project_path = project_path.trim().to_string();
             if !project_path.is_empty() {
-                let db_path = format!("{}/.codebroker/codebroker.db", project_path);
+                let db_path = std::path::Path::new(&project_path)
+                    .join(".codebroker")
+                    .join("codebroker.db")
+                    .to_string_lossy()
+                    .to_string();
                 let exists = std::path::Path::new(&db_path).exists();
                 if exists {
                     eprintln!("Using active project database: {}", db_path);
@@ -641,31 +644,12 @@ fn resolve_symbol_for_tool(
 /// the workspace that `set_workspace` / `active_project` actually pointed to,
 /// leaving the intended workspace's database empty (0 edges) or never indexed.
 fn run_index(project_dir: &str) -> Result<String, String> {
-    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let parent = current_exe
-        .parent()
-        .ok_or_else(|| "Could not resolve codebroker-mcp binary directory".to_string())?;
-    let cli_path = parent.join("codebroker");
-
     // Stdio must NOT be inherited here: the MCP transport is JSON-RPC framed
     // over this same process's stdout, and a child's plain `println!` output
     // landing on that stream corrupts every subsequent response.
-    let status = std::process::Command::new(&cli_path)
-        .arg("init")
-        .current_dir(project_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to spawn indexer process in {}: {}", project_dir, e))?;
-
-    if status.success() {
-        Ok(format!("Indexing complete for workspace: {}", project_dir))
-    } else {
-        Err(format!(
-            "Indexer exited with non-zero status ({}) while indexing {}",
-            status, project_dir
-        ))
-    }
+    let cli_path = runtime::executables::find_cli_binary().map_err(|e| e.to_string())?;
+    runtime::process::run_detached(&cli_path, &["init"], std::path::Path::new(project_dir))?;
+    Ok(format!("Indexing complete for workspace: {}", project_dir))
 }
 
 /// Runs `codebroker reindex-incremental <changed_paths...>` rooted at `project_dir`,
@@ -673,44 +657,18 @@ fn run_index(project_dir: &str) -> Result<String, String> {
 /// rebuild. See indexer::reindex::reindex_paths for what this intentionally
 /// trades away (alias/route/prop-type linking) in exchange for speed.
 fn run_incremental_index(project_dir: &str, changed_paths: &[String]) -> Result<String, String> {
-    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let parent = current_exe
-        .parent()
-        .ok_or_else(|| "Could not resolve codebroker-mcp binary directory".to_string())?;
-    let cli_path = parent.join("codebroker");
+    // Same reasoning as run_index: must not inherit stdout/stderr, or the
+    // child's println! output corrupts the JSON-RPC stream on this fd.
+    let cli_path = runtime::executables::find_cli_binary().map_err(|e| e.to_string())?;
+    let mut args: Vec<&str> = vec!["reindex-incremental"];
+    args.extend(changed_paths.iter().map(|p| p.as_str()));
+    runtime::process::run_detached(&cli_path, &args, std::path::Path::new(project_dir))?;
 
-    let mut cmd = std::process::Command::new(&cli_path);
-    cmd.arg("reindex-incremental")
-        .current_dir(project_dir)
-        // Same reasoning as run_index: must not inherit stdout/stderr, or the
-        // child's println! output corrupts the JSON-RPC stream on this fd.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    for p in changed_paths {
-        cmd.arg(p);
-    }
-
-    let status = cmd.status().map_err(|e| {
-        format!(
-            "Failed to spawn incremental indexer process in {}: {}",
-            project_dir, e
-        )
-    })?;
-
-    if status.success() {
-        Ok(format!(
-            "Incremental reindex complete for {} file(s) in workspace: {}",
-            changed_paths.len(),
-            project_dir
-        ))
-    } else {
-        Err(format!(
-            "Incremental indexer exited with non-zero status ({}) while indexing {} file(s) in {}",
-            status,
-            changed_paths.len(),
-            project_dir
-        ))
-    }
+    Ok(format!(
+        "Incremental reindex complete for {} file(s) in workspace: {}",
+        changed_paths.len(),
+        project_dir
+    ))
 }
 
 fn main() {
@@ -721,10 +679,12 @@ fn main() {
     // actual project root (not the MCP process's ambient CWD).
     if !resolved.exists {
         let project_dir = resolved.project_root.clone();
-        let home_dir = std::env::var("HOME").unwrap_or_default();
+        let home_dir = runtime::environment::home_dir();
         let project_path_buf = std::path::PathBuf::from(&project_dir);
 
-        if project_dir.is_empty() || project_dir == home_dir || project_path_buf.parent().is_none()
+        if project_dir.is_empty()
+            || home_dir.as_deref() == Some(project_path_buf.as_path())
+            || project_path_buf.parent().is_none()
         {
             eprintln!(
                 "Refusing to auto-initialize codebroker in home or root directory to prevent massive indexing."
@@ -1843,13 +1803,17 @@ Treat native tools as the repository's implementation layer."#;
                                 } else if !std::path::Path::new(path).exists() {
                                     format!("Error: Path '{}' does not exist.", path)
                                 } else {
-                                    if let Ok(home) = std::env::var("HOME") {
-                                        let active_file = format!("{}/.codebroker/active_project", home);
-                                        std::fs::create_dir_all(format!("{}/.codebroker", home)).unwrap_or_default();
+                                    if let Some(codebroker_dir) = runtime::environment::codebroker_dir() {
+                                        let active_file = codebroker_dir.join("active_project");
+                                        std::fs::create_dir_all(&codebroker_dir).unwrap_or_default();
                                         if let Err(e) = std::fs::write(&active_file, path) {
                                             format!("Error saving workspace: {}", e)
                                         } else {
-                                            let new_db_path = format!("{}/.codebroker/codebroker.db", path);
+                                            let new_db_path = std::path::Path::new(path)
+                                                .join(".codebroker")
+                                                .join("codebroker.db")
+                                                .to_string_lossy()
+                                                .to_string();
                                             if std::path::Path::new(&new_db_path).exists() {
                                                 let staleness_note = match storage::Database::new(&new_db_path) {
                                                     Ok(db) => match db.count_stale_files(2000) {
@@ -1870,7 +1834,7 @@ Treat native tools as the repository's implementation layer."#;
                                             }
                                         }
                                     } else {
-                                        "Error: HOME environment variable not set.".to_string()
+                                        "Error: Could not determine the user's home directory (checked HOME, USERPROFILE, HOMEDRIVE+HOMEPATH).".to_string()
                                     }
                                 }
                             }
@@ -1894,7 +1858,11 @@ Treat native tools as the repository's implementation layer."#;
                                     };
                                     match index_result {
                                         Ok(_) => {
-                                            let reindexed_db_path = format!("{}/.codebroker/codebroker.db", project_dir);
+                                            let reindexed_db_path = std::path::Path::new(&project_dir)
+                                                .join(".codebroker")
+                                                .join("codebroker.db")
+                                                .to_string_lossy()
+                                                .to_string();
                                             match storage::Database::new(&reindexed_db_path) {
                                                 Ok(db) => match query::engine::build_project_overview(&db) {
                                                     Ok(overview) => format!(

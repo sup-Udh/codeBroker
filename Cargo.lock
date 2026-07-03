@@ -329,7 +329,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "analytics",
  "clap",
@@ -342,6 +342,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest 0.13.4",
+ "runtime",
  "rusqlite",
  "self-replace",
  "self_update",
@@ -1438,6 +1439,7 @@ dependencies = [
  "indexer",
  "query",
  "resolver",
+ "runtime",
  "rusqlite",
  "semantic",
  "serde",
@@ -1993,6 +1995,13 @@ checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
 dependencies = [
  "hashbrown 0.16.1",
  "thiserror",
+]
+
+[[package]]
+name = "runtime"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

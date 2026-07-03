@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $Repo = "sup-Udh/codeBroker"
 $BinDir = "$env:USERPROFILE\.codebroker\bin"
 $ExeName = "codebroker.exe"
+$McpExeName = "codebroker-mcp.exe"
 $AssetName = "codebroker-windows-x86_64.zip"
 
 Write-Host "Installing CodeBroker..." -ForegroundColor Cyan
@@ -32,16 +33,20 @@ Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip
 Write-Host "Extracting..."
 Expand-Archive -Path $TempZip -DestinationPath $TempExtracted -Force
 
-# Move the executable
+# Move the executables
 $SourceExe = Join-Path -Path $TempExtracted -ChildPath $ExeName
 $DestExe = Join-Path -Path $BinDir -ChildPath $ExeName
 Move-Item -Path $SourceExe -Destination $DestExe -Force
+
+$SourceMcpExe = Join-Path -Path $TempExtracted -ChildPath $McpExeName
+$DestMcpExe = Join-Path -Path $BinDir -ChildPath $McpExeName
+Move-Item -Path $SourceMcpExe -Destination $DestMcpExe -Force
 
 # Cleanup temp files
 Remove-Item -Path $TempZip -Force | Out-Null
 Remove-Item -Path $TempExtracted -Recurse -Force | Out-Null
 
-Write-Host "Successfully installed $ExeName to $BinDir" -ForegroundColor Green
+Write-Host "Successfully installed $ExeName and $McpExeName to $BinDir" -ForegroundColor Green
 
 # Add to PATH if not already there
 $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")

@@ -15,6 +15,7 @@ semantic = { path = "../semantic" }
 analytics = { path = "../analytics" }
 resolver = { path = "../resolver" }
 indexer = { path = "../indexer" }
+runtime = { path = "../runtime" }
 chrono = "0.4.45"
 rusqlite = "0.40.1"
 

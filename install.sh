@@ -4,6 +4,7 @@ set -e
 REPO="sup-Udh/codeBroker"
 BIN_DIR="$HOME/.codebroker/bin"
 EXE_NAME="codebroker"
+MCP_EXE_NAME="codebroker-mcp"
 
 echo "Installing CodeBroker..."
 
@@ -40,9 +41,10 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 curl -sL "$DOWNLOAD_URL" -o "$TMP_DIR/$ASSET_NAME"
 tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
 mv "$TMP_DIR/$EXE_NAME" "$BIN_DIR/$EXE_NAME"
-chmod +x "$BIN_DIR/$EXE_NAME"
+mv "$TMP_DIR/$MCP_EXE_NAME" "$BIN_DIR/$MCP_EXE_NAME"
+chmod +x "$BIN_DIR/$EXE_NAME" "$BIN_DIR/$MCP_EXE_NAME"
 
-echo "Successfully installed $EXE_NAME to $BIN_DIR"
+echo "Successfully installed $EXE_NAME and $MCP_EXE_NAME to $BIN_DIR"
 
 # Check if it's in PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
