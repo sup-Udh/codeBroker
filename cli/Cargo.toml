@@ -22,6 +22,7 @@ graph = { version = "0.1.0", path = "../graph" }
 graph_diagnostics = { path = "../graph_diagnostics" }
 rayon = "1.10"
 indicatif = "0.17"
+self_update = { version = "0.44.0", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 
 [[bin]]
 name = "codebroker"
