@@ -1109,11 +1109,7 @@ fn main() {
                 .to_string_lossy()
                 .to_string();
 
-            let new_arg = if std::env::consts::OS == "windows" {
-                format!("cd /d \"{}\" && codebroker-mcp", current_dir)
-            } else {
-                format!("cd \"{}\" && codebroker-mcp", current_dir)
-            };
+            let codebroker_cmd = "codebroker-mcp";
 
             // 2. Paths to configs
             let home_dir = std::env::var("HOME")
@@ -1159,17 +1155,19 @@ fn main() {
                         .as_object_mut()
                         .unwrap();
                     
-                    let cmd_name = if std::env::consts::OS == "windows" { "cmd" } else { "bash" };
-                    let shell_flag = if std::env::consts::OS == "windows" { "/C" } else { "-c" };
-                    
-                    codebroker.insert("command".to_string(), serde_json::Value::String(cmd_name.to_string()));
-                    codebroker.insert("args".to_string(), serde_json::json!([shell_flag, new_arg]));
+                    codebroker.insert("command".to_string(), serde_json::Value::String(codebroker_cmd.to_string()));
+                    codebroker.insert("args".to_string(), serde_json::json!([]));
 
-                    if !openai_key.is_empty() {
-                        let env_map = codebroker
-                            .entry("env")
-                            .or_insert_with(|| serde_json::json!({}));
-                        if let Some(env_obj) = env_map.as_object_mut() {
+                    let env_map = codebroker
+                        .entry("env")
+                        .or_insert_with(|| serde_json::json!({}));
+                    
+                    if let Some(env_obj) = env_map.as_object_mut() {
+                        env_obj.insert(
+                            "CODEBROKER_WORKSPACE".to_string(),
+                            serde_json::Value::String(current_dir.clone()),
+                        );
+                        if !openai_key.is_empty() {
                             env_obj.insert(
                                 "OPENAI_API_KEY".to_string(),
                                 serde_json::Value::String(openai_key.clone()),

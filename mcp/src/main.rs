@@ -60,8 +60,13 @@ fn resolve_workspace() -> ResolvedWorkspace {
     // No active_project pointer has ever been set: fall back to CWD.
     let cwd_db = ".codebroker/codebroker.db".to_string();
     let exists = std::path::Path::new(&cwd_db).exists();
-    let project_root = std::env::current_dir()
-        .unwrap_or_default()
+    let project_root = std::env::var("CODEBROKER_WORKSPACE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().expect("Failed to get current dir"));
+
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or(project_root)
         .to_string_lossy()
         .to_string();
     ResolvedWorkspace {
