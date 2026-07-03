@@ -1112,8 +1112,22 @@ fn main() {
             let new_arg = format!("cd {} && codebroker-mcp", current_dir);
 
             // 2. Paths to configs
-            let home_dir = std::env::var("HOME").unwrap_or_default();
-            let claude_path = format!("{}/.config/Claude/claude_desktop_config.json", home_dir);
+            let home_dir = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+
+            let claude_path = match std::env::consts::OS {
+                "windows" => format!(
+                    "{}\\Claude\\claude_desktop_config.json",
+                    std::env::var("APPDATA").unwrap_or_default()
+                ),
+                "macos" | "darwin" => format!(
+                    "{}/Library/Application Support/Claude/claude_desktop_config.json",
+                    home_dir
+                ),
+                _ => format!("{}/.config/Claude/claude_desktop_config.json", home_dir),
+            };
+
             let gemini_path = format!("{}/.gemini/config/mcp_config.json", home_dir);
 
             let paths_to_update = vec![claude_path, gemini_path];
