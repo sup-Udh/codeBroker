@@ -72,10 +72,12 @@ jobs:
         with:
           path: artifacts
 
-      - name: Generate latest_version.txt and flatten
+      - name: Generate latest_version.txt, copy scripts, and flatten
         run: |
           VERSION=$(grep -m1 '^version = ' cli/Cargo.toml | cut -d '"' -f 2)
           echo "$VERSION" > artifacts/latest_version.txt
+          cp install.sh artifacts/
+          cp install.ps1 artifacts/
           find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
           find artifacts -mindepth 1 -type d -empty -delete
 
