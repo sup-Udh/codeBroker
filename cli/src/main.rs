@@ -579,12 +579,28 @@ fn main() {
                 return;
             }
 
-            if latest_version == current_version {
+            // A binary that self-updated *before* this check existed would
+            // have replaced itself and stopped, never copying the sibling
+            // codebroker-mcp binary out of the archive — so "versions match"
+            // alone isn't sufficient to skip: also re-run if that sibling
+            // binary is missing from disk, so a stuck install can self-heal
+            // on the very next `codebroker update` instead of needing a
+            // fresh install.sh/install.ps1 run.
+            let mcp_missing = runtime::executables::find_mcp_binary().is_err();
+
+            if latest_version == current_version && !mcp_missing {
                 println!("You are already on the latest version ({}).", current_version);
                 return;
             }
 
-            println!("New version found: {}. Updating...", latest_version);
+            if latest_version == current_version {
+                println!(
+                    "Already on version {}, but codebroker-mcp is missing locally — re-downloading to install it.",
+                    current_version
+                );
+            } else {
+                println!("New version found: {}. Updating...", latest_version);
+            }
 
             // Determine OS and Arch
             let os = std::env::consts::OS;
