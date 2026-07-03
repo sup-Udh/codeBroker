@@ -74,12 +74,14 @@ jobs:
 
       - name: Generate latest_version.txt, copy scripts, and flatten
         run: |
+          mkdir -p artifacts_flat
+          cp install.sh artifacts_flat/
+          cp install.ps1 artifacts_flat/
           VERSION=$(grep -m1 '^version = ' cli/Cargo.toml | cut -d '"' -f 2)
-          echo "$VERSION" > artifacts/latest_version.txt
-          cp install.sh artifacts/
-          cp install.ps1 artifacts/
-          find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
-          find artifacts -mindepth 1 -type d -empty -delete
+          echo "$VERSION" > artifacts_flat/latest_version.txt
+          find artifacts -type f -exec mv -n {} artifacts_flat/ \;
+          rm -rf artifacts
+          mv artifacts_flat artifacts
 
       - name: Upload to R2
         env:
