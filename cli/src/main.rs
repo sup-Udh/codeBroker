@@ -1109,7 +1109,14 @@ fn main() {
                 .to_string_lossy()
                 .to_string();
 
-            let codebroker_cmd = "codebroker-mcp";
+            let current_exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("codebroker"));
+            let bin_dir = current_exe.parent().unwrap_or_else(|| std::path::Path::new(""));
+            let mcp_binary = if std::env::consts::OS == "windows" {
+                "codebroker-mcp.exe"
+            } else {
+                "codebroker-mcp"
+            };
+            let codebroker_cmd = bin_dir.join(mcp_binary).to_string_lossy().replace("\\\\", "\\").to_string();
 
             // 2. Paths to configs
             let home_dir = std::env::var("HOME")
