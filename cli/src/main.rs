@@ -1128,7 +1128,10 @@ fn main() {
                 _ => format!("{}/.config/Claude/claude_desktop_config.json", home_dir),
             };
 
-            let gemini_path = format!("{}/.gemini/config/mcp_config.json", home_dir);
+            let gemini_path = match std::env::consts::OS {
+                "windows" => format!("{}\\.gemini\\config\\mcp_config.json", home_dir),
+                _ => format!("{}/.gemini/config/mcp_config.json", home_dir),
+            };
 
             let paths_to_update = vec![claude_path, gemini_path];
 
