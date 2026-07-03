@@ -131,7 +131,7 @@ fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str 
 /// so that `search_codebase`, `subsystem_stats`, and `generate_context_capsule`
 /// all call one function instead of each inlining the same OpenAI round-trips.
 fn prepare_semantic_context(query: &str) -> (Vec<String>, Option<Vec<f32>>, bool) {
-    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
     if openai_key.is_empty() {
         return (vec![], None, false);
     }
@@ -1479,7 +1479,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 let fwd = context.as_ref().map(|c| c.fetch_forward_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
                                                 let rev = context.as_ref().map(|c| c.fetch_reverse_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
                                                 let total_dependencies = fwd + rev;
-                                                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                                                let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
 
                                                 // Cheap path: below threshold (or no model available) ->
                                                 // deterministic graph-derived output, no LLM call.

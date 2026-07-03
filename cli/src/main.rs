@@ -470,7 +470,7 @@ fn main() {
                 // it's the actual `backfill_missing_embeddings` API calls
                 // (network-bound, can take tens of seconds) that get deferred
                 // to a detached background process after publish, below.
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
                 if !openai_key.is_empty() {
                     pb.set_message("Embedding  —  replaying semantic cache");
                     let t_apply = std::time::Instant::now();
@@ -545,7 +545,7 @@ fn main() {
             // (genuinely new/changed symbols) in a detached background
             // process against the now-published database, instead of
             // blocking this process on OpenAI API calls before returning.
-            if !std::env::var("OPENAI_API_KEY").unwrap_or_default().is_empty() {
+            if !runtime::environment::openai_api_key().unwrap_or_default().is_empty() {
                 if let Ok(exe) = std::env::current_exe() {
                     let _ = std::process::Command::new(exe)
                         .arg("_embed-backfill")
@@ -987,7 +987,7 @@ fn main() {
         }
         Commands::Refresh => {
             let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
-            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
             if openai_key.is_empty() {
                 println!("Error: OPENAI_API_KEY environment variable is not set.");
                 return;
@@ -1009,7 +1009,7 @@ fn main() {
         }
         Commands::Explain { symbol } => {
             let db = storage::Database::new(".codebroker/codebroker.db").expect("DB not found.");
-            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
             if openai_key.is_empty() {
                 println!("Error: OPENAI_API_KEY environment variable is not set.");
                 println!("Please run: export OPENAI_API_KEY=\"sk-your-key\"");
@@ -1105,7 +1105,7 @@ fn main() {
                         Err(e) => println!("Warning: concept tagging failed: {}", e),
                     }
 
-                    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                    let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
                     if !openai_key.is_empty() && !stats.touched_symbol_ids.is_empty() {
                         let provider = semantic::openai::OpenAiProvider::new(openai_key);
                         match semantic::embeddings::backfill_missing_embeddings(
@@ -1140,10 +1140,19 @@ fn main() {
             // real API key into the binary/source. Without one, semantic
             // (LLM-backed) tools fall back to their deterministic paths;
             // discovery/graph tools are unaffected either way.
-            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
             if openai_key.is_empty() {
                 println!(
                     "Warning: OPENAI_API_KEY is not set in this shell — semantic tools (impact_analysis on large symbols, etc.) will be skipped until you set it and re-run `codebroker bind`."
+                );
+            } else if let Err(e) = runtime::environment::persist_openai_api_key(&openai_key) {
+                println!(
+                    "Warning: could not persist OPENAI_API_KEY to ~/.codebroker for future sessions: {}",
+                    e
+                );
+            } else {
+                println!(
+                    "Saved OPENAI_API_KEY to ~/.codebroker/openai_api_key — future commands on this machine won't need it re-exported."
                 );
             }
 
@@ -1744,7 +1753,7 @@ Treat native tools as the repository's implementation layer."#;
             }
         }
         Commands::EmbedBackfill => {
-            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
             if openai_key.is_empty() {
                 return;
             }

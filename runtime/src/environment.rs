@@ -49,9 +49,78 @@ pub fn active_project_path() -> Option<PathBuf> {
     codebroker_dir().map(|d| d.join("active_project"))
 }
 
+/// `~/.codebroker/openai_api_key` — a local, per-machine fallback for the
+/// key so it only has to be set once (via `codebroker bind`) instead of in
+/// every shell session. Deliberately NOT read from anywhere in the repo or
+/// release archive — this file only ever exists on a user's own machine,
+/// written by `bind` itself, never checked in or shipped.
+pub fn openai_api_key_path() -> Option<PathBuf> {
+    codebroker_dir().map(|d| d.join("openai_api_key"))
+}
+
+/// Testable core: env var first, then an already-read file fallback.
+fn openai_api_key_with(env_value: Option<String>, file_contents: Option<String>) -> Option<String> {
+    if let Some(key) = env_value {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    file_contents
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The OpenAI API key to use for semantic tools: `OPENAI_API_KEY` if set in
+/// the current shell, otherwise the per-machine file `bind` persists so the
+/// key doesn't have to be re-exported every session. Never embedded in any
+/// shipped binary or archive — this only ever reads local machine state.
+pub fn openai_api_key() -> Option<String> {
+    let env_value = std::env::var("OPENAI_API_KEY").ok();
+    let file_contents = openai_api_key_path().and_then(|p| std::fs::read_to_string(p).ok());
+    openai_api_key_with(env_value, file_contents)
+}
+
+/// Persists `key` to `~/.codebroker/openai_api_key` so future commands can
+/// pick it up via [`openai_api_key`] without the caller re-exporting it.
+/// No-op (returns `Ok(())`) when `key` is empty, so callers can pass through
+/// an unconditionally-fetched env var without an extra `is_empty()` check.
+pub fn persist_openai_api_key(key: &str) -> std::io::Result<()> {
+    if key.is_empty() {
+        return Ok(());
+    }
+    let dir = codebroker_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "could not determine home directory")
+    })?;
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("openai_api_key"), key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefers_env_value_over_file() {
+        let result = openai_api_key_with(Some("sk-env".to_string()), Some("sk-file".to_string()));
+        assert_eq!(result, Some("sk-env".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_file_when_env_unset() {
+        let result = openai_api_key_with(None, Some("sk-file\n".to_string()));
+        assert_eq!(result, Some("sk-file".to_string()));
+    }
+
+    #[test]
+    fn empty_env_value_falls_back_to_file() {
+        let result = openai_api_key_with(Some(String::new()), Some("sk-file".to_string()));
+        assert_eq!(result, Some("sk-file".to_string()));
+    }
+
+    #[test]
+    fn none_when_neither_set() {
+        assert_eq!(openai_api_key_with(None, None), None);
+    }
 
     #[test]
     fn prefers_home_over_userprofile() {
