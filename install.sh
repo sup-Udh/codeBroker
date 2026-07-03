@@ -37,7 +37,7 @@ mkdir -p "$BIN_DIR"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-curl -sL "$LATEST_URL" -o "$TMP_DIR/$ASSET_NAME"
+curl -sL "$DOWNLOAD_URL" -o "$TMP_DIR/$ASSET_NAME"
 tar -xzf "$TMP_DIR/$ASSET_NAME" -C "$TMP_DIR"
 mv "$TMP_DIR/$EXE_NAME" "$BIN_DIR/$EXE_NAME"
 chmod +x "$BIN_DIR/$EXE_NAME"
