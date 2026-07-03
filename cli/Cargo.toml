@@ -23,6 +23,9 @@ graph_diagnostics = { path = "../graph_diagnostics" }
 rayon = "1.10"
 indicatif = "0.17"
 self_update = { version = "0.44.0", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+reqwest = { version = "0.13.4", features = ["blocking"] }
+tempfile = "3.27.0"
+self-replace = "1.5.0"
 
 [[bin]]
 name = "codebroker"

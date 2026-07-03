@@ -25,19 +25,13 @@ case "${ARCH}" in
     *)          echo "Unsupported architecture: ${ARCH}"; exit 1;;
 esac
 
+R2_URL="https://pub-aa0624d820a7465aa2d7388f8ad39d1b.r2.dev"
+
 # Formulate asset name based on github actions workflow
 ASSET_NAME="codebroker-${OS_NAME}-${ARCH_NAME}.tar.gz"
+DOWNLOAD_URL="${R2_URL}/${ASSET_NAME}"
 
-# Fetch latest release data from GitHub API
-LATEST_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url.*$ASSET_NAME" | cut -d '"' -f 4)
-
-if [ -z "$LATEST_URL" ]; then
-    echo "Could not find a release for ${OS_NAME} ${ARCH_NAME}."
-    echo "Please check https://github.com/$REPO/releases"
-    exit 1
-fi
-
-echo "Downloading latest release: $LATEST_URL"
+echo "Downloading latest release: $DOWNLOAD_URL"
 
 mkdir -p "$BIN_DIR"
 TMP_DIR=$(mktemp -d)

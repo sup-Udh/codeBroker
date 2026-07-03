@@ -60,7 +60,7 @@ jobs:
           path: ${{ matrix.archive_name }}
 
   release:
-    name: Create Release
+    name: Upload to Cloudflare R2
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -72,11 +72,18 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/**/*.tar.gz
-            artifacts/**/*.zip
+      - name: Generate latest_version.txt and flatten
+        run: |
+          VERSION=$(grep -m1 '^version = ' cli/Cargo.toml | cut -d '"' -f 2)
+          echo "$VERSION" > artifacts/latest_version.txt
+          find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
+          find artifacts -mindepth 1 -type d -empty -delete
+
+      - name: Upload to R2
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3 sync artifacts/ s3://${{ secrets.R2_BUCKET_NAME }}/ \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com

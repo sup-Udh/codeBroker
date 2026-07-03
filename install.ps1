@@ -7,29 +7,8 @@ $AssetName = "codebroker-windows-x86_64.zip"
 
 Write-Host "Installing CodeBroker..." -ForegroundColor Cyan
 
-# Fetch latest release data from GitHub API
-$ApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-Write-Host "Querying latest release from $ApiUrl"
-try {
-    $ReleaseData = Invoke-RestMethod -Uri $ApiUrl -ErrorAction Stop
-} catch {
-    Write-Host "Failed to fetch release data. Please check your internet connection and GitHub API limits." -ForegroundColor Red
-    exit 1
-}
-
-$DownloadUrl = $null
-foreach ($Asset in $ReleaseData.assets) {
-    if ($Asset.name -eq $AssetName) {
-        $DownloadUrl = $Asset.browser_download_url
-        break
-    }
-}
-
-if ($null -eq $DownloadUrl) {
-    Write-Host "Could not find a release for Windows x86_64." -ForegroundColor Red
-    Write-Host "Please check https://github.com/$Repo/releases" -ForegroundColor Red
-    exit 1
-}
+$R2Url = "https://pub-aa0624d820a7465aa2d7388f8ad39d1b.r2.dev"
+$DownloadUrl = "$R2Url/$AssetName"
 
 Write-Host "Downloading latest release: $DownloadUrl"
 

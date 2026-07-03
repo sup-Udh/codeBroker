@@ -65,6 +65,8 @@ enum Commands {
     PrepareContext {
         target: String,
     },
+    /// Updates the CodeBroker CLI to the latest release
+    Update,
     /// Internal: backfills missing symbol embeddings against the already-
     /// published database. Spawned as a detached background process by
     /// `init` so semantic-search embedding calls (network-bound, can take
@@ -557,6 +559,80 @@ fn main() {
             if show_timing {
                 eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
             }
+        }
+        Commands::Update => {
+            println!("Checking for updates...");
+            let r2_url = "https://pub-aa0624d820a7465aa2d7388f8ad39d1b.r2.dev";
+            let latest_version_url = format!("{}/latest_version.txt", r2_url);
+            
+            let latest_version = match reqwest::blocking::get(&latest_version_url) {
+                Ok(resp) => resp.text().unwrap_or_default().trim().to_string(),
+                Err(e) => {
+                    println!("Failed to check for updates. Could not reach update server: {}", e);
+                    return;
+                }
+            };
+
+            let current_version = env!("CARGO_PKG_VERSION");
+            if latest_version.is_empty() {
+                println!("Failed to parse the latest version from the server.");
+                return;
+            }
+
+            if latest_version == current_version {
+                println!("You are already on the latest version ({}).", current_version);
+                return;
+            }
+
+            println!("New version found: {}. Updating...", latest_version);
+
+            // Determine OS and Arch
+            let os = std::env::consts::OS;
+            let arch = std::env::consts::ARCH;
+            
+            let os_name = match os {
+                "linux" => "linux",
+                "macos" | "darwin" => "macos",
+                "windows" => "windows",
+                _ => { println!("Unsupported OS for auto-update."); return; }
+            };
+
+            let arch_name = match arch {
+                "x86_64" => "x86_64",
+                "aarch64" => "aarch64",
+                _ => { println!("Unsupported architecture for auto-update."); return; }
+            };
+
+            let ext = if os == "windows" { "zip" } else { "tar.gz" };
+            let asset_name = format!("codebroker-{}-{}.{}", os_name, arch_name, ext);
+            let download_url = format!("{}/{}", r2_url, asset_name);
+
+            let tmp_dir = tempfile::Builder::new().prefix("codebroker-update").tempdir().unwrap();
+            let archive_path = tmp_dir.path().join(&asset_name);
+            
+            println!("Downloading {}...", download_url);
+            let mut resp = reqwest::blocking::get(&download_url).unwrap();
+            let mut archive_file = std::fs::File::create(&archive_path).unwrap();
+            std::io::copy(&mut resp, &mut archive_file).unwrap();
+
+            println!("Extracting...");
+            let archive_format = if os == "windows" {
+                self_update::ArchiveKind::Zip
+            } else {
+                self_update::ArchiveKind::Tar(Some(self_update::Compression::Gz))
+            };
+            
+            self_update::Extract::from_source(&archive_path)
+                .archive(archive_format)
+                .extract_into(tmp_dir.path()).unwrap();
+
+            let exe_name = if os == "windows" { "codebroker.exe" } else { "codebroker" };
+            let new_binary = tmp_dir.path().join(exe_name);
+            
+            println!("Replacing executable...");
+            self_replace::self_replace(&new_binary).unwrap();
+            
+            println!("Successfully updated to version {}!", latest_version);
         }
         Commands::Query { text } => {
             // Connect to the existing DB
