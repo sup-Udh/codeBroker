@@ -1109,7 +1109,11 @@ fn main() {
                 .to_string_lossy()
                 .to_string();
 
-            let new_arg = format!("cd {} && codebroker-mcp", current_dir);
+            let new_arg = if std::env::consts::OS == "windows" {
+                format!("cd /d \"{}\" && codebroker-mcp", current_dir)
+            } else {
+                format!("cd \"{}\" && codebroker-mcp", current_dir)
+            };
 
             // 2. Paths to configs
             let home_dir = std::env::var("HOME")
@@ -1136,46 +1140,53 @@ fn main() {
             let paths_to_update = vec![claude_path, gemini_path];
 
             for path in paths_to_update {
-                if let Ok(config_str) = fs::read_to_string(&path) {
-                    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                        if let Some(servers) =
-                            json.get_mut("mcpServers").and_then(|s| s.as_object_mut())
-                        {
-                            if let Some(codebroker) = servers
-                                .get_mut("codebroker")
-                                .and_then(|c| c.as_object_mut())
-                            {
-                                if let Some(args) =
-                                    codebroker.get_mut("args").and_then(|a| a.as_array_mut())
-                                {
-                                    if args.len() >= 2 {
-                                        args[1] = serde_json::Value::String(new_arg.clone());
-                                    }
-                                }
+                let config_str = fs::read_to_string(&path).unwrap_or_else(|_| "{\"mcpServers\": {}}".to_string());
+                
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                    if !json.is_object() {
+                        json = serde_json::json!({"mcpServers": {}});
+                    }
+                    
+                    let servers = json.as_object_mut()
+                        .unwrap()
+                        .entry("mcpServers")
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut()
+                        .unwrap();
+                    
+                    let codebroker = servers.entry("codebroker")
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut()
+                        .unwrap();
+                    
+                    let cmd_name = if std::env::consts::OS == "windows" { "cmd" } else { "bash" };
+                    let shell_flag = if std::env::consts::OS == "windows" { "/C" } else { "-c" };
+                    
+                    codebroker.insert("command".to_string(), serde_json::Value::String(cmd_name.to_string()));
+                    codebroker.insert("args".to_string(), serde_json::json!([shell_flag, new_arg]));
 
-                                // Inject OPENAI_API_KEY (only if we actually have one to give it —
-                                // never write a placeholder/hardcoded secret into a config file).
-                                if !openai_key.is_empty() {
-                                    let env_map = codebroker
-                                        .entry("env")
-                                        .or_insert_with(|| serde_json::json!({}));
-                                    if let Some(env_obj) = env_map.as_object_mut() {
-                                        env_obj.insert(
-                                            "OPENAI_API_KEY".to_string(),
-                                            serde_json::Value::String(openai_key.clone()),
-                                        );
-                                    }
-                                }
-
-                                if let Ok(new_json) = serde_json::to_string_pretty(&json) {
-                                    let _ = fs::write(&path, new_json);
-                                    println!("Successfully bound config at {}", path);
-                                }
-                            }
+                    if !openai_key.is_empty() {
+                        let env_map = codebroker
+                            .entry("env")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(env_obj) = env_map.as_object_mut() {
+                            env_obj.insert(
+                                "OPENAI_API_KEY".to_string(),
+                                serde_json::Value::String(openai_key.clone()),
+                            );
                         }
                     }
-                } else {
-                    println!("Warning: Config not found at {}", path);
+
+                    if let Ok(new_json) = serde_json::to_string_pretty(&json) {
+                        if let Some(parent) = std::path::Path::new(&path).parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        if fs::write(&path, new_json).is_ok() {
+                            println!("Successfully bound config at {}", path);
+                        } else {
+                            println!("Warning: Could not write to config at {}", path);
+                        }
+                    }
                 }
             }
 
@@ -1184,13 +1195,15 @@ fn main() {
             // guards in codebroker-mcp's auto-init hook — each claude session spawns
             // its own subprocess with the project directory as CWD.
 
+            let claude_bin = if std::env::consts::OS == "windows" { "claude.cmd" } else { "claude" };
+
             // Remove first to force a clean re-registration
-            let _ = std::process::Command::new("claude")
+            let _ = std::process::Command::new(claude_bin)
                 .args(&["mcp", "remove", "codebroker", "-s", "user"])
                 .output(); // use output() to suppress stderr noise
 
             // Also clean up any leftover project-scoped .mcp.json entry
-            let _ = std::process::Command::new("claude")
+            let _ = std::process::Command::new(claude_bin)
                 .args(&["mcp", "remove", "codebroker", "-s", "local"])
                 .output();
 
@@ -1205,7 +1218,7 @@ fn main() {
             }
             add_args.push("--");
             add_args.push("codebroker-mcp");
-            let add_status = std::process::Command::new("claude")
+            let add_status = std::process::Command::new(claude_bin)
                 .args(&add_args)
                 .status();
 
