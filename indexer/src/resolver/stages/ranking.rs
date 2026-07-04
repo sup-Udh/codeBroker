@@ -33,8 +33,13 @@ impl ResolutionStage for RankingStage {
             context.resolve_with(self.stage_type(), state, reason, None);
             return Ok(());
         } else if context.candidates.len() == 1 {
-            let state = context.candidates[0].state.clone();
-            context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
+            let winning_id = context.candidates[0].symbol_id;
+            if Some(winning_id) == context.ir.enclosing_symbol_id {
+                context.resolve_with(self.stage_type(), ResolutionState::Recursive, DecisionReason::RecursiveRelationship, None);
+            } else {
+                let state = context.candidates[0].state.clone();
+                context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
+            }
             return Ok(());
         } else {
             context.candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
@@ -43,8 +48,13 @@ impl ResolutionStage for RankingStage {
                 context.resolve_with(self.stage_type(), ResolutionState::Ambiguous, DecisionReason::MultipleCandidates, None);
                 return Ok(());
             } else {
-                let state = context.candidates[0].state.clone();
-                context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
+                let winning_id = context.candidates[0].symbol_id;
+                if Some(winning_id) == context.ir.enclosing_symbol_id {
+                    context.resolve_with(self.stage_type(), ResolutionState::Recursive, DecisionReason::RecursiveRelationship, None);
+                } else {
+                    let state = context.candidates[0].state.clone();
+                    context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
+                }
                 return Ok(());
             }
         }

@@ -346,6 +346,40 @@ fn emit_semantic_bindings(
 ) -> Vec<graph::SemanticBinding> {
     let mut bindings = Vec::new();
 
+    // ── Variable assignments from constructors: const x = new Foo() ────────
+    let q_var_type = "
+        (lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
+        (variable_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
+        (assignment_expression left: (identifier) @var_name right: (new_expression constructor: (identifier) @type_name))
+        (assignment_expression left: (member_expression object: (this) property: (property_identifier) @var_name) right: (new_expression constructor: (identifier) @type_name))
+    ";
+    if let Ok(query) = Query::new(language, q_var_type) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut var_name = String::new();
+            let mut type_name = String::new();
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    match *cn {
+                        "var_name" => var_name = text.trim().to_string(),
+                        "type_name" => type_name = text.trim().to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            if !var_name.is_empty() && !type_name.is_empty() {
+                bindings.push(graph::SemanticBinding {
+                    kind: graph::SemanticBindingKind::VarType,
+                    name: var_name,
+                    type_name,
+                    context: None,
+                });
+            }
+        }
+    }
+
     // ── Alias assignments: const x = y (bare identifier RHS) ────────────────
     let q_alias = "
         (lexical_declaration (variable_declarator name: (identifier) @alias_name value: (identifier) @source_name))

@@ -165,16 +165,15 @@ impl VariableFlowEngine {
                     }
                 } else if k == "calls" || k == "method_call" {
                     if let Some(var_name) = source {
-                        let ret_type = self.function_returns.get(&name).cloned();
-                        if let Some(ret_type) = ret_type {
-                            let var = self.get_or_create_var(file_id, &var_name);
-                            var.apply_type(
-                                ret_type,
-                                VariableOrigin::ReturnValue,
-                                ResolutionConfidence::Medium,
-                                ResolutionEvidence::ReturnFlow,
-                            );
-                        }
+                        // Fallback to the function/method name as a provisional type if we don't know the exact return type
+                        let ret_type = self.function_returns.get(&name).cloned().unwrap_or_else(|| name.clone());
+                        let var = self.get_or_create_var(file_id, &var_name);
+                        var.apply_type(
+                            ret_type,
+                            VariableOrigin::ReturnValue,
+                            ResolutionConfidence::Medium,
+                            ResolutionEvidence::ReturnFlow,
+                        );
                     }
                 }
             }
@@ -186,7 +185,7 @@ impl VariableFlowEngine {
         let mut file_bindings: HashMap<i64, Vec<(String, String, SemanticBindingKind)>> = HashMap::new();
         if let Ok(all_bindings) = db.get_all_semantic_bindings() {
             for (file_id, binding) in all_bindings {
-                if matches!(binding.kind, SemanticBindingKind::Alias | SemanticBindingKind::Destructuring | SemanticBindingKind::ObjectLiteral) {
+                if matches!(binding.kind, SemanticBindingKind::Alias | SemanticBindingKind::Destructuring | SemanticBindingKind::ObjectLiteral | SemanticBindingKind::Assignment) {
                     file_bindings.entry(file_id).or_default().push((binding.name, binding.type_name, binding.kind));
                 }
             }
@@ -222,6 +221,17 @@ impl VariableFlowEngine {
                                     if let Some(src_type) = &field_var.inferred_type {
                                         updates.push((name.clone(), src_type.clone(), VariableOrigin::Destructuring, ResolutionEvidence::Destructuring));
                                     }
+                                }
+                            }
+                        }
+                        SemanticBindingKind::Assignment => {
+                            let has_type = self.get_var(file_id, name).and_then(|v| v.inferred_type.clone()).is_some();
+                            if !has_type {
+                                if let Some(ret_type) = self.function_returns.get(source_name).cloned() {
+                                    updates.push((name.clone(), ret_type, VariableOrigin::ReturnValue, ResolutionEvidence::ReturnFlow));
+                                } else {
+                                    // Provisional fallback to function name
+                                    updates.push((name.clone(), source_name.clone(), VariableOrigin::ReturnValue, ResolutionEvidence::ReturnFlow));
                                 }
                             }
                         }

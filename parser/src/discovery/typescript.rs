@@ -460,12 +460,15 @@ fn emit_semantic_bindings(
 ) -> Vec<SemanticBinding> {
     let mut bindings = Vec::new();
 
-    // ── Variable type annotations: const x: Type = ... (plain and generic) ────
     let q_var_type = "
         (lexical_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (type_identifier) @type_name)))
         (variable_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (type_identifier) @type_name)))
         (lexical_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (generic_type name: (type_identifier) @type_name))))
         (variable_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (generic_type name: (type_identifier) @type_name))))
+        (lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
+        (variable_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
+        (assignment_expression left: (identifier) @var_name right: (new_expression constructor: (identifier) @type_name))
+        (assignment_expression left: (member_expression object: (this) property: (property_identifier) @var_name) right: (new_expression constructor: (identifier) @type_name))
     ";
     if let Ok(query) = Query::new(language, q_var_type) {
         let mut cursor = QueryCursor::new();
