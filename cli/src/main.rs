@@ -49,6 +49,8 @@ enum Commands {
     Inspect {
         relationship_id: i64,
     },
+    /// Validates Repository Capability (Tool Agreements & Graph Completeness)
+    ValidateTools,
     /// Analyzes the resolution pipeline and outputs aggregate statistics
     AnalyzeResolution,
     /// Prints a high-level summary of the project
@@ -837,6 +839,36 @@ fn main() {
                     eprintln!("Error: Relationship ID {} not found.", relationship_id);
                     std::process::exit(1);
                 }
+            }
+        }
+        Commands::ValidateTools => {
+            let db = storage::Database::new(".codebroker/codebroker.db").expect("Database must be initialized. Run `codebroker init` first.");
+            let report = graph_diagnostics::engine::run_diagnostics(&db).expect("Failed to run diagnostics");
+            
+            println!("\nRepository Capability Report");
+            println!("============================");
+            
+            // Extract retrieval stage report specifically
+            let mut found = false;
+            for stage in &report.stages {
+                if let graph_diagnostics::traits::PipelineStage::Retrieval = stage.stage {
+                    found = true;
+                    let mut keys: Vec<&String> = stage.metrics.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        println!("{:<25} {:.1}%", key, stage.metrics[key]);
+                    }
+                    
+                    if !stage.findings.is_empty() {
+                        println!("\nWarnings & Errors:");
+                        for finding in &stage.findings {
+                            println!("- [{:?}] {}: {}", finding.severity, finding.title, finding.description);
+                        }
+                    }
+                }
+            }
+            if !found {
+                println!("No retrieval report found.");
             }
         }
         Commands::AnalyzeResolution => {

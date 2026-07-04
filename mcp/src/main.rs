@@ -1,3 +1,6 @@
+pub mod contracts;
+pub mod tools;
+
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 
@@ -1734,45 +1737,26 @@ Treat native tools as the repository's implementation layer."#;
                                 } else {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
-                                            // Every target name goes through the shared resolver
-                                            // exactly once. Ambiguous/NotFound names are reported
-                                            // back verbatim (the resolver's own rendering) instead
-                                            // of this tool re-deriving its own ambiguity JSON;
-                                            // confidently-resolved names carry forward their
-                                            // now-unambiguous file hint to the actual source read.
-                                            let mut problems: Vec<serde_json::Value> = Vec::new();
-                                            let mut resolved_targets: Vec<(String, Option<String>)> = Vec::new();
+                                            // The new Phase 20 architecture:
+                                            let mut combined_results = Vec::new();
                                             for symbol in &targets {
-                                                match resolver::resolve_symbol(&db, symbol, file_hint, None, None) {
-                                                    resolver::ResolvedEntity::Symbol(s) => {
-                                                        let hint = relative_hint(&db, &s.file_path).to_string();
-                                                        resolved_targets.push((s.name, Some(hint)));
-                                                    }
-                                                    other => problems.push(other.to_json()),
-                                                }
-                                            }
-                                            if !problems.is_empty() {
-                                                serde_json::json!({ "unresolved": true, "results": problems }).to_string()
-                                            } else {
-                                                let mut combined_results = Vec::new();
-                                                let mut has_error = false;
-                                                let mut err_msg = String::new();
-                                                for (symbol, hint) in resolved_targets {
-                                                    match query::retrieval::read_symbol_source_scoped(&db, &symbol, include_deps, hint.as_deref()) {
-                                                        Ok(results) => combined_results.extend(results),
-                                                        Err(e) => {
-                                                            has_error = true;
-                                                            err_msg = format!("Error reading source for {}: {}", symbol, e);
-                                                            break;
-                                                        }
+                                                let result = tools::read_symbol_source::ReadSymbolSource::execute(
+                                                    &db,
+                                                    symbol,
+                                                    file_hint,
+                                                    include_deps,
+                                                );
+                                                // If it's a JSON array (from our tool), accumulate it. Otherwise, it's an error.
+                                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&result) {
+                                                    if let Some(arr) = json_val.as_array() {
+                                                        combined_results.extend(arr.clone());
+                                                    } else {
+                                                        // It's an error object (like Ambiguous or NotFound)
+                                                        combined_results.push(json_val);
                                                     }
                                                 }
-                                                if has_error {
-                                                    err_msg
-                                                } else {
-                                                    serde_json::to_string_pretty(&combined_results).unwrap_or_default()
-                                                }
                                             }
+                                            serde_json::to_string_pretty(&combined_results).unwrap_or_default()
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
                                     }

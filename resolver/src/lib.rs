@@ -21,8 +21,12 @@
 
 pub mod pipeline;
 pub mod types;
+pub mod naming;
+pub mod universal;
 
 pub use pipeline::{resolve_any, resolve_path, resolve_search, resolve_subsystem, resolve_symbol};
+pub use naming::CanonicalNameResolver;
+pub use universal::UniversalResolver;
 pub use types::{
     AmbiguousMatch, Candidate, Confidence, ConfidenceLabel, EntityType, NotFound,
     ResolvedDirectory, ResolvedEntity, ResolvedFeature, ResolvedFile, ResolvedSubsystem,

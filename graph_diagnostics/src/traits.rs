@@ -18,6 +18,7 @@ pub enum PipelineStage {
     Retrieval,
     Consistency,
     DeveloperIntelligence,
+    Completeness,
 }
 
 impl std::fmt::Display for PipelineStage {
@@ -36,6 +37,7 @@ impl std::fmt::Display for PipelineStage {
             PipelineStage::Retrieval => write!(f, "Retrieval"),
             PipelineStage::Consistency => write!(f, "Consistency"),
             PipelineStage::DeveloperIntelligence => write!(f, "Developer Intelligence"),
+            PipelineStage::Completeness => write!(f, "Completeness"),
         }
     }
 }

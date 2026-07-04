@@ -8,6 +8,7 @@ pub mod resolution_quality;
 pub mod graph;
 pub mod feature_extraction;
 pub mod semantic_index;
+pub mod completeness;
 pub mod retrieval;
 pub mod consistency;
 pub mod version;

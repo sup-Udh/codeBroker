@@ -112,15 +112,20 @@ pub struct Candidate {
     pub kind: String,
     pub file_path: String,
     pub start_line: i64,
+    pub start_byte: i64,
+    pub end_byte: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedSymbol {
+    pub id: i64,
     pub name: String,
     pub kind: String,
     pub file_path: String,
     pub start_line: i64,
     pub end_line: i64,
+    pub start_byte: i64,
+    pub end_byte: i64,
     pub is_entrypoint: bool,
     pub confidence: Confidence,
 }

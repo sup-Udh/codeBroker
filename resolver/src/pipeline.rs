@@ -46,6 +46,8 @@ struct SymbolRow {
     kind: String,
     start_line: i64,
     end_line: i64,
+    start_byte: i64,
+    end_byte: i64,
     path: String,
     is_entrypoint: bool,
 }
@@ -58,7 +60,7 @@ fn query_symbols_by_name(
 ) -> rusqlite::Result<Vec<SymbolRow>> {
     let sql = format!(
         "SELECT symbols.id, symbols.name, symbols.kind, symbols.start_line, symbols.end_line,
-                files.path, COALESCE(sf.is_entrypoint, 0)
+                symbols.start_byte, symbols.end_byte, files.path, COALESCE(sf.is_entrypoint, 0)
          FROM symbols
          JOIN files ON symbols.file_id = files.id
          LEFT JOIN symbol_features sf ON sf.symbol_id = symbols.id
@@ -75,8 +77,10 @@ fn query_symbols_by_name(
             kind: row.get(2)?,
             start_line: row.get(3)?,
             end_line: row.get(4)?,
-            path: row.get(5)?,
-            is_entrypoint: row.get(6)?,
+            start_byte: row.get(5)?,
+            end_byte: row.get(6)?,
+            path: row.get(7)?,
+            is_entrypoint: row.get(8)?,
         });
     }
     Ok(out)
@@ -95,11 +99,14 @@ fn rows_to_entity(
         1 => {
             let r = &rows[0];
             Some(ResolvedEntity::Symbol(ResolvedSymbol {
+                id: r.id,
                 name: r.name.clone(),
                 kind: r.kind.clone(),
                 file_path: db.resolve_path(&r.path),
                 start_line: r.start_line,
                 end_line: r.end_line,
+                start_byte: r.start_byte,
+                end_byte: r.end_byte,
                 is_entrypoint: r.is_entrypoint,
                 confidence,
             }))
@@ -119,11 +126,14 @@ fn rows_to_entity(
                     before.sort_by_key(|r| std::cmp::Reverse(r.start_line));
                     let r = &before[0];
                     return Some(ResolvedEntity::Symbol(ResolvedSymbol {
+                        id: r.id,
                         name: r.name.clone(),
                         kind: r.kind.clone(),
                         file_path: db.resolve_path(&r.path),
                         start_line: r.start_line,
                         end_line: r.end_line,
+                        start_byte: r.start_byte,
+                        end_byte: r.end_byte,
                         is_entrypoint: r.is_entrypoint,
                         confidence,
                     }));
@@ -143,6 +153,8 @@ fn rows_to_entity(
                         kind: r.kind,
                         file_path: db.resolve_path(&r.path),
                         start_line: r.start_line,
+                        start_byte: r.start_byte,
+                        end_byte: r.end_byte,
                     })
                     .collect(),
                 hint: hint.to_string(),
@@ -229,6 +241,8 @@ fn stage_semantic_symbol(db: &Database, query_vector: Option<&[f32]>) -> Option<
                     kind: kind.clone(),
                     file_path: db.resolve_path(path),
                     start_line: 0,
+                    start_byte: 0,
+                    end_byte: 0,
                 })
                 .collect(),
             hint: "Multiple symbols are equally strong semantic matches. Re-run with `file_path` set to disambiguate.".to_string(),
@@ -254,11 +268,14 @@ fn stage_semantic_symbol(db: &Database, query_vector: Option<&[f32]>) -> Option<
         .unwrap_or((0, 0, false));
 
     Some(ResolvedEntity::Symbol(ResolvedSymbol {
+        id,
         name,
         kind,
         file_path: db.resolve_path(&path),
         start_line,
         end_line,
+        start_byte: 0,
+        end_byte: 0,
         is_entrypoint,
         confidence: Confidence::new(
             (sim.clamp(0.0, 1.0) * 100.0) as u8,
@@ -347,6 +364,8 @@ fn stage_full_path(db: &Database, query: &str) -> Option<ResolvedEntity> {
                     kind: "file".to_string(),
                     file_path: db.resolve_path(p),
                     start_line: 0,
+                    start_byte: 0,
+                    end_byte: 0,
                 })
                 .collect(),
             hint: "Multiple indexed files share this path.".to_string(),
@@ -391,6 +410,8 @@ fn stage_filename(db: &Database, query: &str) -> Option<ResolvedEntity> {
                     kind: "file".to_string(),
                     file_path: db.resolve_path(p),
                     start_line: 0,
+                    start_byte: 0,
+                    end_byte: 0,
                 })
                 .collect(),
             hint:
@@ -493,6 +514,8 @@ fn stage_feature(db: &Database, query: &str) -> Option<ResolvedEntity> {
                 kind: m.symbol_kind,
                 file_path: m.file_path,
                 start_line: 0,
+                start_byte: 0,
+                end_byte: 0,
             })
             .collect(),
         confidence: Confidence::high(85, "Exact domain-concept name match"),

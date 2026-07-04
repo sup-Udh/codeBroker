@@ -18,11 +18,13 @@ use crate::validators::{
     consistency::ConsistencyValidator,
     version::VersionValidator,
     developer_intelligence::DeveloperIntelligenceValidator,
+    completeness::GraphCompletenessValidator,
 };
 
 pub fn run_diagnostics(db: &Database) -> Result<PipelineReport> {
     let validators: Vec<Box<dyn PipelineValidator>> = vec![
         Box::new(VersionValidator),
+        Box::new(GraphCompletenessValidator),
         Box::new(ParserValidator),
         Box::new(SemanticValidator),
         Box::new(FlowValidator),
