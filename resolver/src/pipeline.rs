@@ -20,8 +20,16 @@ const SEMANTIC_THRESHOLD: f32 = 0.35;
 /// Ambiguous instead of arbitrarily picking the marginally-higher one.
 const SEMANTIC_AMBIGUITY_MARGIN: f32 = 0.03;
 
-fn normalize_query_path(q: &str) -> String {
-    q.trim()
+fn normalize_query_path(db: &Database, q: &str) -> String {
+    let mut normalized = q.trim().replace('\\', "/");
+    let root = db.project_root.replace('\\', "/");
+    
+    if normalized.starts_with(&root) {
+        normalized = normalized[root.len()..].to_string();
+    }
+    
+    normalized
+        .trim_start_matches('/')
         .trim_start_matches("./")
         .trim_end_matches('/')
         .to_string()
@@ -314,12 +322,12 @@ fn all_file_paths(db: &Database) -> rusqlite::Result<Vec<String>> {
 /// Exact stored-path match (after normalizing the leading "./" both stored
 /// paths and CodeBroker's own conventions use).
 fn stage_full_path(db: &Database, query: &str) -> Option<ResolvedEntity> {
-    let norm_query = normalize_query_path(query);
+    let norm_query = normalize_query_path(db, query);
     let paths = all_file_paths(db).ok()?;
     let matches: Vec<&String> = paths
         .iter()
         .filter(|p| {
-            let norm_stored = normalize_query_path(p);
+            let norm_stored = normalize_query_path(db, p);
             norm_stored == norm_query
         })
         .collect();
@@ -354,7 +362,7 @@ fn stage_full_path(db: &Database, query: &str) -> Option<ResolvedEntity> {
 /// the same suffix — the resolver now reports `Ambiguous` for that case
 /// instead of guessing.
 fn stage_filename(db: &Database, query: &str) -> Option<ResolvedEntity> {
-    let norm_query = normalize_query_path(query);
+    let norm_query = normalize_query_path(db, query);
     if norm_query.is_empty() {
         return None;
     }
@@ -363,7 +371,7 @@ fn stage_filename(db: &Database, query: &str) -> Option<ResolvedEntity> {
     let matches: Vec<&String> = paths
         .iter()
         .filter(|p| {
-            let norm_stored = normalize_query_path(p);
+            let norm_stored = normalize_query_path(db, p);
             norm_stored.ends_with(&suffix) || norm_stored == norm_query
         })
         .collect();
@@ -395,7 +403,7 @@ fn stage_filename(db: &Database, query: &str) -> Option<ResolvedEntity> {
 /// Directory match: the query is a prefix shared by one or more indexed
 /// files' parent directory.
 fn stage_directory(db: &Database, query: &str) -> Option<ResolvedEntity> {
-    let norm_query = normalize_query_path(query);
+    let norm_query = normalize_query_path(db, query);
     if norm_query.is_empty() {
         return None;
     }
@@ -403,7 +411,7 @@ fn stage_directory(db: &Database, query: &str) -> Option<ResolvedEntity> {
     let paths = all_file_paths(db).ok()?;
     let mut children: Vec<String> = Vec::new();
     for p in &paths {
-        let norm_stored = normalize_query_path(p);
+        let norm_stored = normalize_query_path(db, p);
         let parent = std::path::Path::new(&norm_stored)
             .parent()
             .map(|p| p.to_string_lossy().to_string())

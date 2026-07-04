@@ -644,6 +644,11 @@ fn search_file_contents(
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
     let mut file_rows = file_stmt.query([])?;
 
+    let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+    if query_tokens.is_empty() {
+        return Ok(results);
+    }
+
     let mut files_scanned = 0usize;
     while let Some(row) = file_rows.next()? {
         if files_scanned >= MAX_TEXT_SCAN_FILES || results.len() >= MAX_TEXT_MATCHES {
@@ -663,33 +668,43 @@ fn search_file_contents(
         };
         files_scanned += 1;
 
-        for (idx, line) in content.lines().enumerate() {
-            if results.len() >= MAX_TEXT_MATCHES {
-                break;
+        let content_lower = content.to_lowercase();
+        let is_match = if whole_word {
+            query_tokens.iter().all(|t| contains_whole_word(&content_lower, t))
+        } else {
+            query_tokens.iter().all(|t| content_lower.contains(t))
+        };
+
+        if is_match {
+            let first_token = query_tokens.first().unwrap();
+            let mut preview_line = 1;
+            let mut preview_text = String::new();
+            for (idx, line) in content.lines().enumerate() {
+                if line.to_lowercase().contains(first_token) {
+                    preview_line = idx + 1;
+                    let trimmed = line.trim();
+                    preview_text = if trimmed.len() > 160 {
+                        format!("{}...", trimmed.chars().take(160).collect::<String>())
+                    } else {
+                        trimmed.to_string()
+                    };
+                    break;
+                }
             }
-            let line_lower = line.to_lowercase();
-            let is_match = if whole_word {
-                contains_whole_word(&line_lower, query_lower)
-            } else {
-                line_lower.contains(query_lower)
-            };
-            if is_match {
-                let trimmed = line.trim();
-                let preview = if trimmed.len() > 160 {
-                    format!("{}...", trimmed.chars().take(160).collect::<String>())
-                } else {
-                    trimmed.to_string()
-                };
-                results.push(SearchResult {
-                    path: abs_path.clone(),
-                    name: preview,
-                    kind: "text_match".to_string(),
-                    score: 200,
-                    confidence: "Medium (Content Match)".to_string(),
-                    explanation: format!("Matched literal text in file"),
-                    line: Some((idx + 1) as i64),
-                });
+            if preview_text.is_empty() {
+                let first_line = content.lines().next().unwrap_or("").trim();
+                preview_text = first_line.chars().take(160).collect();
             }
+
+            results.push(SearchResult {
+                path: abs_path.clone(),
+                name: preview_text,
+                kind: "text_match".to_string(),
+                score: 200,
+                confidence: "Medium (Content Match)".to_string(),
+                explanation: format!("Matched literal text in file"),
+                line: Some(preview_line as i64),
+            });
         }
     }
 
