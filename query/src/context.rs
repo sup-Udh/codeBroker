@@ -201,19 +201,43 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_reverse_dependencies(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
-            crate::graph::get_incoming_edges(
+            let mut deps = crate::graph::get_incoming_edges(
                 self.db,
                 id,
                 Some(crate::graph::CANONICAL_DEPENDENCY_EDGES),
-            )
+            )?;
+            deps.extend(crate::graph::get_incoming_edges_min_confidence(
+                self.db,
+                id,
+                crate::graph::RECEIVER_RESOLVED_EDGES,
+                crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
+            )?);
+            deps.sort();
+            deps.dedup();
+            Ok(deps)
         } else {
             Ok(Vec::new())
         }
     }
 
+    /// Calls and receiver-resolved method calls (see `RECEIVER_RESOLVED_EDGES`)
+    /// pointing at `id`, merged and deduplicated.
+    fn fetch_callers_ids(&self, id: i64) -> Result<Vec<String>> {
+        let mut callers = crate::graph::get_incoming_edges(self.db, id, Some(&["calls"]))?;
+        callers.extend(crate::graph::get_incoming_edges_min_confidence(
+            self.db,
+            id,
+            &["method_call"],
+            crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
+        )?);
+        callers.sort();
+        callers.dedup();
+        Ok(callers)
+    }
+
     pub fn fetch_same_file_callers(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
-            let callers = crate::graph::get_incoming_edges(self.db, id, Some(&["calls"]))?;
+            let callers = self.fetch_callers_ids(id)?;
             let mut same_file = Vec::new();
             for c in callers {
                 if let Ok(fid) = self.db.conn.query_row(
@@ -250,11 +274,20 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_forward_dependencies(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
-            crate::graph::get_outgoing_edges(
+            let mut deps = crate::graph::get_outgoing_edges(
                 self.db,
                 id,
                 Some(crate::graph::CANONICAL_DEPENDENCY_EDGES),
-            )
+            )?;
+            deps.extend(crate::graph::get_outgoing_edges_min_confidence(
+                self.db,
+                id,
+                crate::graph::RECEIVER_RESOLVED_EDGES,
+                crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
+            )?);
+            deps.sort();
+            deps.dedup();
+            Ok(deps)
         } else {
             Ok(Vec::new())
         }
@@ -277,7 +310,7 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_callers(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
-            crate::graph::get_incoming_edges(self.db, id, Some(&["calls"]))
+            self.fetch_callers_ids(id)
         } else {
             Ok(Vec::new())
         }
@@ -285,7 +318,16 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_callees(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
-            crate::graph::get_outgoing_edges(self.db, id, Some(&["calls"]))
+            let mut callees = crate::graph::get_outgoing_edges(self.db, id, Some(&["calls"]))?;
+            callees.extend(crate::graph::get_outgoing_edges_min_confidence(
+                self.db,
+                id,
+                &["method_call"],
+                crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
+            )?);
+            callees.sort();
+            callees.dedup();
+            Ok(callees)
         } else {
             Ok(Vec::new())
         }

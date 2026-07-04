@@ -62,7 +62,14 @@ static NODE_BUILTINS: &[&str] = &[
 
 pub struct ClassificationStage;
 
-pub fn classify_import_source(source: &str, name: &str, is_rust: bool, is_js_ts: bool, is_python: bool) -> ResolutionState {
+pub fn classify_import_source(
+    source: &str,
+    name: &str,
+    is_rust: bool,
+    is_js_ts: bool,
+    is_python: bool,
+    python_packages: &std::collections::HashSet<String>,
+) -> ResolutionState {
     if source.starts_with("std::")
         || source.starts_with("core::")
         || source.starts_with("alloc::")
@@ -87,10 +94,21 @@ pub fn classify_import_source(source: &str, name: &str, is_rust: bool, is_js_ts:
         return ResolutionState::ExternalDependency;
     }
 
+    // `@/...` and `~/...` are bundler/tsconfig path aliases (the default
+    // convention in Next.js, Nuxt, and many Vite templates — tsconfig's
+    // `"paths": {"@/*": ["./src/*"]}`), not npm scoped packages: a real
+    // scoped package always has a non-empty scope between `@` and `/`
+    // (`@babel/core`), so a bare `@/foo` is unambiguous. Without this check
+    // every aliased import in an alias-based project was misclassified as
+    // ExternalDependency, which halts MemberResolverStage immediately
+    // instead of ever attempting to resolve the receiver's methods.
+    let is_local_path_alias = source.starts_with("@/") || source.starts_with("~/");
+
     if is_js_ts && !source.is_empty()
         && !source.starts_with("./")
         && !source.starts_with("../")
         && !source.starts_with('/')
+        && !is_local_path_alias
     {
         let base = source.split('/').next().unwrap_or(source);
         let base_trimmed = base.trim_start_matches('@');
@@ -118,9 +136,21 @@ pub fn classify_import_source(source: &str, name: &str, is_rust: bool, is_js_ts:
 
         if PYTHON_STDLIB.contains(&root) {
             return ResolutionState::StandardLibrary;
-        } else {
-            return ResolutionState::ExternalDependency;
         }
+
+        // Python's absolute-import convention (`from services.Foo import Foo`,
+        // the idiomatic default — PEP 8 discourages implicit relative imports)
+        // is syntactically identical to importing a real third-party package.
+        // Only a leading "." distinguishes an explicit relative import, which
+        // is already handled above. Cross-reference against the project's own
+        // package/module names instead of assuming "no leading dot" means
+        // external — otherwise every first-party import in a typical Python
+        // project is misclassified as ExternalDependency.
+        if python_packages.contains(root) {
+            return ResolutionState::RepositorySymbol;
+        }
+
+        return ResolutionState::ExternalDependency;
     }
 
     ResolutionState::RepositorySymbol
@@ -219,7 +249,7 @@ impl ResolutionStage for ClassificationStage {
         }).unwrap_or(false);
         let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
 
-        let state = classify_import_source(source, name, is_rust, is_js_ts, is_python);
+        let state = classify_import_source(source, name, is_rust, is_js_ts, is_python, &context.ctx.symbol_index.python_packages);
         match state {
             ResolutionState::StandardLibrary => {
                 context.resolve_with(

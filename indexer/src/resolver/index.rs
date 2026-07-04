@@ -20,6 +20,14 @@ pub struct SymbolIndex {
     pub file_paths: HashMap<i64, String>,
     /// Maps parent symbol id → child symbol ids for method resolution.
     pub methods_by_parent: HashMap<i64, Vec<i64>>,
+    /// Every path component that appears in an indexed `.py` file's path
+    /// (directory names and bare module filenames, extension stripped).
+    /// Python has no relative-import marker for first-party absolute
+    /// imports the way JS/TS does (`./`) — `from services.Foo import Foo`
+    /// looks identical, syntactically, to importing a third-party package.
+    /// This lets classify_import_source tell "services" (a real local
+    /// package, present in this set) apart from an actual PyPI dependency.
+    pub python_packages: std::collections::HashSet<String>,
 }
 
 impl SymbolIndex {
@@ -95,6 +103,19 @@ impl SymbolIndex {
             });
         }
 
+        let mut python_packages: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in file_paths.values() {
+            if !path.ends_with(".py") {
+                continue;
+            }
+            for component in path.split('/') {
+                if component.is_empty() || component == "." || component == ".." {
+                    continue;
+                }
+                python_packages.insert(component.trim_end_matches(".py").to_string());
+            }
+        }
+
         Ok(Self {
             symbols,
             symbols_by_name,
@@ -102,6 +123,7 @@ impl SymbolIndex {
             parent_map,
             file_paths,
             methods_by_parent,
+            python_packages,
         })
     }
 

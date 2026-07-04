@@ -53,7 +53,66 @@ impl ResolutionStage for MemberResolverStage {
 
         let method_name = context.ir.node.name.clone();
         let chain = ReceiverChain::parse(receiver_raw);
-        
+
+        // Bare `this.method()` / `self.method()` — a direct call on the
+        // enclosing instance, as opposed to `this.field.method()` (handled
+        // below via flow_engine) or `obj.method()` on some other variable.
+        // There's no field to look up a type through, so resolve directly
+        // against the enclosing class using SymbolIndex's containment-based
+        // parent_map, the same one find_method_in_type already relies on.
+        if receiver_raw == "this" || receiver_raw == "self" {
+            let enclosing_class_name = context
+                .ir
+                .enclosing_symbol_id
+                .and_then(|id| context.ctx.symbol_index.parent_map.get(&id).copied())
+                .and_then(|parent_id| context.ctx.symbol_index.get_symbol(parent_id))
+                .map(|s| s.name.clone());
+
+            if let Some(class_name) = enclosing_class_name {
+                let mut candidates = context.ctx.symbol_index.find_method_in_type(&method_name, &class_name);
+                if candidates.is_empty() {
+                    if let Some(type_ids) = context.ctx.symbol_index.find_by_name(&class_name) {
+                        for &type_id in type_ids {
+                            for ancestor_id in context.ctx.type_graph.get_ancestors(type_id) {
+                                if let Some(ancestor) = context.ctx.symbol_index.get_symbol(ancestor_id) {
+                                    candidates.extend(context.ctx.symbol_index.find_method_in_type(&method_name, &ancestor.name));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !candidates.is_empty() {
+                    let resolution_candidates = candidates
+                        .into_iter()
+                        .map(|id| ResolutionCandidate {
+                            symbol_id: id,
+                            score: 1.0,
+                            state: ResolutionState::RepositorySymbol,
+                        })
+                        .collect();
+                    context.add_candidates(
+                        self.stage_type(),
+                        resolution_candidates,
+                        Some(DecisionReason::RepositoryMatch),
+                        Some(format!("Enclosing class: {}", class_name)),
+                    );
+                    context.resolve_with(self.stage_type(), ResolutionState::RepositorySymbol, DecisionReason::RepositoryMatch, None);
+                } else {
+                    context.resolve_with(
+                        self.stage_type(),
+                        ResolutionState::Missing,
+                        DecisionReason::MissingImport,
+                        Some(format!("Method missing on enclosing class: {}", class_name)),
+                    );
+                }
+                return Ok(());
+            }
+            // No enclosing class found (e.g. a bare `this` outside any class,
+            // or the containment index missed it) — fall through to the
+            // existing logic below, which fails with UnknownReceiverType.
+        }
+
         let mut origin = crate::resolver::context::SymbolOrigin::Unknown;
         let mut type_name_to_use = None;
         let mut imported_source = None;
@@ -85,7 +144,7 @@ impl ResolutionStage for MemberResolverStage {
                 let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
 
                 let state = crate::resolver::stages::classification::classify_import_source(
-                    &imported.source, &imported.name, is_rust, is_js_ts, is_python
+                    &imported.source, &imported.name, is_rust, is_js_ts, is_python, &context.ctx.symbol_index.python_packages
                 );
                 
                 match state {
@@ -103,6 +162,30 @@ impl ResolutionStage for MemberResolverStage {
             // Check if the receiver raw itself is an import (just in case flow engine missed it)
             if let Some(imported) = context.ctx.import_resolver.resolve(context.ir.source_file_id, receiver_raw) {
                 type_name_to_use = Some(imported.name.clone());
+
+                // The imported name might not itself be a class/type — e.g. a
+                // module-level singleton instance (`export const
+                // inventoryRepository = new InventoryRepository();`),
+                // imported and called directly by its lowercase instance
+                // name. find_method_in_type would then search for methods
+                // under a type literally named "inventoryRepository", which
+                // doesn't exist. Follow it one hop instead: look up what that
+                // singleton's own defining file inferred its constructed
+                // type to be (VariableFlowEngine's load_constructors runs
+                // over every file's relationships, so this is already
+                // available), and use that as the effective type.
+                if let Some(sym_id) = imported.symbol_id {
+                    if let Some(sym) = context.ctx.symbol_index.get_symbol(sym_id) {
+                        if sym.kind != "type" {
+                            if let Some(inferred) = context.ctx.flow_engine
+                                .get_var(sym.file_id, &imported.name)
+                                .and_then(|v| v.inferred_type.clone())
+                            {
+                                type_name_to_use = Some(inferred);
+                            }
+                        }
+                    }
+                }
                 let file_path = context.ctx.symbol_index.file_paths.get(&context.ir.source_file_id);
                 let is_rust = file_path.map(|p| p.ends_with(".rs")).unwrap_or(false);
                 let is_js_ts = file_path.map(|p| {
@@ -114,7 +197,7 @@ impl ResolutionStage for MemberResolverStage {
                 let is_python = file_path.map(|p| p.ends_with(".py")).unwrap_or(false);
 
                 let state = crate::resolver::stages::classification::classify_import_source(
-                    &imported.source, &imported.name, is_rust, is_js_ts, is_python
+                    &imported.source, &imported.name, is_rust, is_js_ts, is_python, &context.ctx.symbol_index.python_packages
                 );
                 
                 match state {

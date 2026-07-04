@@ -2054,9 +2054,11 @@ mod dependency_cycles_tests {
 /// full type resolution). `re_export` is included because re-exporting a symbol
 /// creates a hard dependency on the source module.
 ///
-/// `method_call` and `MEMBER_ACCESS` are intentionally excluded: without type
-/// resolution, these would generate phantom dependencies (every `obj.map()`
-/// resolving to an unrelated top-level `map` function).
+/// `method_call` and `MEMBER_ACCESS` are excluded from this unconditional set:
+/// without type resolution, these would generate phantom dependencies (every
+/// `obj.map()` resolving to an unrelated top-level `map` function). Edges of
+/// these kinds are still surfaced, but gated on resolution confidence — see
+/// `RECEIVER_RESOLVED_EDGES` / `MIN_CONFIDENCE_FOR_RECEIVER_EDGES` below.
 pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
     "calls",
     "imports",
@@ -2071,6 +2073,19 @@ pub const CANONICAL_DEPENDENCY_EDGES: &[&str] = &[
     "instantiates",
     "re_export",
 ];
+
+/// `method_call` / `MEMBER_ACCESS` edges the resolver could only classify by
+/// receiver, not by unconditional kind — see `CANONICAL_DEPENDENCY_EDGES`.
+/// Only trustworthy when filtered by `MIN_CONFIDENCE_FOR_RECEIVER_EDGES`.
+pub const RECEIVER_RESOLVED_EDGES: &[&str] = &["method_call", "MEMBER_ACCESS"];
+
+/// The resolver assigns candidate score 1.0 when a `method_call`/`member_access`
+/// receiver was resolved via a typed variable, `this`/`self` field, or import
+/// (`MemberResolverStage`), and 0.0 when it fell through to a bare same-name
+/// lookup across the entire workspace with no scope information
+/// (`LexicalGenerationStage`). Anything at or above this threshold came from
+/// the former path.
+pub const MIN_CONFIDENCE_FOR_RECEIVER_EDGES: f64 = 0.5;
 
 /// SQL fragment `'calls', 'imports', ...` for embedding the canonical set in an
 /// `IN (...)` clause. Centralised so every query filters on the identical set.
@@ -2125,6 +2140,43 @@ pub fn get_outgoing_edges(
     Ok(results)
 }
 
+/// Like `get_outgoing_edges`, but additionally requires `edges.confidence >=
+/// min_confidence`. Used to admit `RECEIVER_RESOLVED_EDGES` kinds without
+/// reintroducing the phantom-dependency problem `CANONICAL_DEPENDENCY_EDGES`
+/// excludes them for.
+pub fn get_outgoing_edges_min_confidence(
+    db: &storage::Database,
+    symbol_id: i64,
+    edge_kinds: &[&str],
+    min_confidence: f64,
+) -> Result<Vec<String>> {
+    let kinds_str = edge_kinds
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT symbols.name
+         FROM edges
+         JOIN symbols ON edges.target_symbol_id = symbols.id
+         WHERE edges.source_symbol_id = ?1
+         AND edges.kind IN ({})
+         AND edges.confidence >= ?2
+         AND edges.target_symbol_id != edges.source_symbol_id",
+        kinds_str
+    );
+
+    let mut stmt = db.conn.prepare(&query)?;
+    let mut rows = stmt.query(rusqlite::params![symbol_id, min_confidence])?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next()? {
+        results.push(row.get::<_, String>(0)?);
+    }
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
 /// Unified symbol-level API for depth=1 incoming edges.
 /// Filters out self-loops.
 /// If `edge_kinds` is Some, filters by those edge kinds.
@@ -2161,6 +2213,44 @@ pub fn get_incoming_edges(
 
     let mut stmt = db.conn.prepare(&query)?;
     let mut rows = stmt.query(rusqlite::params![symbol_id])?;
+    let mut results = Vec::new();
+    while let Some(row) = rows.next()? {
+        results.push(row.get::<_, String>(0)?);
+    }
+    results.sort();
+    results.dedup();
+    Ok(results)
+}
+
+/// Like `get_incoming_edges`, but additionally requires `edges.confidence >=
+/// min_confidence`. Used to admit `RECEIVER_RESOLVED_EDGES` kinds without
+/// reintroducing the phantom-dependency problem `CANONICAL_DEPENDENCY_EDGES`
+/// excludes them for.
+pub fn get_incoming_edges_min_confidence(
+    db: &storage::Database,
+    symbol_id: i64,
+    edge_kinds: &[&str],
+    min_confidence: f64,
+) -> Result<Vec<String>> {
+    let kinds_str = edge_kinds
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT symbols.name
+         FROM edges
+         JOIN symbols ON edges.source_symbol_id = symbols.id
+         WHERE edges.target_symbol_id = ?1
+         AND edges.source_symbol_id IS NOT NULL
+         AND edges.kind IN ({})
+         AND edges.confidence >= ?2
+         AND edges.source_symbol_id != edges.target_symbol_id",
+        kinds_str
+    );
+
+    let mut stmt = db.conn.prepare(&query)?;
+    let mut rows = stmt.query(rusqlite::params![symbol_id, min_confidence])?;
     let mut results = Vec::new();
     while let Some(row) = rows.next()? {
         results.push(row.get::<_, String>(0)?);

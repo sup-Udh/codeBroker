@@ -136,6 +136,52 @@ fn emit_calls(
         }
     }
 
+    // ---- Constructor bindings on self/cls: self.field = SomeClass() ----
+    // The standard Python dependency-injection idiom (assigned in __init__),
+    // but q_ctor above only matches a bare identifier target, never an
+    // attribute target — so `self.repo = ProjectRepository()` fell through
+    // to the untargeted fallback instantiates capture with no source at all,
+    // and VariableFlowEngine's load_constructors had nothing to attach the
+    // type to. Source is the bare field name (not "self.<field>") to match
+    // the convention FieldType semantic bindings already use — that's what
+    // MemberResolverStage strips "self."/"this." down to before calling
+    // flow_engine.get_var, so the two must agree on the same bare key.
+    let q_self_ctor = "(assignment left: (attribute object: (identifier) @self_obj attribute: (identifier) @field_name) right: (call function: (identifier) @constructor))";
+    if let Ok(query) = Query::new(language, q_self_ctor) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut self_obj = String::new();
+            let mut field_name = String::new();
+            let mut constructor = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "self_obj" => self_obj = t,
+                        "field_name" => field_name = t,
+                        "constructor" => {
+                            constructor = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if (self_obj == "self" || self_obj == "cls")
+                && !field_name.is_empty()
+                && !constructor.is_empty()
+                && !crate::utils::is_noisy_call_name(&constructor)
+            {
+                let rel = Relationship::new(constructor, RelationshipKind::Instantiates, line)
+                    .with_source(field_name);
+                collector.emit(rel);
+            }
+        }
+    }
+
     // ---- self.field.method() — two-level attribute chain from `self` ----
     // Source set to "self.<field>" to distinguish from a local var receiver.
     let q_self_meth = "(call function: (attribute object: (attribute object: (identifier) @self_obj attribute: (identifier) @field_name) attribute: (identifier) @method_name))";

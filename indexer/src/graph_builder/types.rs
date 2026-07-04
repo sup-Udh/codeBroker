@@ -8,7 +8,13 @@ pub struct GraphEdgeIR {
     pub target_symbol_id: i64,
     pub kind: String,
     pub edge_type: String,
-    
+
+    /// Resolution confidence carried over from `ResolvedRelationshipIR::confidence`
+    /// (1.0 = resolved via a typed receiver/import, 0.0 = bare lexical name match
+    /// with no scope information). Lets query-time code admit `method_call` /
+    /// `member_access` edges selectively instead of excluding the whole kind.
+    pub confidence: f64,
+
     /// Provenance tracking: the originating relationship ID that produced this edge.
     /// Invaluable for diagnostics and debugging.
     pub relationship_id: i64,
@@ -21,8 +27,9 @@ impl PartialEq for GraphEdgeIR {
         self.target_symbol_id == other.target_symbol_id &&
         self.kind == other.kind &&
         self.edge_type == other.edge_type
-        // provenance (relationship_id) is explicitly excluded from equality
-        // to ensure edges deduplicate properly even if they come from different relationships.
+        // provenance (relationship_id) and confidence are explicitly excluded from
+        // equality to ensure edges deduplicate properly even if they come from
+        // different relationships or resolution passes.
     }
 }
 
@@ -35,6 +42,6 @@ impl Hash for GraphEdgeIR {
         self.target_symbol_id.hash(state);
         self.kind.hash(state);
         self.edge_type.hash(state);
-        // provenance intentionally excluded from hash
+        // provenance and confidence intentionally excluded from hash
     }
 }

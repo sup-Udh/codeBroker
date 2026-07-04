@@ -84,6 +84,7 @@ impl GraphBuilder {
                         target_symbol_id: target_id,
                         kind: edge_kind,
                         edge_type: "static".to_string(),
+                        confidence: resolved.confidence,
                         relationship_id: resolved.original.id,
                     };
                     

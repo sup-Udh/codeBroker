@@ -53,6 +53,12 @@ fn extract_js_symbols(
     let is_jsx = path.ends_with(".jsx");
     let query_str = "
         (class_declaration name: (identifier) @type)
+        (class_declaration
+          body: (class_body
+            (method_definition name: (property_identifier) @method)))
+        (class_declaration
+          body: (class_body
+            (field_definition property: (property_identifier) @method value: (arrow_function))))
         (function_declaration name: (identifier) @function)
         (return_statement (jsx_element) @jsx_render)
         (return_statement (parenthesized_expression (jsx_element) @jsx_render))
@@ -92,7 +98,11 @@ fn extract_js_symbols(
 
                 // The node that actually owns a "body" field (function/class/arrow),
                 // captured before `parent` gets widened to its lexical_declaration/export_statement.
-                let decl_node = if parent.kind() == "variable_declarator" {
+                // field_definition (an arrow-function class property, e.g.
+                // `handleClick = () => {...}`) has a "value" field the same
+                // as variable_declarator, so the signature can be built the
+                // same way.
+                let decl_node = if parent.kind() == "variable_declarator" || parent.kind() == "field_definition" {
                     parent.child_by_field_name("value")
                 } else {
                     Some(parent)

@@ -87,6 +87,13 @@ impl<'a> PipelineStage for Resolver<'a> {
                     // We now return decisions in ResolvedRelationshipIR for the caller to format.
                     let evidence_str = resolved_context.evidence.map(|e| e.as_str().to_string());
                     let state_str = resolved_context.final_state.as_str().to_string();
+                    // RankingStage sorts `candidates` descending by score (or leaves the
+                    // lone candidate as-is), so the first entry's score is exactly the
+                    // confidence backing the edge `target_symbol_ids[0]` will produce:
+                    // 1.0 for a receiver/import-resolved candidate, 0.0 for a bare
+                    // lexical name match with no scope information. Read it before the
+                    // `into_iter()` below consumes the candidates for their ids.
+                    let confidence = resolved_context.candidates.first().map(|c| c.score).unwrap_or(1.0);
                     let target_ids =
                         resolved_context.candidates.into_iter().map(|c| c.symbol_id).collect();
 
@@ -96,7 +103,7 @@ impl<'a> PipelineStage for Resolver<'a> {
                             original: ir,
                             state: resolved_context.final_state,
                             target_symbol_ids: target_ids,
-                            confidence: 1.0,
+                            confidence,
                             decisions: resolved_context.decisions,
                         },
                         state_str,
@@ -122,8 +129,8 @@ impl<'a> PipelineStage for Resolver<'a> {
                     "UPDATE relationships SET state = ?1, confidence = ?2, evidence = ?3 WHERE id = ?4",
                 )
                 .map_err(|e| e.to_string())?;
-            for (rel_id, _, state_str, evidence_str) in &resolved {
-                let _ = stmt.execute(rusqlite::params![state_str, 1.0, evidence_str, rel_id]);
+            for (rel_id, resolved_rel, state_str, evidence_str) in &resolved {
+                let _ = stmt.execute(rusqlite::params![state_str, resolved_rel.confidence, evidence_str, rel_id]);
             }
         }
         self.db

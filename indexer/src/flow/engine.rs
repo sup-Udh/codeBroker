@@ -19,8 +19,14 @@ impl VariableFlowEngine {
             function_returns: HashMap::new(),
         };
         engine.load_semantic_bindings(db, &symbol_index, &import_resolver);
-        engine.load_imports(db, &symbol_index, &import_resolver);
+        // load_constructors before load_imports: an imported name might be a
+        // module-level singleton instance rather than a class
+        // (`export const inventoryRepository = new InventoryRepository()`),
+        // and load_imports needs that instance's own already-inferred
+        // constructed type (recorded here, keyed by its *defining* file) to
+        // resolve method calls on it — see load_imports below.
         engine.load_constructors(db);
+        engine.load_imports(db, &symbol_index, &import_resolver);
         engine.resolve_aliases(db);
         engine
     }
@@ -113,9 +119,26 @@ impl VariableFlowEngine {
             for (_, file_id, name, _, kind, _) in relationships {
                 if kind.as_deref() == Some("imports") {
                     if let Some(imported) = import_resolver.resolve(file_id, &name) {
+                        // The imported name is usually a class/type, in which
+                        // case it IS the effective type. But it might instead
+                        // be a module-level singleton instance
+                        // (`export const inventoryRepository = new
+                        // InventoryRepository()`) — follow it one hop to
+                        // what load_constructors (which already ran, see
+                        // `new` above) inferred for that instance in its own
+                        // defining file, since that's the type
+                        // find_method_in_type actually needs.
+                        let effective_type = imported
+                            .symbol_id
+                            .and_then(|sid| symbol_index.get_symbol(sid))
+                            .filter(|sym| sym.kind != "type")
+                            .and_then(|sym| self.get_var(sym.file_id, &imported.name))
+                            .and_then(|v| v.inferred_type.clone())
+                            .unwrap_or_else(|| imported.name.clone());
+
                         let var = self.get_or_create_var(file_id, &name);
                         var.apply_type(
-                            imported.name.clone(),
+                            effective_type,
                             VariableOrigin::Import,
                             ResolutionConfidence::Certain,
                             ResolutionEvidence::ImportFlow,

@@ -140,6 +140,34 @@ fn emit_calls(
         }
     }
 
+    // ---- Bare this.method() / self.method() — direct call on the enclosing
+    // instance, as opposed to this.field.method() (q_this_meth below) or
+    // obj.method() on some other variable (q_meth_recv above). Source is the
+    // literal sentinel "this" so MemberResolverStage resolves it against the
+    // enclosing class instead of trying to look up a field's type.
+    let q_this_bare = "(call_expression function: (member_expression object: (this) property: (property_identifier) @method))";
+    if let Ok(query) = Query::new(language, q_this_bare) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if *cn != "method" {
+                    continue;
+                }
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let method = text.trim().to_string();
+                    let line = capture.node.start_position().row + 1;
+                    if !method.is_empty() && !crate::utils::is_noisy_call_name(&method) {
+                        let rel = Relationship::new(method, RelationshipKind::MethodCall, line)
+                            .with_source("this".to_string());
+                        collector.emit(rel);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- New expressions with variable binding: const x = new Foo() ----
     // Emitted first so dedup keeps the version with variable name.
     let q_new_var = "(lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @constructor)))";
@@ -167,6 +195,47 @@ fn emit_calls(
             if !constructor.is_empty() && !crate::utils::is_noisy_call_name(&constructor) {
                 let rel = Relationship::new(constructor, RelationshipKind::NewCall, line);
                 let rel = if !var_name.is_empty() { rel.with_source(var_name) } else { rel };
+                collector.emit(rel);
+            }
+        }
+    }
+
+    // ---- Constructor bindings on this: this.field = new SomeClass() ----
+    // The standard TS/JS dependency-injection idiom (assigned in a
+    // constructor), but q_new_var above only matches a plain variable
+    // declarator target, never a `this.field` assignment target — so
+    // `this.notificationService = new NotificationService()` fell through to
+    // the untargeted fallback new_call capture with no source at all, and
+    // VariableFlowEngine's load_constructors had nothing to attach the type
+    // to. Source is the bare field name (not "this.<field>") to match the
+    // convention FieldType semantic bindings already use — that's what
+    // MemberResolverStage strips "this."/"self." down to before calling
+    // flow_engine.get_var, so the two must agree on the same bare key.
+    let q_this_ctor = "(assignment_expression left: (member_expression object: (this) property: (property_identifier) @field_name) right: (new_expression constructor: (identifier) @constructor))";
+    if let Ok(query) = Query::new(language, q_this_ctor) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut field_name = String::new();
+            let mut constructor = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "field_name" => field_name = t,
+                        "constructor" => {
+                            constructor = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !field_name.is_empty() && !constructor.is_empty() && !crate::utils::is_noisy_call_name(&constructor) {
+                let rel = Relationship::new(constructor, RelationshipKind::NewCall, line)
+                    .with_source(field_name);
                 collector.emit(rel);
             }
         }

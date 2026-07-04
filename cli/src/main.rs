@@ -102,7 +102,27 @@ fn main() {
 
             const FINAL_DB_PATH: &str = ".codebroker/codebroker.db";
             const TMP_DB_PATH: &str = ".codebroker/codebroker.db.tmp";
-            const PIPELINE_VERSION: &str = "1";
+            // Bumped to "13": extract_ts_symbols now indexes module-level
+            // singleton instances (`export const inventoryRepository = new
+            // InventoryRepository();`, a common DI pattern) as symbols, and
+            // VariableFlowEngine::load_imports (reordered after
+            // load_constructors) now follows such a singleton one hop to its
+            // own constructed type instead of using its lowercase instance
+            // name as if it were the class itself — find_method_in_type
+            // needs the actual class name. Also fixed extract_ts_symbols
+            // deriving its query-cache key from the file path's ".tsx"
+            // suffix instead of an explicit is_tsx parameter: any caller
+            // parsing non-.tsx-suffixed content with the TSX grammar (e.g.
+            // VueFrontend parsing a .vue file's <script> block through
+            // TsxFrontend) collided with the "typescript_symbols" cache slot
+            // populated by a real .ts file parsed with the plain TypeScript
+            // grammar — a query compiled for one grammar silently matches
+            // nothing against a tree built with the other. This made Vue
+            // (and any similarly-embedded TSX-grammar) symbol extraction
+            // depend on file processing order, worked in isolation and
+            // failed once enough real .ts files primed the wrong cache slot.
+            // Existing indexes must be fully reparsed.
+            const PIPELINE_VERSION: &str = "13";
 
             // Load embeddings from the OLD database before wiping it.
             // On every full `init`, the temp DB starts empty, so without

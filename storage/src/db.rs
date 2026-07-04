@@ -655,6 +655,28 @@ impl Database {
         Ok(())
     }
 
+    /// Like `insert_edge_attributed`, but persists the resolver's actual
+    /// per-relationship confidence instead of relying on the column default.
+    /// Used by the graph builder's production insertion path so query-time
+    /// code can distinguish a receiver-resolved `method_call` (confidence 1.0)
+    /// from a bare lexical name guess (confidence 0.0) instead of having to
+    /// exclude the whole edge kind to avoid phantom dependencies.
+    pub fn insert_edge_attributed_with_confidence(
+        &self,
+        source_file_id: i64,
+        source_symbol_id: Option<i64>,
+        target_symbol_id: i64,
+        kind: &str,
+        confidence: f64,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO edges (source_file_id, source_symbol_id, target_symbol_id, kind, confidence) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![source_file_id, source_symbol_id, target_symbol_id, kind, confidence])?;
+        Ok(())
+    }
+
     /// Inserts a logical edge (`graph::EdgeType::Logical`) — one inferred by
     /// matching a runtime-boundary pattern (HTTP fetch, websocket emit) to
     /// the symbol that handles it, rather than found by walking syntax. Same

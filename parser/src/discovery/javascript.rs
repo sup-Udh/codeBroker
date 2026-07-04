@@ -42,6 +42,13 @@ fn emit_imports(
             (export_clause (export_specifier name: (identifier) @re_export))
             source: (string (string_fragment) @source)
         )
+        (variable_declarator
+            name: (identifier) @cjs_import
+            value: (call_expression
+                function: (identifier) @require_fn
+                arguments: (arguments (string (string_fragment) @source))
+            )
+        )
     ";
     let query = Query::new(language, query_str).expect("invalid query");
     let mut cursor = QueryCursor::new();
@@ -51,6 +58,11 @@ fn emit_imports(
         let mut source = String::new();
         let mut kind = RelationshipKind::Import;
         let mut line = 0usize;
+        // Only set for the CommonJS `require(...)` pattern; used to confirm
+        // the called function is actually named "require" (tree-sitter has
+        // no #eq? predicate support wired up in this codebase, so the check
+        // happens here instead of in the query).
+        let mut require_fn_text: Option<String> = None;
 
         for capture in m.captures {
             let cn = &query.capture_names()[capture.index as usize];
@@ -67,10 +79,20 @@ fn emit_imports(
                         line = capture.node.start_position().row + 1;
                         kind = RelationshipKind::ReExport;
                     }
+                    "cjs_import" => {
+                        name = text;
+                        line = capture.node.start_position().row + 1;
+                        kind = RelationshipKind::Import;
+                    }
+                    "require_fn" => require_fn_text = Some(text),
                     "source" => source = text,
                     _ => {}
                 }
             }
+        }
+
+        if require_fn_text.is_some_and(|f| f != "require") {
+            continue;
         }
 
         if !name.is_empty() {
@@ -90,6 +112,177 @@ fn emit_calls(
     language: &tree_sitter::Language,
     collector: &mut RelationshipCollector,
 ) {
+    // ---- Receiver-aware method calls: obj.method() where obj is an identifier ----
+    // Emitted first so dedup keeps the version with receiver info. Without this,
+    // every `foo.method()` call loses its receiver entirely (`source: None`),
+    // which forces MemberResolverStage to fail immediately and fall through to
+    // LexicalGenerationStage's low-confidence global name lookup even when the
+    // receiver is a perfectly resolvable local import — see typescript.rs's
+    // emit_calls, which this mirrors.
+    let q_meth_recv = "(call_expression function: (member_expression object: (identifier) @receiver property: (property_identifier) @method))";
+    if let Ok(query) = Query::new(language, q_meth_recv) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut receiver = String::new();
+            let mut method = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "receiver" => receiver = t,
+                        "method" => {
+                            method = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !method.is_empty() && !crate::utils::is_noisy_call_name(&method) {
+                let rel = Relationship::new(method, RelationshipKind::MethodCall, line);
+                let rel = if !receiver.is_empty() { rel.with_source(receiver) } else { rel };
+                collector.emit(rel);
+            }
+        }
+    }
+
+    // ---- Bare this.method() — direct call on the enclosing instance, as
+    // opposed to this.field.method() (q_this_meth below) or obj.method() on
+    // some other variable (q_meth_recv above). Source is the literal
+    // sentinel "this" so MemberResolverStage resolves it against the
+    // enclosing class instead of trying to look up a field's type.
+    let q_this_bare = "(call_expression function: (member_expression object: (this) property: (property_identifier) @method))";
+    if let Ok(query) = Query::new(language, q_this_bare) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if *cn != "method" {
+                    continue;
+                }
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let method = text.trim().to_string();
+                    let line = capture.node.start_position().row + 1;
+                    if !method.is_empty() && !crate::utils::is_noisy_call_name(&method) {
+                        let rel = Relationship::new(method, RelationshipKind::MethodCall, line)
+                            .with_source("this".to_string());
+                        collector.emit(rel);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- New expressions with variable binding: const x = new Foo() ----
+    // Emitted first so dedup keeps the version with variable name.
+    let q_new_var = "(lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @constructor)))";
+    if let Ok(query) = Query::new(language, q_new_var) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut var_name = String::new();
+            let mut constructor = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "var_name" => var_name = t,
+                        "constructor" => {
+                            constructor = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !constructor.is_empty() && !crate::utils::is_noisy_call_name(&constructor) {
+                let rel = Relationship::new(constructor, RelationshipKind::NewCall, line);
+                let rel = if !var_name.is_empty() { rel.with_source(var_name) } else { rel };
+                collector.emit(rel);
+            }
+        }
+    }
+
+    // ---- Constructor bindings on this: this.field = new SomeClass() ----
+    // The standard JS dependency-injection idiom (assigned in a
+    // constructor), but q_new_var above only matches a plain variable
+    // declarator target, never a `this.field` assignment target. Source is
+    // the bare field name (not "this.<field>") to match the convention
+    // FieldType semantic bindings already use — MemberResolverStage strips
+    // "this."/"self." down to before calling flow_engine.get_var, so the two
+    // must agree on the same bare key.
+    let q_this_ctor = "(assignment_expression left: (member_expression object: (this) property: (property_identifier) @field_name) right: (new_expression constructor: (identifier) @constructor))";
+    if let Ok(query) = Query::new(language, q_this_ctor) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut field_name = String::new();
+            let mut constructor = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "field_name" => field_name = t,
+                        "constructor" => {
+                            constructor = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !field_name.is_empty() && !constructor.is_empty() && !crate::utils::is_noisy_call_name(&constructor) {
+                let rel = Relationship::new(constructor, RelationshipKind::NewCall, line)
+                    .with_source(field_name);
+                collector.emit(rel);
+            }
+        }
+    }
+
+    // ---- this.field.method() — two-level member chain from `this` ----
+    // Emitted before fallback so dedup keeps this version (with field context in source).
+    let q_this_meth = "(call_expression function: (member_expression object: (member_expression object: (this) property: (property_identifier) @field_name) property: (property_identifier) @method_name))";
+    if let Ok(query) = Query::new(language, q_this_meth) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            let mut field_name = String::new();
+            let mut method_name = String::new();
+            let mut line = 0usize;
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let t = text.trim().to_string();
+                    match *cn {
+                        "field_name" => field_name = t,
+                        "method_name" => {
+                            method_name = t;
+                            line = capture.node.start_position().row + 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !method_name.is_empty() && !field_name.is_empty()
+                && !crate::utils::is_noisy_call_name(&method_name)
+            {
+                let source = format!("this.{}", field_name);
+                let rel = Relationship::new(method_name, RelationshipKind::MethodCall, line)
+                    .with_source(source);
+                collector.emit(rel);
+            }
+        }
+    }
+
+    // ---- Fallback queries (deduplicated against receiver-aware results above) ----
     let query_str = "
         (call_expression function: (identifier) @call_name)
         (call_expression function: (member_expression property: (property_identifier) @method_call))

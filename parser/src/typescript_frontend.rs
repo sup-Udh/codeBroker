@@ -25,7 +25,7 @@ impl LanguageFrontend for TypeScriptFrontend {
         })?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
-        let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
+        let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path, false);
         let relationships = extract_ts_relationships(&tree, source_code, false);
         let semantic = extract_ts_semantic_bindings(&tree, source_code, false);
 
@@ -56,7 +56,7 @@ impl LanguageFrontend for TsxFrontend {
         })?;
 
         let metadata = graph::models::FileMetadata { metadata: None };
-        let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path);
+        let symbols = extract_ts_symbols(&tree, source_code, language.clone(), path, true);
         let relationships = extract_ts_relationships(&tree, source_code, true);
         let semantic = extract_ts_semantic_bindings(&tree, source_code, true);
 
@@ -69,12 +69,12 @@ fn extract_ts_symbols(
     source_code: &str,
     language: tree_sitter::Language,
     path: &str,
+    is_tsx: bool,
 ) -> Vec<SymbolNode> {
     let filename = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let is_tsx = path.ends_with(".tsx");
     let mut query_str = String::from(
         "
         (class_declaration name: (type_identifier) @type)
@@ -82,6 +82,9 @@ fn extract_ts_symbols(
         (class_declaration
           body: (class_body
             (method_definition name: (property_identifier) @method)))
+        (class_declaration
+          body: (class_body
+            (public_field_definition name: (property_identifier) @method value: (arrow_function))))
         (function_declaration
             name: (identifier) @function
             parameters: (formal_parameters
@@ -107,7 +110,7 @@ fn extract_ts_symbols(
         (lexical_declaration
             (variable_declarator
                 name: (identifier) @data_const
-                value: [(array) (object) (string) (template_string) (number)]
+                value: [(array) (object) (string) (template_string) (number) (new_expression)]
             )
         )
     ",
@@ -171,7 +174,11 @@ fn extract_ts_symbols(
 
             // The node that actually owns a "body" field (function/class/interface/arrow),
             // captured before `parent` gets widened to its lexical_declaration/export_statement.
-            let decl_node = if parent.kind() == "variable_declarator" {
+            // public_field_definition (an arrow-function class property, e.g.
+            // `public register = async (req, res) => {...}` — the idiomatic
+            // Express-controller pattern) has a "value" field the same as
+            // variable_declarator, so the signature can be built the same way.
+            let decl_node = if parent.kind() == "variable_declarator" || parent.kind() == "public_field_definition" {
                 parent.child_by_field_name("value")
             } else {
                 Some(parent)
@@ -455,6 +462,7 @@ mod data_const_tests {
             src,
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "languages.ts",
+            false,
         );
 
         let sym = symbols

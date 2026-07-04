@@ -37,7 +37,12 @@ impl ImportResolver {
                 for row in rows.flatten() {
                     let (file_id, name, source) = row;
                     
-                    let symbol_id = if source.starts_with(".") || source.starts_with("/") || source.starts_with("~") || source.starts_with("crate::") || source.starts_with("super::") || source.starts_with("self::") {
+                    // "@/" is included alongside the existing "~" tsconfig-alias
+                    // check: both are bundler path-alias conventions pointing at
+                    // the project's own source root, not npm scoped packages
+                    // (a real scoped package always has a scope name between
+                    // "@" and "/", e.g. "@babel/core" — never bare "@/foo").
+                    let symbol_id = if source.starts_with(".") || source.starts_with("/") || source.starts_with("~") || source.starts_with("@/") || source.starts_with("crate::") || source.starts_with("super::") || source.starts_with("self::") {
                         index.find_by_name(&name).and_then(|ids| ids.first().copied())
                     } else {
                         None

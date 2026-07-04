@@ -1,5 +1,5 @@
 use query::context::ContextResponseBuilder;
-use query::graph::{GraphDirection, explore_graph};
+use query::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES;
 use query::response::ResponseProfile;
 use storage::Database;
 
@@ -54,25 +54,38 @@ fn test_graph_invariants() {
             ContextResponseBuilder::new(&db, &sym_name, None, ResponseProfile::Standard).unwrap();
 
         if let Some(ctx) = builder {
-            // Check Callers consistency
+            // `sym_name` can be ambiguous (many methods share a name like "new");
+            // `ContextResponseBuilder` and `fetch_callers`/`fetch_callees` operate
+            // on the one specific symbol id it resolved to, so the comparison
+            // query below must filter by that same id rather than by name.
+            let Some(ctx_symbol_id) = ctx.symbol_id else {
+                continue;
+            };
+
+            // Check Callers consistency. `fetch_callers` treats a `calls` edge
+            // (any confidence) or a high-confidence `method_call` edge (see
+            // MIN_CONFIDENCE_FOR_RECEIVER_EDGES) as a caller — mirrored here via
+            // direct SQL since `explore_graph`'s edges don't carry confidence.
             let mut ctx_callers = ctx.fetch_callers().unwrap();
             ctx_callers.sort();
 
-            let graph_incoming =
-                explore_graph(&db, &sym_name, 1, GraphDirection::Incoming, 100).unwrap();
-            let mut expected_callers: Vec<String> = graph_incoming
-                .edges
-                .iter()
-                .filter(|e| e.kind == "calls")
-                .map(|e| {
-                    graph_incoming
-                        .nodes
-                        .iter()
-                        .find(|n| n.id == e.source)
-                        .unwrap()
-                        .name
-                        .clone()
-                })
+            let mut callers_stmt = db
+                .conn
+                .prepare(
+                    "SELECT DISTINCT s1.name FROM edges
+                     JOIN symbols s1 ON edges.source_symbol_id = s1.id
+                     WHERE edges.target_symbol_id = ?1
+                     AND (edges.kind = 'calls' OR (edges.kind = 'method_call' AND edges.confidence >= ?2))
+                     AND edges.source_symbol_id != edges.target_symbol_id",
+                )
+                .unwrap();
+            let mut expected_callers: Vec<String> = callers_stmt
+                .query_map(
+                    rusqlite::params![ctx_symbol_id, MIN_CONFIDENCE_FOR_RECEIVER_EDGES],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+                .map(|r| r.unwrap())
                 .collect();
             expected_callers.sort();
             expected_callers.dedup();
@@ -83,25 +96,27 @@ fn test_graph_invariants() {
                 sym_name
             );
 
-            // Check Callees consistency
+            // Check Callees consistency (same predicate, opposite direction).
             let mut ctx_callees = ctx.fetch_callees().unwrap();
             ctx_callees.sort();
 
-            let graph_outgoing =
-                explore_graph(&db, &sym_name, 1, GraphDirection::Outgoing, 100).unwrap();
-            let mut expected_callees: Vec<String> = graph_outgoing
-                .edges
-                .iter()
-                .filter(|e| e.kind == "calls")
-                .map(|e| {
-                    graph_outgoing
-                        .nodes
-                        .iter()
-                        .find(|n| n.id == e.target)
-                        .unwrap()
-                        .name
-                        .clone()
-                })
+            let mut callees_stmt = db
+                .conn
+                .prepare(
+                    "SELECT DISTINCT s2.name FROM edges
+                     JOIN symbols s2 ON edges.target_symbol_id = s2.id
+                     WHERE edges.source_symbol_id = ?1
+                     AND (edges.kind = 'calls' OR (edges.kind = 'method_call' AND edges.confidence >= ?2))
+                     AND edges.source_symbol_id != edges.target_symbol_id",
+                )
+                .unwrap();
+            let mut expected_callees: Vec<String> = callees_stmt
+                .query_map(
+                    rusqlite::params![ctx_symbol_id, MIN_CONFIDENCE_FOR_RECEIVER_EDGES],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+                .map(|r| r.unwrap())
                 .collect();
             expected_callees.sort();
             expected_callees.dedup();

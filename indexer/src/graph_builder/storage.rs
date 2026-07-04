@@ -27,11 +27,12 @@ impl StorageWriter {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| e.to_string())?;
         for edge in result.edges {
-            if let Err(_) = db.insert_edge_attributed(
+            if let Err(_) = db.insert_edge_attributed_with_confidence(
                 edge.source_file_id,
                 edge.source_symbol_id,
                 edge.target_symbol_id,
                 &edge.kind,
+                edge.confidence,
             ) {
                 result.metrics.sqlite_failures += 1;
             } else {
