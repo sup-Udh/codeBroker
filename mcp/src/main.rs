@@ -694,14 +694,7 @@ Treat native tools as the repository's implementation layer."#;
                             id,
                             result: serde_json::json!({
                                 "tools": [
-                                    {
-                                        "name": "project_overview",
-                                        "description": "Fast deterministic repository overview. Returns file, symbol, edge, and language counts, per-directory density metrics (with total_directories/directories_truncated so nothing is silently dropped), and repo-wide entrypoints (API routes + pages/layouts). Use for navigation and architectural discovery.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {}
-                                        }
-                                    },
+
                                     {
                                         "name": "get_workspace",
                                         "description": "Returns the active CodeBroker workspace, including project root, database path, and indexing status.",
@@ -845,19 +838,7 @@ Treat native tools as the repository's implementation layer."#;
                                             "required": ["keyword"]
                                         }
                                     },
-                                    {
-                                        "name": "find_symbol",
-                                        "description": "Finds symbol definitions using exact, prefix, substring, or fuzzy matching. Returns locations, metadata, and optional source previews.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string", "description": "Symbol name to find." },
-                                                "context_lines": { "type": "number", "description": "Default 3. Lines of source preview around each match; 0 disables previews." },
-                                                "path_scope": { "type": "string", "description": "Optional substring to restrict matches to files whose path contains it." }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
+
                                     {
                                         "name": "repository_stats",
                                         "description": "Returns file, symbol, edge, and language statistics for a repository or repository subsection, plus entrypoints (API routes + pages/layouts) scoped the same way as the stats themselves.",
@@ -962,18 +943,7 @@ Treat native tools as the repository's implementation layer."#;
                                             "required": ["path"]
                                         }
                                     },
-                                    {
-                                        "name": "get_implementation",
-                                        "description": "Returns a symbol's source code together with its full deterministic graph context. Equivalent to `read_symbol_source` and `get_context` combined.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string", "description": "Symbol name to look up." },
-                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." }
-                                            },
-                                            "required": ["symbol"]
-                                        }
-                                    },
+
                                     {
                                         "name": "get_edit_context",
                                         "description": "Returns the source code and dependency context required to safely modify a symbol. Includes edit boundaries, dependencies, and related callers. Read-only.",
@@ -1223,84 +1193,7 @@ Treat native tools as the repository's implementation layer."#;
                                     Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
                                 }
                             }
-                            "find_symbol" => {
-                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let context_lines = arguments.get("context_lines").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
 
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_find_symbol_context(&db, symbol);
-                                        match query::engine::find_symbol(&db, symbol, context_lines, path_scope) {
-                                            Ok(results) => {
-                                                // Disambiguation (#4): a common name like "GET" matches
-                                                // many route files. Past a threshold, suppress the
-                                                // per-match source previews for fuzzy matches to save
-                                                // context, but always keep previews for exact matches.
-                                                const PREVIEW_SUPPRESSION_THRESHOLD: usize = 5;
-                                                let compact = results.len() > PREVIEW_SUPPRESSION_THRESHOLD && path_scope.is_none();
-                                                let query_lower = symbol.to_lowercase();
-
-                                                let mut matches = Vec::new();
-                                                let mut exact_matches = Vec::new();
-                                                let mut fuzzy_matches = Vec::new();
-                                                for (name, path, kind, line, preview, score) in results.iter() {
-                                                    let is_exact = name.to_lowercase() == query_lower;
-                                                    let show_preview = context_lines > 0 && (is_exact || !compact);
-
-                                                    let mut entry = serde_json::json!({
-                                                        "name": name,
-                                                        "path": path,
-                                                        "kind": kind,
-                                                        "line": line,
-                                                    });
-                                                    if show_preview {
-                                                        entry["preview"] = serde_json::Value::String(preview.to_string());
-                                                    }
-
-                                                    let mut full = entry.clone();
-                                                    full["score"] = serde_json::json!(score);
-                                                    matches.push(full);
-                                                    if is_exact {
-                                                        exact_matches.push(entry);
-                                                    } else {
-                                                        fuzzy_matches.push(entry);
-                                                    }
-                                                }
-
-                                                // The "is this name ambiguous" signal comes from
-                                                // the same shared resolver every other tool uses
-                                                // (rather than this tool re-deriving its own
-                                                // exact-match-count check), so `find_symbol`'s
-                                                // ambiguity verdict can never disagree with
-                                                // `get_context`/`impact_analysis`/etc.
-                                                let ambiguous = resolver::resolve_symbol(&db, symbol, path_scope, None, None).is_ambiguous();
-
-                                                let mut payload = serde_json::json!({
-                                                    "workspace_root": db.project_root,
-                                                    "query": symbol,
-                                                    "found": !matches.is_empty(),
-                                                    "ambiguous": ambiguous,
-                                                    "exact_matches": exact_matches,
-                                                    "fuzzy_matches": fuzzy_matches,
-                                                    "matches": matches,
-                                                });
-
-                                                if compact && !fuzzy_matches.is_empty() {
-                                                    payload["compact"] = serde_json::Value::Bool(true);
-                                                    payload["hint"] = serde_json::Value::String(format!(
-                                                        "{} total matches for \"{}\". Previews for fuzzy matches suppressed. Narrow with path_scope to see all previews.",
-                                                        results.len(), symbol
-                                                    ));
-                                                }
-                                                serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                            }
-                                            Err(e) => serde_json::json!({"success": false, "error": format!("Error finding symbol: {}", e)}).to_string(),
-                                        }
-                                    }
-                                    Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
-                                }
-                            }
                             "prepare_context" => {
                                 let target = arguments.get("target").and_then(|t| t.as_str()).unwrap_or_default();
                                 match storage::Database::new(&db_path) {
@@ -1347,32 +1240,7 @@ Treat native tools as the repository's implementation layer."#;
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
-                            "project_overview" => {
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::engine::build_project_overview(&db) {
-                                            Ok(overview) => {
-                                                let mut output = serde_json::to_value(&overview).unwrap();
-                                                output["workspace_root"] = serde_json::Value::String(db.project_root.clone());
-                                                // Repo-wide entrypoints (API routes + pages/layouts),
-                                                // surfaced directly here instead of requiring a
-                                                // separate list_entrypoints call to answer "what are
-                                                // this repo's entrypoints" — previously only ever
-                                                // discoverable once a subsystem name was already known
-                                                // (benchmark run_001's gap #1).
-                                                if let Ok(report) = query::subsystem::list_entrypoints(&db, None) {
-                                                    output["entrypoints"] = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
-                                                }
-                                                add_response_size_hint(&mut output);
-                                                serde_json::to_string_pretty(&output).unwrap_or_default()
-                                            },
-                                            Err(e) => format!("Error building overview: {}", e),
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
+
                             "repository_stats" => {
                                 let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
@@ -1840,29 +1708,7 @@ Treat native tools as the repository's implementation layer."#;
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
-                            "get_implementation" => {
-                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = get_file_hint(&arguments);
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
-                                        Err(resp) => resp,
-                                        Ok(resolved) => {
-                                            let symbol = resolved.name.as_str();
-                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
-                                            let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
-                                            let context = query::context::ContextResponseBuilder::new_by_id(&db, resolved.id, query::response::ResponseProfile::Verbose).unwrap_or(None);
-                                            let implementation = serde_json::json!({
-                                                "symbol_source": source,
-                                                "context": context.map(|c| c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or(serde_json::json!({}))
-                                            });
-                                            serde_json::to_string_pretty(&implementation).unwrap_or_default()
-                                        }
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
+
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let file_hint = get_file_hint(&arguments);
