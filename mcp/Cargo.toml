@@ -19,6 +19,9 @@ runtime = { path = "../runtime" }
 chrono = "0.4.45"
 rusqlite = "0.40.1"
 
+[dev-dependencies]
+graph = { path = "../graph" }
+
 [[bin]]
 name = "codebroker-mcp"
 path = "src/main.rs"

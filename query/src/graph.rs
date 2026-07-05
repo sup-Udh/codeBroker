@@ -65,6 +65,13 @@ pub struct GraphResponse {
     /// a caller should treat dense same-file edges with suspicion rather than
     /// assuming every co-located symbol is genuinely coupled to the root.
     pub dominant_file_warning: Option<String>,
+    /// Set only when `nodes`/`edges` are empty because the root symbol
+    /// itself couldn't be found — an empty graph with no explanation is
+    /// indistinguishable from "this symbol genuinely has no
+    /// callers/callees", which is a different (and much less alarming)
+    /// situation. Mirrors `GraphSubtreeResponse::truncated_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_found_reason: Option<String>,
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
 }
@@ -108,6 +115,9 @@ impl GraphResponse {
         }
         if let Some(warning) = &self.dominant_file_warning {
             md.push_str(&format!("**Warning: {}**\n", warning));
+        }
+        if let Some(reason) = &self.not_found_reason {
+            md.push_str(&format!("**Not found: {}**\n", reason));
         }
 
         let mut id_to_name = std::collections::HashMap::new();
@@ -160,6 +170,9 @@ impl GraphResponse {
         if let Some(w) = &self.dominant_file_warning {
             map.insert("dominant_file_warning".to_string(), serde_json::json!(w));
         }
+        if let Some(reason) = &self.not_found_reason {
+            map.insert("not_found_reason".to_string(), serde_json::json!(reason));
+        }
         map.insert("nodes".to_string(), serde_json::json!(nodes));
         map.insert("edges".to_string(), serde_json::json!(edges));
 
@@ -174,7 +187,7 @@ pub fn explore_graph(
     direction: GraphDirection,
     max_nodes: usize,
 ) -> Result<GraphResponse> {
-    explore_graph_scoped(db, symbol_name, max_depth, direction, max_nodes, None)
+    explore_graph_scoped(db, symbol_name, max_depth, direction, max_nodes, None, None)
 }
 
 /// Like `explore_graph`, but when `file_hint` is given, the root lookup is
@@ -190,6 +203,7 @@ pub fn explore_graph_scoped(
     direction: GraphDirection,
     max_nodes: usize,
     file_hint: Option<&str>,
+    symbol_id: Option<i64>,
 ) -> Result<GraphResponse> {
     let safe_depth = std::cmp::min(max_depth, 5);
     let max_nodes = max_nodes.clamp(1, 200);
@@ -198,21 +212,36 @@ pub fn explore_graph_scoped(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    // Find the root symbol, optionally scoped to file_hint.
-    let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, symbols.name, symbols.kind, files.path
-         FROM symbols
-         JOIN files ON symbols.file_id = files.id
-         WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
-         ORDER BY symbols.id LIMIT 1",
-    )?;
-
-    let root_info: Option<(i64, String, String, String)> = stmt
-        .query_row(
+    // Find the root symbol. When the caller already holds a resolver-
+    // confirmed id (e.g. `resolver::resolve_symbol`'s `ResolvedSymbol.id`),
+    // look it up directly instead of re-running the name/file_hint match —
+    // otherwise this root lookup could silently land on a different
+    // same-named symbol than the one that was actually resolved.
+    let root_info: Option<(i64, String, String, String)> = if let Some(id) = symbol_id {
+        let mut stmt = db.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.id = ?1 LIMIT 1",
+        )?;
+        stmt.query_row(rusqlite::params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?
+    } else {
+        let mut stmt = db.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
+             ORDER BY symbols.id LIMIT 1",
+        )?;
+        stmt.query_row(
             rusqlite::params![symbol_name, file_hint.unwrap_or("")],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .optional()?;
+        .optional()?
+    };
 
     let root_info = match root_info {
         Some(info) => info,
@@ -222,6 +251,13 @@ pub fn explore_graph_scoped(
                 depth: safe_depth,
                 truncated: false,
                 dominant_file_warning: None,
+                not_found_reason: Some(format!(
+                    "No symbol named '{}' found{}.",
+                    symbol_name,
+                    file_hint
+                        .map(|h| format!(" in a file matching '{}'", h))
+                        .unwrap_or_default()
+                )),
                 nodes: vec![],
                 edges: vec![],
             });
@@ -411,6 +447,7 @@ pub fn explore_graph_scoped(
         depth: safe_depth,
         truncated,
         dominant_file_warning,
+        not_found_reason: None,
         nodes,
         edges,
     })
@@ -466,6 +503,15 @@ pub struct ShortestPathResponse {
     /// requiring the caller to manually read the source and re-query
     /// (benchmark run_003's central finding).
     pub suggested_connector: Option<SuggestedConnector>,
+    /// Populated only when `found` is false AND the reason is that one or
+    /// both endpoint symbols couldn't be resolved at all — as distinct from
+    /// both endpoints resolving fine but the BFS genuinely finding no static
+    /// path between them (that case is `None` here; `graph_unindexed` and
+    /// `suggested_connector` already cover it). Without this, "you gave me a
+    /// symbol name that doesn't exist" and "these two symbols are just
+    /// unrelated" were indistinguishable — the same `found: false` either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Scans `source` for `fetch("/api/...")`-shaped string literals (single,
@@ -670,6 +716,8 @@ pub fn shortest_path(
     to_symbol: &str,
     from_file_hint: Option<&str>,
     to_file_hint: Option<&str>,
+    from_id: Option<i64>,
+    to_id: Option<i64>,
 ) -> Result<ShortestPathResponse> {
     let total_edges: i64 = db
         .conn
@@ -686,6 +734,24 @@ pub fn shortest_path(
     // `found: false`. `from_file_hint`/`to_file_hint` let a caller pin each
     // endpoint to the file they actually mean, the same way `get_context`'s
     // `file_path` does.
+    // When the caller already holds a resolver-confirmed id for an endpoint
+    // (e.g. `resolver::resolve_symbol`'s `ResolvedSymbol.id`), look it up
+    // directly instead of re-running the name/hint match, so this can never
+    // silently start/end at a different same-named symbol than the one that
+    // was actually resolved.
+    let lookup_by_id = |id: i64| -> Result<Option<(i64, String, String, String)>> {
+        let mut stmt = db.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.id = ?1 LIMIT 1",
+        )?;
+        stmt.query_row(rusqlite::params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()
+    };
+
     let lookup =
         |name: &str, hint: Option<&str>| -> Result<Option<(i64, String, String, String)>> {
             if let Some(h) = hint {
@@ -713,13 +779,26 @@ pub fn shortest_path(
             }
         };
 
-    let from_info = lookup(from_symbol, from_file_hint)?;
-    let to_info = lookup(to_symbol, to_file_hint)?;
+    let from_info = match from_id {
+        Some(id) => lookup_by_id(id)?,
+        None => lookup(from_symbol, from_file_hint)?,
+    };
+    let to_info = match to_id {
+        Some(id) => lookup_by_id(id)?,
+        None => lookup(to_symbol, to_file_hint)?,
+    };
 
     if from_info.is_none() || to_info.is_none() {
         let suggested_connector = from_info
             .as_ref()
             .and_then(|info| find_suggested_connector(db, info.0));
+        let mut missing = Vec::new();
+        if from_info.is_none() {
+            missing.push(format!("'{}' (from)", from_symbol));
+        }
+        if to_info.is_none() {
+            missing.push(format!("'{}' (to)", to_symbol));
+        }
         return Ok(ShortestPathResponse {
             from: from_symbol.to_string(),
             to: to_symbol.to_string(),
@@ -729,6 +808,12 @@ pub fn shortest_path(
             edges: vec![],
             graph_unindexed,
             suggested_connector,
+            reason: Some(format!(
+                "Endpoint(s) not found in the index: {}. This is a resolution failure, \
+                 not a graph answer about whether the symbols are related — re-check the \
+                 name/file_path/id passed in.",
+                missing.join(", ")
+            )),
         });
     }
 
@@ -802,6 +887,12 @@ pub fn shortest_path(
             edges: vec![],
             graph_unindexed,
             suggested_connector,
+            // Both endpoints resolved fine — this is a legitimate graph
+            // answer ("no static path"), not a resolution failure, so no
+            // `reason` is set (see `graph_unindexed`/`suggested_connector`
+            // for why a static path might not exist even when one is
+            // expected).
+            reason: None,
         });
     }
 
@@ -877,6 +968,7 @@ pub fn shortest_path(
         edges: path_edges,
         graph_unindexed,
         suggested_connector: None,
+        reason: None,
     })
 }
 
@@ -1444,6 +1536,7 @@ pub fn graph_subtree(
     depth: usize,
     max_nodes: Option<usize>,
     file_hint: Option<&str>,
+    symbol_id: Option<i64>,
 ) -> Result<GraphSubtreeResponse> {
     let safe_depth = std::cmp::min(depth, 5);
     // Previously a fixed 500 with no escape hatch on hub symbols. Defaulting
@@ -1461,24 +1554,38 @@ pub fn graph_subtree(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
-    // When a file_hint is supplied, scope root resolution to it so an
-    // ambiguous name (e.g. `SOFTWARE_REGISTRY` defined in both
-    // software_registry.py and software_registry_v2.py) resolves to the
-    // intended one rather than silently picking whichever row sorts first.
-    let mut stmt = db.conn.prepare(
-        "SELECT symbols.id, symbols.name, symbols.kind, files.path
-         FROM symbols
-         JOIN files ON symbols.file_id = files.id
-         WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
-         ORDER BY symbols.id LIMIT 1",
-    )?;
-
-    let root_info: Option<(i64, String, String, String)> = stmt
-        .query_row(
+    // When the caller already holds a resolver-confirmed id (e.g.
+    // `resolver::resolve_symbol`'s `ResolvedSymbol.id`), look it up directly
+    // instead of re-running the name/file_hint match. Otherwise, when a
+    // file_hint is supplied, scope root resolution to it so an ambiguous
+    // name (e.g. `SOFTWARE_REGISTRY` defined in both software_registry.py and
+    // software_registry_v2.py) resolves to the intended one rather than
+    // silently picking whichever row sorts first.
+    let root_info: Option<(i64, String, String, String)> = if let Some(id) = symbol_id {
+        let mut stmt = db.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.id = ?1 LIMIT 1",
+        )?;
+        stmt.query_row(rusqlite::params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .optional()?
+    } else {
+        let mut stmt = db.conn.prepare(
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path
+             FROM symbols
+             JOIN files ON symbols.file_id = files.id
+             WHERE symbols.name = ?1 AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')
+             ORDER BY symbols.id LIMIT 1",
+        )?;
+        stmt.query_row(
             rusqlite::params![root_symbol, file_hint.unwrap_or("")],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .optional()?;
+        .optional()?
+    };
 
     let root_info = match root_info {
         Some(info) => info,
@@ -1751,7 +1858,7 @@ mod shortest_path_tests {
 
         // Scoped to the server file: must find the real path.
         let scoped =
-            shortest_path(&db, "useRoom", "createClient", None, Some("server.ts")).unwrap();
+            shortest_path(&db, "useRoom", "createClient", None, Some("server.ts"), None, None).unwrap();
         assert!(
             scoped.found,
             "scoping 'to' to server.ts must find the real useRoom -> createClient edge"
@@ -1760,7 +1867,7 @@ mod shortest_path_tests {
         // Scoped to the (unconnected) browser file: must correctly report no path,
         // not silently fall back to the connected one.
         let wrong_scope =
-            shortest_path(&db, "useRoom", "createClient", None, Some("client.ts")).unwrap();
+            shortest_path(&db, "useRoom", "createClient", None, Some("client.ts"), None, None).unwrap();
         assert!(
             !wrong_scope.found,
             "scoping 'to' to the unrelated browser client.ts must not find a path"
@@ -1847,7 +1954,7 @@ mod shortest_path_tests {
         // related via the fetch/route HTTP boundary), so a plain shortest_path
         // between unrelated names must come back found:false but WITH a
         // suggested connector pointing at the POST route handler.
-        let resp = shortest_path(&db, "runCode", "normalizeProblem", None, None).unwrap();
+        let resp = shortest_path(&db, "runCode", "normalizeProblem", None, None, None, None).unwrap();
         assert!(!resp.found);
         let connector = resp
             .suggested_connector

@@ -20,8 +20,28 @@ pub fn assemble_context_self_healing<'a>(
     file_hint: Option<&str>,
     profile: ResponseProfile,
 ) -> Result<Option<ContextResponseBuilder<'a>>, String> {
-    let context =
-        ContextResponseBuilder::new(db, symbol, file_hint, profile).map_err(|e| e.to_string())?;
+    assemble_context_self_healing_by_id(db, None, symbol, file_hint, profile)
+}
+
+/// Same as `assemble_context_self_healing`, but when `symbol_id` is supplied
+/// (a resolver-confirmed id, e.g. `resolver::resolve_symbol`'s
+/// `ResolvedSymbol.id`) the initial assembly looks that row up directly
+/// instead of re-running the name/file_hint match — so this can never
+/// silently operate on a different same-named symbol than the one that was
+/// actually resolved. The post-reindex refresh always re-resolves by name,
+/// since reindexing can change row ids.
+pub fn assemble_context_self_healing_by_id<'a>(
+    db: &'a Database,
+    symbol_id: Option<i64>,
+    symbol: &str,
+    file_hint: Option<&str>,
+    profile: ResponseProfile,
+) -> Result<Option<ContextResponseBuilder<'a>>, String> {
+    let context = match symbol_id {
+        Some(id) => ContextResponseBuilder::new_by_id(db, id, profile),
+        None => ContextResponseBuilder::new(db, symbol, file_hint, profile),
+    }
+    .map_err(|e| e.to_string())?;
     let context = match context {
         Some(c) => c,
         None => return Ok(None),

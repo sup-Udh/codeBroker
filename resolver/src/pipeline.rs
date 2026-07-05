@@ -11,6 +11,7 @@
 //! through to a random fallback" failure mode the rest of CodeBroker used to
 //! have scattered across individual tools.
 
+use crate::naming::CanonicalNameResolver;
 use crate::types::*;
 use storage::Database;
 
@@ -20,19 +21,13 @@ const SEMANTIC_THRESHOLD: f32 = 0.35;
 /// Ambiguous instead of arbitrarily picking the marginally-higher one.
 const SEMANTIC_AMBIGUITY_MARGIN: f32 = 0.03;
 
+/// The one path-normalization implementation, shared with every other
+/// `path_scope`-consuming caller via `CanonicalNameResolver::normalize_path` —
+/// this used to be a second, independently-maintained copy of the same
+/// logic, which is exactly the kind of drift that let path handling diverge
+/// between tools.
 fn normalize_query_path(db: &Database, q: &str) -> String {
-    let mut normalized = q.trim().replace('\\', "/");
-    let root = db.project_root.replace('\\', "/");
-    
-    if normalized.starts_with(&root) {
-        normalized = normalized[root.len()..].to_string();
-    }
-    
-    normalized
-        .trim_start_matches('/')
-        .trim_start_matches("./")
-        .trim_end_matches('/')
-        .to_string()
+    CanonicalNameResolver::normalize_path(db, q)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,20 +528,26 @@ fn stage_feature(db: &Database, query: &str) -> Option<ResolvedEntity> {
 /// algorithm IS this stage's implementation — the resolver doesn't
 /// reimplement it, it owns the decision of whether the result is confident
 /// enough to call "resolved").
-pub fn resolve_subsystem(
+fn try_discover_subsystem(
     db: &Database,
     name: &str,
     semantic_tokens: &[String],
     query_vector: Option<&[f32]>,
-) -> ResolvedEntity {
-    match query::subsystem::discover_subsystem(db, name, semantic_tokens, query_vector) {
+) -> Option<ResolvedEntity> {
+    match query::subsystem::discover_subsystem(
+        db,
+        name,
+        semantic_tokens,
+        query_vector,
+        query::subsystem::TraversalScope::Expanded,
+    ) {
         Ok(stats) if !stats.files.is_empty() && stats.confidence != "Low" => {
             let score = match stats.confidence.as_str() {
                 "High" => 90,
                 "Medium" => 65,
                 _ => 30,
             };
-            ResolvedEntity::Subsystem(ResolvedSubsystem {
+            Some(ResolvedEntity::Subsystem(ResolvedSubsystem {
                 name: stats.name,
                 file_count: stats.files.len(),
                 symbol_count: stats.symbols.len(),
@@ -560,17 +561,41 @@ pub fn resolve_subsystem(
                 files: stats.files,
                 symbols: stats.symbols,
                 routes: stats.routes,
-            })
+            }))
         }
-        _ => ResolvedEntity::NotFound(NotFound {
-            query: name.to_string(),
-            reason: format!(
-                "No subsystem matching '{}' could be confidently discovered.",
-                name
-            ),
-            stages_tried: vec!["subsystem".to_string()],
-        }),
+        _ => None,
     }
+}
+
+/// Resolves a query to a subsystem. Tries the canonicalized alias first
+/// (`CanonicalNameResolver::resolve_subsystem_name`, e.g. "authentication"/
+/// "AUTH"/"login" -> "auth") so that different tools calling this with
+/// different-but-equivalent spellings of the same subsystem converge on the
+/// identical result, falling back to the raw input for names the alias
+/// table doesn't recognize.
+pub fn resolve_subsystem(
+    db: &Database,
+    name: &str,
+    semantic_tokens: &[String],
+    query_vector: Option<&[f32]>,
+) -> ResolvedEntity {
+    let canonical = crate::naming::CanonicalNameResolver::resolve_subsystem_name(name);
+    if canonical != name.trim().to_lowercase() {
+        if let Some(r) = try_discover_subsystem(db, &canonical, semantic_tokens, query_vector) {
+            return r;
+        }
+    }
+    if let Some(r) = try_discover_subsystem(db, name, semantic_tokens, query_vector) {
+        return r;
+    }
+    ResolvedEntity::NotFound(NotFound {
+        query: name.to_string(),
+        reason: format!(
+            "No subsystem matching '{}' could be confidently discovered.",
+            name
+        ),
+        stages_tried: vec!["subsystem".to_string()],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -622,9 +647,13 @@ pub fn resolve_any(
         return r;
     }
     stages_tried.push("subsystem".to_string());
-    if let Ok(stats) =
-        query::subsystem::discover_subsystem(db, query, semantic_tokens, query_vector)
-    {
+    if let Ok(stats) = query::subsystem::discover_subsystem(
+        db,
+        query,
+        semantic_tokens,
+        query_vector,
+        query::subsystem::TraversalScope::Expanded,
+    ) {
         if !stats.files.is_empty() && stats.confidence != "Low" {
             let score = if stats.confidence == "High" { 90 } else { 65 };
             return ResolvedEntity::Subsystem(ResolvedSubsystem {

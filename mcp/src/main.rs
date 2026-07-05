@@ -126,6 +126,18 @@ fn relative_hint<'a>(db: &storage::Database, absolute_path: &'a str) -> &'a str 
         .unwrap_or(absolute_path)
 }
 
+/// `path_scope` arguments are matched against stored (indexed) paths with a
+/// plain substring check in the query layer — unlike symbol/file resolution,
+/// they never went through any path normalization at all. A caller passing
+/// Windows-style backslashes, a leading `./`, or an absolute path prefixed
+/// with the project root would silently get zero matches instead of the
+/// expected results. Normalizing once here, at the dispatch boundary, fixes
+/// every `path_scope`-consuming tool without touching their internal
+/// `path.contains(scope)` matching.
+fn normalized_path_scope(db: &storage::Database, raw: Option<&str>) -> Option<String> {
+    raw.map(|s| resolver::CanonicalNameResolver::normalize_path(db, s))
+}
+
 /// Computes semantic expansion tokens and a query embedding vector for a
 /// given query string. Returns `(tokens, vector, llm_used)`.
 ///
@@ -1100,7 +1112,8 @@ Treat native tools as the repository's implementation layer."#;
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "subsystem_name": { "type": "string", "description": "Subsystem name to discover — e.g. a folder name like 'auth' or 'billing'. Matched as a substring, not an exact path." }
+                                                "subsystem_name": { "type": "string", "description": "Subsystem name to discover — e.g. a folder name like 'auth' or 'billing'. Matched as a substring, not an exact path." },
+                                                "scope": { "type": "string", "enum": ["strict", "expanded", "full"], "description": "How far graph expansion walks past the initial seed matches: 'strict' returns only the seeds, 'expanded' (default) allows up to 3 cohesion-gated hops, 'full' allows up to 8. A hard cap of 150 files always applies regardless of scope (see the 'truncated' field in the response). Does not affect whether the subsystem is found — only how much detail is reported." }
                                             },
                                             "required": ["subsystem_name"]
                                         }
@@ -1290,7 +1303,7 @@ Treat native tools as the repository's implementation layer."#;
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "min_length": { "type": "number", "description": "Default 80. Minimum character length of a block to be considered for duplicate detection." },
+                                                "min_length": { "type": "number", "description": "Default 15. Minimum AST node count a symbol's body must have to be considered — not character length. Low enough to catch small copy-pasted functions, high enough to skip trivial one-liners." },
                                                 "path_scope": { "type": "string", "description": "Optional substring to restrict the scan to files whose path contains it." }
                                             }
                                         }
@@ -1390,6 +1403,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
+                                            let symbol_id = resolved.id;
                                             let symbol = resolved.name.as_str();
                                             let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
@@ -1404,7 +1418,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 "verbose" => query::response::ResponseProfile::Verbose,
                                                 _ => query::response::ResponseProfile::Standard,
                                             };
-                                            match semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, profile).map_err(|e| e.to_string()) {
+                                            match semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, profile).map_err(|e| e.to_string()) {
                                                 Ok(Some(context)) => {
                                                     if format_opt == "markdown" {
                                                         let mut md = context.build_markdown().unwrap_or_else(|_| "Error building markdown".to_string());
@@ -1455,6 +1469,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match resolve_symbol_for_tool(&db, symbol, file_hint, line_hint) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
+                                            let symbol_id = resolved.id;
                                             let symbol = resolved.name.as_str();
                                             let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             // Self-heals a stale defining file instead of just
@@ -1466,13 +1481,32 @@ Treat native tools as the repository's implementation layer."#;
                                             // the incremental reindex itself fails, falls back to
                                             // the stale context with a loud warning rather than
                                             // erroring outright.
-                                            let context = semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
+                                            let context = semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
                                             let stale_warning = still_stale.then(|| format!(
                                                 "WARNING: '{}' has been modified on disk since it was indexed, and the automatic incremental reindex failed. The dependency data below may be computed against stale symbol boundaries. Run reindex_workspace before trusting this analysis.\n\n",
                                                 symbol
                                             ));
-                                            if format == "structured" || format == "json" {
+                                            if context.is_none() {
+                                                // `resolve_symbol_for_tool` just confirmed this exact id
+                                                // resolves — if context assembly then can't find a
+                                                // matching row, that's a graph inconsistency (e.g. a
+                                                // stale/just-deleted symbol), not a legitimate "zero
+                                                // dependencies" answer. Silently falling through to the
+                                                // cheap path below would report a confident-looking
+                                                // "risk_level: LOW, total_dependencies: 0" that's actively
+                                                // wrong rather than surfacing the real problem.
+                                                serde_json::json!({
+                                                    "symbol": symbol,
+                                                    "error": "graph_inconsistent",
+                                                    "semantic_node_resolved": true,
+                                                    "context_available": false,
+                                                    "reason": format!(
+                                                        "'{}' resolved to a valid symbol (id {}), but context assembly could not find a matching row afterward. This is a graph inconsistency, not a 'this symbol has no dependencies' answer — re-run reindex_workspace and retry.",
+                                                        symbol, symbol_id
+                                                    ),
+                                                }).to_string()
+                                            } else if format == "structured" || format == "json" {
                                                 let mut out = context.as_ref().map(|c| serde_json::to_string_pretty(&c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or_default()).unwrap_or_default();
                                                 if let Some(w) = &stale_warning {
                                                     out = format!("{}{}", w, out);
@@ -1645,15 +1679,43 @@ Treat native tools as the repository's implementation layer."#;
                                 let target = arguments.get("target").and_then(|t| t.as_str()).unwrap_or_default();
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        if let Ok(manifest) = indexer::developer::analyzer::RepositoryAnalyzer::analyze(&db) {
-                                            let symbol_index = indexer::resolver::index::SymbolIndex::build(&db).unwrap();
-                                            if let Some(capsule) = indexer::developer::capsules::CapsuleBuilder::build(target, &manifest.subsystems, &symbol_index, &manifest.hotspots) {
-                                                serde_json::to_string_pretty(&capsule).unwrap_or_default()
-                                            } else {
-                                                serde_json::json!({"error": format!("Subsystem '{}' not found.", target)}).to_string()
+                                        // Previously built its own capsule from
+                                        // `indexer::developer::analyzer::RepositoryAnalyzer` +
+                                        // `indexer::resolver::index::SymbolIndex` — a subsystem
+                                        // detector entirely unrelated to the one `subsystem_stats`/
+                                        // `subsystem_communication` use, so a subsystem name that
+                                        // resolved with high confidence there could still come back
+                                        // "not found" here. Now gated on the same
+                                        // `resolver::resolve_subsystem` + `discover_subsystem` pair,
+                                        // so all three subsystem tools agree by construction.
+                                        let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(target);
+                                        match resolver::resolve_subsystem(&db, target, &semantic_tokens, query_vector_opt.as_deref()) {
+                                            resolver::ResolvedEntity::Subsystem(_) => {
+                                                match query::subsystem::discover_subsystem(&db, target, &semantic_tokens, query_vector_opt.as_deref(), query::subsystem::TraversalScope::Expanded) {
+                                                    Ok(stats) => {
+                                                        let models: Vec<&String> = stats.files.iter()
+                                                            .filter(|p| p.contains("model") || p.contains("schema") || p.contains("entities"))
+                                                            .collect();
+                                                        let tests: Vec<&String> = stats.files.iter()
+                                                            .filter(|p| p.contains("test") || p.contains("spec"))
+                                                            .collect();
+                                                        let entry_points = if stats.entrypoints.is_empty() { &stats.routes } else { &stats.entrypoints };
+                                                        let capsule = serde_json::json!({
+                                                            "target": stats.name,
+                                                            "core_files": stats.files,
+                                                            "public_apis": stats.routes,
+                                                            "models": models,
+                                                            "tests": tests,
+                                                            "dependencies": stats.dependencies,
+                                                            "dependents": stats.consumers,
+                                                            "entry_points": entry_points,
+                                                        });
+                                                        serde_json::to_string_pretty(&capsule).unwrap_or_default()
+                                                    }
+                                                    Err(e) => serde_json::json!({"error": format!("Failed to discover subsystem '{}': {}", target, e)}).to_string(),
+                                                }
                                             }
-                                        } else {
-                                            serde_json::json!({"error": "Failed to analyze repository."}).to_string()
+                                            other => other.to_json_string(),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1686,9 +1748,11 @@ Treat native tools as the repository's implementation layer."#;
                                 }
                             }
                             "repository_stats" => {
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
+                                        let path_scope = path_scope.as_deref();
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview_scoped(&db, path_scope) {
                                             Ok(overview) => {
@@ -1908,7 +1972,7 @@ Treat native tools as the repository's implementation layer."#;
                                         Ok(resolved) => {
                                         let hint = relative_hint(&db, &resolved.file_path);
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                        match query::graph::explore_graph_scoped(&db, &resolved.name, depth, direction, max_nodes, Some(hint)) {
+                                        match query::graph::explore_graph_scoped(&db, &resolved.name, depth, direction, max_nodes, Some(hint), Some(resolved.id)) {
                                             Ok(res) => {
                                                 if format_opt == "markdown" {
                                                     res.to_markdown()
@@ -1947,7 +2011,7 @@ Treat native tools as the repository's implementation layer."#;
                                         Ok(to_resolved) => {
                                             let from_hint = relative_hint(&db, &from_resolved.file_path);
                                             let to_hint = relative_hint(&db, &to_resolved.file_path);
-                                            match query::graph::shortest_path(&db, &from_resolved.name, &to_resolved.name, Some(from_hint), Some(to_hint)) {
+                                            match query::graph::shortest_path(&db, &from_resolved.name, &to_resolved.name, Some(from_hint), Some(to_hint), Some(from_resolved.id), Some(to_resolved.id)) {
                                                 Ok(res) => {
                                                     estimated_raw_context_tokens = res.nodes.len() * 50; // rough estimation
                                                     serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing path".to_string())
@@ -1963,9 +2027,11 @@ Treat native tools as the repository's implementation layer."#;
                                 }
                             }
                             "list_entrypoints" => {
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
+                                        let path_scope = path_scope.as_deref();
                                         match query::subsystem::list_entrypoints(&db, path_scope) {
                                             Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing entrypoints".to_string()),
                                             Err(e) => format!("Error listing entrypoints: {}", e),
@@ -1991,9 +2057,21 @@ Treat native tools as the repository's implementation layer."#;
                                         } else if b_resolved.is_not_found() {
                                             b_resolved.to_json_string()
                                         } else {
-                                            match query::subsystem::subsystem_communication(&db, subsystem_a, subsystem_b) {
-                                                Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
-                                                Err(e) => format!("Error computing subsystem communication: {}", e),
+                                            // Reuse the files each side already resolved instead of
+                                            // handing subsystem_communication the raw input strings
+                                            // to re-derive independently — a name resolved via a
+                                            // canonicalized alias (e.g. "authentication" -> "auth")
+                                            // must not silently re-resolve differently (or fail) a
+                                            // second time on the un-canonicalized input.
+                                            match (&a_resolved, &b_resolved) {
+                                                (resolver::ResolvedEntity::Subsystem(a), resolver::ResolvedEntity::Subsystem(b)) => {
+                                                    match query::subsystem::subsystem_communication(&db, &a.name, &b.name, &a.files, &b.files) {
+                                                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
+                                                        Err(e) => format!("Error computing subsystem communication: {}", e),
+                                                    }
+                                                }
+                                                _ if !matches!(a_resolved, resolver::ResolvedEntity::Subsystem(_)) => a_resolved.to_json_string(),
+                                                _ => b_resolved.to_json_string(),
                                             }
                                         }
                                     }
@@ -2002,10 +2080,12 @@ Treat native tools as the repository's implementation layer."#;
                             }
                             "architectural_hotspots" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(20) as usize;
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
+                                        let path_scope = path_scope.as_deref();
                                         match query::graph::architectural_hotspots(&db, limit, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.top_hotspots.len() * 50; // rough estimation
@@ -2019,10 +2099,12 @@ Treat native tools as the repository's implementation layer."#;
                             }
                             "dependency_cycles" => {
                                 let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(25) as usize;
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
                                 let include_same_file = arguments.get("include_same_file").and_then(|b| b.as_bool()).unwrap_or(false);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
+                                        let path_scope = path_scope.as_deref();
                                         match query::graph::dependency_cycles(&db, limit, path_scope, include_same_file) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
@@ -2045,10 +2127,12 @@ Treat native tools as the repository's implementation layer."#;
                                 }
                             }
                             "find_duplicate_logic" => {
-                                let min_length = arguments.get("min_length").and_then(|n| n.as_u64()).unwrap_or(80) as usize;
-                                let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let min_length = arguments.get("min_length").and_then(|n| n.as_u64()).unwrap_or(15) as usize;
+                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
+                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
+                                        let path_scope = path_scope.as_deref();
                                         match query::duplicates::find_duplicate_logic(&db, min_length, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.groups.len() * 60; // rough estimation
@@ -2076,7 +2160,7 @@ Treat native tools as the repository's implementation layer."#;
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                         let hint = relative_hint(&db, &resolved.file_path);
-                                        match query::graph::graph_subtree(&db, &resolved.name, depth, max_nodes, Some(hint)) {
+                                        match query::graph::graph_subtree(&db, &resolved.name, depth, max_nodes, Some(hint), Some(resolved.id)) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.node_count * 50; // rough estimation
                                                 if format_opt == "markdown" {
@@ -2141,7 +2225,7 @@ Treat native tools as the repository's implementation layer."#;
                                             let symbol = resolved.name.as_str();
                                             let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
-                                            let context = query::context::ContextResponseBuilder::new(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
+                                            let context = query::context::ContextResponseBuilder::new_by_id(&db, resolved.id, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let implementation = serde_json::json!({
                                                 "symbol_source": source,
                                                 "context": context.map(|c| c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or(serde_json::json!({}))
@@ -2161,6 +2245,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
+                                            let symbol_id = resolved.id;
                                             let symbol = resolved.name.as_str();
                                             let file_hint = Some(relative_hint(&db, &resolved.file_path));
                                             // Self-heal on a stale defining file before reading
@@ -2168,7 +2253,7 @@ Treat native tools as the repository's implementation layer."#;
                                             // is re-read AFTER any reindex too, since edit context
                                             // is exactly the case where stale start_line/end_line
                                             // boundaries are most dangerous to act on.
-                                            let context = semantic::staleness::assemble_context_self_healing(&db, symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
+                                            let context = semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                             let mut edit_context = serde_json::json!({
@@ -2194,6 +2279,14 @@ Treat native tools as the repository's implementation layer."#;
                             }
                             "subsystem_stats" => {
                                 let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
+                                // Controls how much detail is returned about an already-resolved
+                                // subsystem, not whether it resolves at all — the gate below
+                                // always uses Expanded, matching every other subsystem tool, so
+                                // a narrower/wider `scope` here can never change which subsystem
+                                // was found, only how much of it is reported.
+                                let scope = query::subsystem::TraversalScope::from_str(
+                                    arguments.get("scope").and_then(|s| s.as_str()).unwrap_or("expanded"),
+                                );
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(name);
@@ -2203,7 +2296,7 @@ Treat native tools as the repository's implementation layer."#;
                                         // stats struct that looked like a (wrong) answer.
                                         match resolver::resolve_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref()) {
                                             resolver::ResolvedEntity::Subsystem(_) => {
-                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref()) {
+                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref(), scope) {
                                                     Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
                                                     Err(e) => format!("Error discovering subsystem: {}", e),
                                                 }

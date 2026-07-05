@@ -15,7 +15,61 @@ pub struct SubsystemStats {
     pub clusters: Vec<Vec<String>>,
     pub subsystem_hash: String,
     pub confidence: String,
+    /// Which `TraversalScope` produced this result.
+    pub scope: String,
+    /// True when the discovered subsystem exceeded `MAX_SUBSYSTEM_FILES` and
+    /// was cut off — a caller must be told this explicitly rather than
+    /// silently receiving a partial (and possibly misleadingly "complete"
+    /// looking) file list.
+    pub truncated: bool,
 }
+
+/// How far `discover_subsystem`'s graph-expansion step is allowed to walk
+/// past the initial lexical/semantic seed matches. Exists because the
+/// previous fixed 3-hop expansion had no caller-facing control at all — a
+/// cohesively-connected subsystem could pull in hundreds of files with no
+/// way to ask for a narrower (or deliberately wider) view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalScope {
+    /// Only the seed matches themselves — no graph expansion.
+    Strict,
+    /// Today's default: up to 3 cohesion-gated hops.
+    Expanded,
+    /// A deliberately wider dependency radius (more hops), still subject to
+    /// `MAX_SUBSYSTEM_FILES`.
+    Full,
+}
+
+impl TraversalScope {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "strict" => TraversalScope::Strict,
+            "full" => TraversalScope::Full,
+            _ => TraversalScope::Expanded,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            TraversalScope::Strict => "strict",
+            TraversalScope::Expanded => "expanded",
+            TraversalScope::Full => "full",
+        }
+    }
+
+    fn max_hops(&self) -> usize {
+        match self {
+            TraversalScope::Strict => 0,
+            TraversalScope::Expanded => 3,
+            TraversalScope::Full => 8,
+        }
+    }
+}
+
+/// Hard ceiling on files returned by `discover_subsystem`, applied
+/// regardless of `TraversalScope` — even `Full` must not be able to dump an
+/// entire repository into one response.
+pub const MAX_SUBSYSTEM_FILES: usize = 150;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct EntrypointEntry {
@@ -120,14 +174,20 @@ pub fn list_entrypoints(
 /// lists relative to a SINGLE subsystem; answering a two-subsystem question
 /// previously required calling it twice and manually diffing the two result
 /// sets (benchmark run_001's gap #3).
+/// `files_a`/`files_b` must come from the caller's own subsystem resolution
+/// (e.g. `resolver::resolve_subsystem`'s `ResolvedSubsystem.files`) rather
+/// than this function re-deriving them from `a`/`b` via a second, independent
+/// `discover_subsystem` call — otherwise a name that resolved via a
+/// canonicalized alias (e.g. "authentication" -> "auth") could silently
+/// re-resolve differently (or fail) here, using the raw un-canonicalized
+/// input. `a`/`b` are only used as output labels.
 pub fn subsystem_communication(
     db: &Database,
     a: &str,
     b: &str,
+    files_a: &[String],
+    files_b: &[String],
 ) -> Result<SubsystemCommunication, String> {
-    let stats_a = discover_subsystem(db, a, &[], None)?;
-    let stats_b = discover_subsystem(db, b, &[], None)?;
-
     // Resolve each subsystem's files to file ids. We key communication on FILE
     // membership (source_file_id / target symbol's file_id), exactly as
     // `discover_subsystem`'s `consumers`/`dependencies` do — previously this
@@ -154,8 +214,8 @@ pub fn subsystem_communication(
         Ok(ids)
     };
 
-    let files_a = file_ids_for(&stats_a.files)?;
-    let files_b = file_ids_for(&stats_b.files)?;
+    let file_ids_a = file_ids_for(files_a)?;
+    let file_ids_b = file_ids_for(files_b)?;
 
     // Every edge with a target symbol, carrying both the source file and the
     // target symbol's file so we can classify by file membership. The source
@@ -193,10 +253,10 @@ pub fn subsystem_communication(
                 .to_string()
         });
 
-        if files_a.contains(&src_file) && files_b.contains(&tgt_file) {
+        if file_ids_a.contains(&src_file) && file_ids_b.contains(&tgt_file) {
             a_to_b.push((src_label.clone(), tgt_name.clone()));
         }
-        if files_b.contains(&src_file) && files_a.contains(&tgt_file) {
+        if file_ids_b.contains(&src_file) && file_ids_a.contains(&tgt_file) {
             b_to_a.push((src_label, tgt_name));
         }
     }
@@ -226,6 +286,7 @@ pub fn discover_subsystem(
     name: &str,
     semantic_tokens: &[String],
     query_vector: Option<&[f32]>,
+    scope: TraversalScope,
 ) -> Result<SubsystemStats, String> {
     // 1. Seed Generation (Hybrid Lexical + Semantic + Graph)
     let (seed_results, _) = crate::engine::search_symbols(
@@ -288,9 +349,16 @@ pub fn discover_subsystem(
     // 2. Graph-Based Expansion (Cohesion-Driven Localized Traversal)
     // Expand from seeds to adjacent nodes that are tightly coupled to the subsystem.
     let mut current_frontier = matched_symbol_ids.clone();
+    let mut truncated = false;
 
-    // We expand for a maximum of 3 hops to prevent unbounded sprawling
-    for _hop in 0..3 {
+    // Hop ceiling is caller-controlled via `scope` (see `TraversalScope`);
+    // `MAX_SUBSYSTEM_FILES` is an absolute ceiling that applies regardless of
+    // scope, so even `Full` can't pull in an entire repository.
+    for _hop in 0..scope.max_hops() {
+        if matched_file_ids.len() >= MAX_SUBSYSTEM_FILES {
+            truncated = true;
+            break;
+        }
         let mut next_candidates = HashSet::new();
 
         // Gather all immediate neighbors of the current frontier
@@ -384,6 +452,31 @@ pub fn discover_subsystem(
             break; // Cohesion dropped, subsystem boundary found
         }
         current_frontier = next_frontier;
+    }
+
+    // Final safeguard: even if the per-hop check above didn't catch it (e.g.
+    // the seed matches alone already exceed the cap under `Strict`), never
+    // hand back more than `MAX_SUBSYSTEM_FILES` — deterministically keep the
+    // lowest file ids and drop any matched symbol whose file didn't make the
+    // cut, so `files`/`symbols`/`dependencies`/`consumers` all stay
+    // consistent with each other.
+    if matched_file_ids.len() > MAX_SUBSYSTEM_FILES {
+        truncated = true;
+        let mut sorted_fids: Vec<i64> = matched_file_ids.iter().cloned().collect();
+        sorted_fids.sort();
+        sorted_fids.truncate(MAX_SUBSYSTEM_FILES);
+        let kept_fids: HashSet<i64> = sorted_fids.into_iter().collect();
+        matched_symbol_ids.retain(|&s_id| {
+            db.conn
+                .query_row(
+                    "SELECT file_id FROM symbols WHERE id = ?1",
+                    rusqlite::params![s_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|f_id| kept_fids.contains(&f_id))
+                .unwrap_or(false)
+        });
+        matched_file_ids = kept_fids;
     }
 
     // 3. Formatting Output
@@ -589,5 +682,7 @@ pub fn discover_subsystem(
         clusters,
         subsystem_hash,
         confidence: confidence_val,
+        scope: scope.as_str().to_string(),
+        truncated,
     })
 }

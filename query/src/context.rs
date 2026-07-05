@@ -44,6 +44,22 @@ pub struct ContextResponseBuilder<'a> {
     pub budget: TokenBudget,
 }
 
+/// How the target symbol's row is located. `ById` is the fast path a caller
+/// uses when it already holds a resolver-confirmed id (e.g.
+/// `resolver::resolve_symbol`'s `ResolvedSymbol.id`) — it looks the row up
+/// directly instead of re-running the name/`LIKE` query a second time, so
+/// this builder can never end up operating on a different same-named symbol
+/// than the one the resolver actually picked (two symbols with an identical
+/// name+file, such as overloads or nested closures, previously could diverge
+/// here since this was an independent, unranked `LIMIT 1` lookup).
+enum SymbolLocator<'a> {
+    ById(i64),
+    ByName {
+        name: &'a str,
+        path_scope: Option<&'a str>,
+    },
+}
+
 impl<'a> ContextResponseBuilder<'a> {
     pub fn new(
         db: &'a Database,
@@ -51,47 +67,102 @@ impl<'a> ContextResponseBuilder<'a> {
         path_scope: Option<&str>,
         profile: ResponseProfile,
     ) -> Result<Option<Self>> {
-        let mut target_info = if let Some(scope) = path_scope {
-            let mut stmt = db.conn.prepare(
-                "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
-                 FROM symbols
-                 JOIN files ON symbols.file_id = files.id
-                 WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
-            )?;
-            let like_scope = format!("%{}%", scope);
-            stmt.query_row(rusqlite::params![symbol_name, like_scope], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,            // id
-                    row.get::<_, String>(1)?,         // name
-                    row.get::<_, String>(2)?,         // kind
-                    row.get::<_, String>(3)?,         // path
-                    row.get::<_, i64>(4)?,            // line_number
-                    row.get::<_, i64>(5)?,            // file_id
-                    row.get::<_, Option<String>>(6)?, // signature
-                    row.get::<_, Option<String>>(7)?, // directive
-                    row.get::<_, Option<String>>(8)?, // content_hash
-                ))
-            })
-        } else {
-            let mut stmt = db.conn.prepare(
-                "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
-                 FROM symbols
-                 JOIN files ON symbols.file_id = files.id
-                 WHERE symbols.name = ?1 LIMIT 1"
-            )?;
-            stmt.query_row(rusqlite::params![symbol_name], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,            // id
-                    row.get::<_, String>(1)?,         // name
-                    row.get::<_, String>(2)?,         // kind
-                    row.get::<_, String>(3)?,         // path
-                    row.get::<_, i64>(4)?,            // line_number
-                    row.get::<_, i64>(5)?,            // file_id
-                    row.get::<_, Option<String>>(6)?, // signature
-                    row.get::<_, Option<String>>(7)?, // directive
-                    row.get::<_, Option<String>>(8)?, // content_hash
-                ))
-            })
+        Self::new_with_locator(
+            db,
+            SymbolLocator::ByName {
+                name: symbol_name,
+                path_scope,
+            },
+            profile,
+        )
+    }
+
+    /// Fast path for callers that already hold a resolved symbol id — see
+    /// `SymbolLocator::ById`.
+    pub fn new_by_id(db: &'a Database, symbol_id: i64, profile: ResponseProfile) -> Result<Option<Self>> {
+        Self::new_with_locator(db, SymbolLocator::ById(symbol_id), profile)
+    }
+
+    fn new_with_locator(
+        db: &'a Database,
+        locator: SymbolLocator<'_>,
+        profile: ResponseProfile,
+    ) -> Result<Option<Self>> {
+        let symbol_name = match &locator {
+            SymbolLocator::ById(_) => "",
+            SymbolLocator::ByName { name, .. } => *name,
+        };
+        let target_info = match &locator {
+            SymbolLocator::ById(id) => {
+                let mut stmt = db.conn.prepare(
+                    "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
+                     FROM symbols
+                     JOIN files ON symbols.file_id = files.id
+                     WHERE symbols.id = ?1 LIMIT 1"
+                )?;
+                stmt.query_row(rusqlite::params![id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,            // id
+                        row.get::<_, String>(1)?,         // name
+                        row.get::<_, String>(2)?,         // kind
+                        row.get::<_, String>(3)?,         // path
+                        row.get::<_, i64>(4)?,            // line_number
+                        row.get::<_, i64>(5)?,            // file_id
+                        row.get::<_, Option<String>>(6)?, // signature
+                        row.get::<_, Option<String>>(7)?, // directive
+                        row.get::<_, Option<String>>(8)?, // content_hash
+                    ))
+                })
+            }
+            SymbolLocator::ByName {
+                name,
+                path_scope: Some(scope),
+            } => {
+                let mut stmt = db.conn.prepare(
+                    "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
+                     FROM symbols
+                     JOIN files ON symbols.file_id = files.id
+                     WHERE symbols.name = ?1 AND files.path LIKE ?2 LIMIT 1"
+                )?;
+                let like_scope = format!("%{}%", scope);
+                stmt.query_row(rusqlite::params![name, like_scope], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,            // id
+                        row.get::<_, String>(1)?,         // name
+                        row.get::<_, String>(2)?,         // kind
+                        row.get::<_, String>(3)?,         // path
+                        row.get::<_, i64>(4)?,            // line_number
+                        row.get::<_, i64>(5)?,            // file_id
+                        row.get::<_, Option<String>>(6)?, // signature
+                        row.get::<_, Option<String>>(7)?, // directive
+                        row.get::<_, Option<String>>(8)?, // content_hash
+                    ))
+                })
+            }
+            SymbolLocator::ByName {
+                name,
+                path_scope: None,
+            } => {
+                let mut stmt = db.conn.prepare(
+                    "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, symbols.file_id, symbols.signature, files.metadata, files.content_hash
+                     FROM symbols
+                     JOIN files ON symbols.file_id = files.id
+                     WHERE symbols.name = ?1 LIMIT 1"
+                )?;
+                stmt.query_row(rusqlite::params![name], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,            // id
+                        row.get::<_, String>(1)?,         // name
+                        row.get::<_, String>(2)?,         // kind
+                        row.get::<_, String>(3)?,         // path
+                        row.get::<_, i64>(4)?,            // line_number
+                        row.get::<_, i64>(5)?,            // file_id
+                        row.get::<_, Option<String>>(6)?, // signature
+                        row.get::<_, Option<String>>(7)?, // directive
+                        row.get::<_, Option<String>>(8)?, // content_hash
+                    ))
+                })
+            }
         };
 
         let (
@@ -116,6 +187,13 @@ impl<'a> ContextResponseBuilder<'a> {
                 info.7,
                 info.8,
             ),
+            Err(rusqlite::Error::QueryReturnedNoRows) if matches!(locator, SymbolLocator::ById(_)) => {
+                // An id lookup that finds nothing means the id is stale/invalid
+                // (e.g. the row was deleted since it was resolved) — there is
+                // no name to fall back to guessing a file from, so this is a
+                // definitive miss rather than a file-search candidate.
+                return Ok(None);
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let mut file_stmt = db.conn.prepare(
                     "SELECT id, path, metadata, content_hash FROM files WHERE path LIKE ?1 LIMIT 1",

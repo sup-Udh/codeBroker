@@ -95,25 +95,19 @@ pub fn find_duplicate_logic(
 
         let source = String::from_utf8_lossy(&content[s..e]).to_string();
 
-        // We repurpose min_normalized_len as the minimum AST node count (e.g. 15 nodes)
-        // rather than string length
+        // `min_normalized_len` is the minimum AST node count (not character
+        // length, despite the name/original design) a symbol's body must
+        // have to be considered — small enough to avoid trivial one-liners
+        // dominating the report, large enough that renamed-identifier
+        // duplicates of a real function still clear it. See the
+        // `find_duplicate_logic` MCP tool schema for the caller-facing
+        // default.
         let (normalized, node_count) = match normalize(&source, &abs_path) {
             Some(res) => res,
             None => continue,
         };
 
-        // 10 nodes is a good minimum floor to avoid trivial single lines,
-        // and we use the provided min_normalized_len parameter which was originally string length
-        // but now we'll compare it dynamically or just use a fixed floor.
-        // Actually, let's treat min_normalized_len = 15 for AST node counts if the caller passes something reasonable,
-        // or just use 15 directly if the caller passes 150 (the old string length).
-        let effective_min_nodes = if min_normalized_len > 100 {
-            15
-        } else {
-            min_normalized_len
-        };
-
-        if node_count < effective_min_nodes {
+        if node_count < min_normalized_len {
             continue;
         }
 
@@ -136,9 +130,14 @@ pub fn find_duplicate_logic(
         });
     }
 
+    // Two or more members with identical normalized structure is a
+    // duplicate group regardless of whether they live in the same file or
+    // different ones — copy-pasting a function twice within one file is as
+    // much "duplicate logic" as doing it across files, and the tool's own
+    // stated purpose (finding copy-pasted logic) doesn't distinguish the two.
     let mut result_groups: Vec<DuplicateGroup> = groups
         .into_iter()
-        .filter(|(_, (_, members, files))| members.len() > 1 && files.len() > 1)
+        .filter(|(_, (_, members, _))| members.len() > 1)
         .map(|(_, (normalized_length, members, _))| DuplicateGroup {
             normalized_length,
             members,
