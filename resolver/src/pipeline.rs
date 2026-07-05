@@ -689,15 +689,15 @@ pub fn resolve_any(
 }
 
 // ---------------------------------------------------------------------------
-// Multi-result search (search_codebase, generate_context_capsule)
+// Multi-result search (search_codebase)
 // ---------------------------------------------------------------------------
 
 /// Unified multi-result search entry point. Wraps `query::engine::search_symbols`
 /// and concept augmentation in one place so no MCP tool inlines either.
 ///
 /// This is the "find ranked candidates" complement to `resolve_symbol`/`resolve_any`
-/// (which resolve a single entity). Use it whenever the caller wants a list:
-/// `search_codebase` and pivot selection in `generate_context_capsule`.
+/// (which resolve a single entity). Use it whenever the caller wants a list, e.g.
+/// `search_codebase`.
 pub fn resolve_search(
     db: &Database,
     query: &str,

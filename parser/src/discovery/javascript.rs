@@ -112,6 +112,33 @@ fn emit_calls(
     language: &tree_sitter::Language,
     collector: &mut RelationshipCollector,
 ) {
+    // ---- JSX Component Usage ----
+    // React/Next.js component rendering: <BookingRepository /> or <UI.Button />
+    let q_jsx = "
+        (jsx_element open_tag: (jsx_opening_element name: (_) @component))
+        (jsx_self_closing_element name: (_) @component)
+    ";
+    if let Ok(query) = Query::new(language, q_jsx) {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let cn = &query.capture_names()[capture.index as usize];
+                if *cn != "component" {
+                    continue;
+                }
+                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
+                    let component_name = text.trim().to_string();
+                    let line = capture.node.start_position().row + 1;
+                    if !component_name.is_empty() && component_name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                        let rel = Relationship::new(component_name, RelationshipKind::ComponentUse, line);
+                        collector.emit(rel);
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Receiver-aware method calls: obj.method() where obj is an identifier ----
     // Emitted first so dedup keeps the version with receiver info. Without this,
     // every `foo.method()` call loses its receiver entirely (`source: None`),

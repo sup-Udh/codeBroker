@@ -73,7 +73,7 @@ pub fn find_duplicate_logic(
         let end_byte: i64 = row.get(6).unwrap_or(0);
 
         if let Some(scope) = path_scope {
-            if !rel_path.contains(scope) {
+            if !crate::path_matches_scope(&rel_path, scope) {
                 continue;
             }
         }

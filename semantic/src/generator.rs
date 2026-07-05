@@ -15,49 +15,33 @@ impl<'a> SummaryGenerator<'a> {
     }
 
     pub fn generate(&self, symbol_name: &str) -> Result<(String, bool), String> {
-        self.generate_scoped(symbol_name, None)
+        let mut stmt = self
+            .db
+            .conn
+            .prepare("SELECT id FROM symbols WHERE name = ?1 LIMIT 1")
+            .map_err(|e| e.to_string())?;
+        let symbol_id = stmt.query_row([symbol_name], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?;
+        
+        self.generate_by_id(symbol_id, symbol_name)
     }
 
-    /// Like `generate`, but when `file_hint` is given, only resolves a symbol
-    /// defined in a file whose path contains that substring.
-    pub fn generate_scoped(
+    pub fn generate_by_id(
         &self,
+        symbol_id: i64,
         symbol_name: &str,
-        file_hint: Option<&str>,
     ) -> Result<(String, bool), String> {
-        // 1. Get the symbol from the database
-        let (symbol_id, file_id) = if let Some(hint) = file_hint {
-            let mut stmt = self.db.conn.prepare(
-                "SELECT symbols.id, symbols.file_id FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.name = ?1 AND INSTR(files.path, ?2) > 0 LIMIT 1"
-            ).map_err(|e| e.to_string())?;
-            stmt.query_row(rusqlite::params![symbol_name, hint], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|_| {
-                format!(
-                    "Symbol '{}' not found in a file matching '{}'.",
-                    symbol_name, hint
-                )
-            })?
-        } else {
-            let mut stmt = self
-                .db
-                .conn
-                .prepare("SELECT id, file_id FROM symbols WHERE name = ?1 LIMIT 1")
-                .map_err(|e| e.to_string())?;
-            stmt.query_row([symbol_name], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|_| format!("Symbol '{}' not found in database.", symbol_name))?
-        };
-
-        // 2. Get the file path and read the source code
+        // 1. Get the file path
         let file_path: String = self
             .db
             .conn
-            .query_row("SELECT path FROM files WHERE id = ?1", [file_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT files.path FROM symbols JOIN files ON symbols.file_id = files.id WHERE symbols.id = ?1",
+                [symbol_id],
+                |row| row.get(0)
+            )
             .map_err(|e| e.to_string())?;
 
         // BUG FIX: this used to read `file_path` (the DB-relative path, e.g.
@@ -71,11 +55,10 @@ impl<'a> SummaryGenerator<'a> {
         let abs_file_path = self.db.resolve_path(&file_path);
         let source_code = fs::read_to_string(&abs_file_path).unwrap_or_default();
 
-        // 3. Assemble the ContextResponseBuilder
-        let builder = query::context::ContextResponseBuilder::new(
+        // 2. Assemble the ContextResponseBuilder
+        let builder = query::context::ContextResponseBuilder::new_by_id(
             self.db,
-            symbol_name,
-            file_hint,
+            symbol_id,
             query::response::ResponseProfile::Verbose,
         )
         .map_err(|e| e.to_string())?

@@ -2,7 +2,7 @@
 //! labels (auth, realtime, notifications, database, ...) based on keyword
 //! matches against the symbol's own name and its file's path. This runs
 //! independently of (and in addition to) literal substring/path search —
-//! `search_codebase`/`subsystem_stats`/`generate_context_capsule` consult it
+//! `search_codebase`/`subsystem_stats`/`prepare_context` consult it
 //! so a query like "authentication system" can surface `createClient`/
 //! `createAdminClient`/`signInWithOAuth` even though none of those names or
 //! their `utils/supabase/*.ts` path contain the literal word "auth" anywhere
@@ -53,7 +53,7 @@ pub const CONCEPTS: &[(&str, &[&str])] = &[
 
 /// Returns the concept names whose keyword list contains `term` (case
 /// insensitive, substring match either direction) — used by
-/// `search_codebase`/`generate_context_capsule` to map a free-text query
+/// `search_codebase`/`prepare_context` to map a free-text query
 /// term onto the concept(s) it should also search by, not just literal
 /// name/path matching.
 pub fn concepts_matching_term(term: &str) -> Vec<&'static str> {

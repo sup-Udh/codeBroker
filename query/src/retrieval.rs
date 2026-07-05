@@ -52,7 +52,7 @@ pub fn read_symbol_source_scoped(
         file_hint
     {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.attributes, symbols.metadata, files.content_hash
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.attributes, symbols.metadata, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 AND INSTR(files.path, ?2) > 0 LIMIT 5"
@@ -63,7 +63,7 @@ pub fn read_symbol_source_scoped(
         )
     } else {
         let stmt = db.conn.prepare(
-            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.attributes, symbols.metadata, files.content_hash
+            "SELECT files.path, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.attributes, symbols.metadata, files.content_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
              WHERE symbols.name = ?1 LIMIT 5"
@@ -181,6 +181,204 @@ pub fn read_symbol_source_scoped(
 
                 let deps = fetch_data_model_dependencies(db, symbol, file_id, signature.as_deref());
                 results.extend(deps);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Retrieves the source for a symbol using its primary key `symbol_id`.
+/// Bypasses ambiguous name resolution and path matching logic.
+pub fn read_symbol_source_by_id(
+    db: &Database,
+    symbol_id: i64,
+    include_dependencies: bool,
+) -> Result<Vec<SymbolSourceResult>, String> {
+    let mut stmt = db.conn.prepare(
+        "SELECT files.path, symbols.name, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.attributes, symbols.metadata, files.content_hash
+         FROM symbols
+         JOIN files ON symbols.file_id = files.id
+         WHERE symbols.id = ?1 LIMIT 1"
+    ).map_err(|e| e.to_string())?;
+
+    let mut rows = stmt
+        .query([&symbol_id])
+        .map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let file_path: String = row.get(0).unwrap_or_default();
+        let symbol_name: String = row.get(1).unwrap_or_default();
+        let abs_path = db.resolve_path(&file_path);
+        let kind: String = row.get(2).unwrap_or_default();
+        let start_line: i64 = row.get(3).unwrap_or(0);
+        let end_line: i64 = row.get(4).unwrap_or(start_line);
+        let start_byte: i64 = row.get(5).unwrap_or(0);
+        let end_byte: i64 = row.get(6).unwrap_or(start_byte);
+        let directive: Option<String> = row.get(7).unwrap_or(None);
+        let attributes_str: Option<String> = row.get(8).unwrap_or(None);
+        let attributes = attributes_str
+            .map(|s| serde_json::from_str(&s).unwrap_or_default())
+            .unwrap_or_default();
+        let metadata: Option<String> = row.get(9).unwrap_or(None);
+        let indexed_content_hash: Option<String> = row.get(10).unwrap_or(None);
+
+        let mut source = String::new();
+        let mut stale = false;
+        if let Ok(content) = fs::read(&abs_path) {
+            if let Some(indexed_hash) = &indexed_content_hash {
+                if *indexed_hash != storage::hash_content(&content) {
+                    stale = true;
+                }
+            }
+
+            if !stale {
+                let start = start_byte as usize;
+                let end = end_byte as usize;
+                if start < end && end <= content.len() {
+                    source = String::from_utf8_lossy(&content[start..end]).to_string();
+                } else {
+                    let text = String::from_utf8_lossy(&content);
+                    let lines: Vec<&str> = text.lines().collect();
+                    let s_idx = (start_line.saturating_sub(1)).max(0) as usize;
+                    let e_idx = end_line.min(lines.len() as i64) as usize;
+                    if s_idx < lines.len() {
+                        source = lines[s_idx..e_idx].join("\n");
+                    }
+                }
+            }
+        }
+
+        let mut source_unavailable = None;
+        let mut reason = None;
+        if stale {
+            source_unavailable = Some(true);
+            reason = Some("Index is stale: this file changed on disk since it was last indexed, so the stored byte offsets no longer line up with its content. Re-run reindex_workspace (or `codebroker reindex-incremental` on this file) before trusting symbol boundaries.".to_string());
+            source = "<ERROR: Stale index. This file was modified after indexing; the stored start/end byte offsets no longer match the file on disk and would return a corrupted snippet. Reindex the workspace, then retry.>".to_string();
+        } else if source.is_empty() {
+            source_unavailable = Some(true);
+            reason = Some("Failed to extract code snippet using byte bounds. Please use native file Read.".to_string());
+            source = "<ERROR: Source extraction failed. The file was read successfully but the requested byte bounds were invalid. Please fall back to the native Read tool using the file path provided.>".to_string();
+        }
+
+        results.push(SymbolSourceResult {
+            symbol_name: symbol_name.clone(),
+            symbol_kind: kind,
+            file_path: abs_path,
+            start_line: start_line as usize,
+            end_line: end_line as usize,
+            source,
+            directive,
+            attributes,
+            metadata,
+            is_dependency: false,
+            source_unavailable,
+            reason,
+        });
+
+        if include_dependencies {
+            let mut file_id_stmt = db
+                .conn
+                .prepare("SELECT id FROM files WHERE path = ?1 LIMIT 1")
+                .unwrap();
+            if let Ok(file_id) = file_id_stmt
+                .query_row(rusqlite::params![file_path], |r: &rusqlite::Row| {
+                    Ok(r.get::<_, i64>(0).unwrap_or(0))
+                })
+            {
+                let mut dep_stmt = db.conn.prepare(
+                    "SELECT target_symbol_id, kind FROM edges WHERE source_file_id = ?1 AND (source_symbol_id = ?2 OR source_symbol_id IS NULL) LIMIT 15"
+                ).unwrap();
+
+                if let Ok(mut dep_rows) =
+                    dep_stmt.query(rusqlite::params![file_id, symbol_id])
+                {
+                    while let Ok(Some(dep_row)) = dep_rows.next() {
+                        let target_symbol_id: i64 = dep_row.get(0).unwrap_or(0);
+                        let edge_kind: String = dep_row.get(1).unwrap_or_default();
+
+                        let mut sym_stmt = db.conn.prepare(
+                            "SELECT files.path, symbols.name, symbols.kind, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte, symbols.signature, symbols.attributes, symbols.metadata, files.content_hash
+                             FROM symbols
+                             JOIN files ON symbols.file_id = files.id
+                             WHERE symbols.id = ?1"
+                        ).unwrap();
+
+                        if let Ok(mut sym_rows) = sym_stmt.query([target_symbol_id]) {
+                            if let Ok(Some(sym_row)) = sym_rows.next() {
+                                let d_file_path: String = sym_row.get(0).unwrap_or_default();
+                                let d_symbol_name: String = sym_row.get(1).unwrap_or_default();
+                                let d_abs_path = db.resolve_path(&d_file_path);
+                                let d_kind: String = sym_row.get(2).unwrap_or_default();
+                                let d_start_line: i64 = sym_row.get(3).unwrap_or(0);
+                                let d_end_line: i64 = sym_row.get(4).unwrap_or(d_start_line);
+                                let d_start_byte: i64 = sym_row.get(5).unwrap_or(0);
+                                let d_end_byte: i64 = sym_row.get(6).unwrap_or(d_start_byte);
+                                let d_directive: Option<String> = sym_row.get(7).unwrap_or(None);
+                                let d_attributes_str: Option<String> =
+                                    sym_row.get(8).unwrap_or(None);
+                                let d_attributes = d_attributes_str
+                                    .map(|s| serde_json::from_str(&s).unwrap_or_default())
+                                    .unwrap_or_default();
+                                let d_metadata: Option<String> = sym_row.get(9).unwrap_or(None);
+                                let d_indexed_hash: Option<String> = sym_row.get(10).unwrap_or(None);
+
+                                let mut d_source = String::new();
+                                let mut d_stale = false;
+                                if let Ok(d_content) = fs::read(&d_abs_path) {
+                                    if let Some(ih) = &d_indexed_hash {
+                                        if *ih != storage::hash_content(&d_content) {
+                                            d_stale = true;
+                                        }
+                                    }
+                                    if !d_stale {
+                                        let ds = d_start_byte as usize;
+                                        let de = d_end_byte as usize;
+                                        if ds < de && de <= d_content.len() {
+                                            d_source =
+                                                String::from_utf8_lossy(&d_content[ds..de])
+                                                    .to_string();
+                                        } else {
+                                            let text = String::from_utf8_lossy(&d_content);
+                                            let lines: Vec<&str> = text.lines().collect();
+                                            let s_idx = (d_start_line.saturating_sub(1)).max(0) as usize;
+                                            let e_idx = d_end_line.min(lines.len() as i64) as usize;
+                                            if s_idx < lines.len() {
+                                                d_source = lines[s_idx..e_idx].join("\n");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let mut d_unavail = None;
+                                let mut d_reason = None;
+                                if d_stale {
+                                    d_unavail = Some(true);
+                                    d_reason = Some("Dependency file is stale on disk".to_string());
+                                } else if d_source.is_empty() {
+                                    d_unavail = Some(true);
+                                    d_reason = Some("Failed to extract dependency snippet".to_string());
+                                }
+
+                                results.push(SymbolSourceResult {
+                                    symbol_name: d_symbol_name,
+                                    symbol_kind: format!("{} (via {})", d_kind, edge_kind),
+                                    file_path: d_abs_path,
+                                    start_line: d_start_line as usize,
+                                    end_line: d_end_line as usize,
+                                    source: d_source,
+                                    directive: d_directive,
+                                    attributes: d_attributes,
+                                    metadata: d_metadata,
+                                    is_dependency: true,
+                                    source_unavailable: d_unavail,
+                                    reason: d_reason,
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
     }

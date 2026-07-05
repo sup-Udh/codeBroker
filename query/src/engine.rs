@@ -314,7 +314,7 @@ fn search_symbol_names(
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -496,7 +496,7 @@ fn search_symbol_names(
     while let Some(row) = file_rows.next()? {
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -656,7 +656,7 @@ fn search_file_contents(
         }
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -897,7 +897,7 @@ pub fn find_symbol(
     while let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -976,7 +976,7 @@ pub fn build_project_overview_scoped(
     while let Some(row) = file_rows.next()? {
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -1003,7 +1003,7 @@ pub fn build_project_overview_scoped(
     while let Some(row) = sym_rows.next()? {
         let path: String = row.get(0)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }

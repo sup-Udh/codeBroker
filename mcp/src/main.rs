@@ -143,7 +143,7 @@ fn normalized_path_scope(db: &storage::Database, raw: Option<&str>) -> Option<St
 ///
 /// Centralizes the four-times-repeated pattern of:
 ///   getenv OPENAI_API_KEY → embed query → expand_query → (tokens, vector)
-/// so that `search_codebase`, `subsystem_stats`, and `generate_context_capsule`
+/// so that `search_codebase`, `subsystem_stats`, and `prepare_context`
 /// all call one function instead of each inlining the same OpenAI round-trips.
 fn prepare_semantic_context(query: &str) -> (Vec<String>, Option<Vec<f32>>, bool) {
     let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
@@ -161,362 +161,6 @@ fn prepare_semantic_context(query: &str) -> (Vec<String>, Option<Vec<f32>>, bool
         (vec![], 0)
     });
     (tokens, query_vector, true)
-}
-
-/// Orchestrates the one-shot "Context Capsule" workflow: discover the 1-3
-/// pivot symbols matching `query`, fetch their full implementation, expand
-/// to immediate (depth=1) callers/callees via the graph, and render
-/// everything as a single Markdown document instead of forcing the caller
-/// to chain search_codebase -> get_implementation -> explore_graph manually.
-fn generate_context_capsule(
-    db: &storage::Database,
-    query: &str,
-    file_hint: Option<&str>,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
-) -> String {
-    use std::fmt::Write;
-    let mut md = String::new();
-    let _ = writeln!(md, "# CodeBroker Context Capsule\n");
-    let _ = writeln!(md, "**Query:** {}\n", query);
-
-    // 1. Fetch initial candidates via the resolver's unified search (includes
-    //    concept augmentation — no need to repeat it here).
-    let (mut results, _reason) = resolver::resolve_search(
-        db,
-        query,
-        semantic_tokens,
-        query_vector,
-        false,
-        file_hint,
-        query::engine::SearchMode::Both,
-        false,
-        None,
-    );
-
-    results.retain(|r| r.kind != "file" && r.kind != "text_match");
-
-    let is_conceptual = {
-        let mut words = query.split_whitespace();
-        words.any(|w| query::concepts::concepts_matching_term(w).is_empty() == false)
-    };
-
-    let highest_conf = results
-        .first()
-        .map(|r| r.confidence.as_str())
-        .unwrap_or("Low");
-    if highest_conf.starts_with("Low")
-        || highest_conf.starts_with("None")
-        || highest_conf == "File Path Match"
-    {
-        let mut md = String::new();
-        let _ = writeln!(md, "# CodeBroker Context Capsule\n\n**Query:** {}\n", query);
-        let _ = writeln!(
-            md,
-            "> [!WARNING]\n> **No confident matches found.** The retrieval engine did not find any highly relevant anchors to safely expand upon. To prevent hallucinations, Context Capsule graph expansion was aborted. Try using `search_codebase` directly."
-        );
-        return md;
-    }
-
-    let needs_subsystem = is_conceptual; // Removed Low fallback since we bail out on Low now
-
-    let mut subsystem_files = std::collections::HashSet::new();
-    let mut subsystem_confidence = "Low".to_string();
-
-    if needs_subsystem {
-        if let resolver::ResolvedEntity::Subsystem(sub) =
-            resolver::resolve_subsystem(db, query, semantic_tokens, query_vector)
-        {
-            subsystem_confidence = match sub.confidence.label {
-                resolver::ConfidenceLabel::High => "High",
-                resolver::ConfidenceLabel::Medium => "Medium",
-                resolver::ConfidenceLabel::Low => "Low",
-            }
-            .to_string();
-            for f in &sub.files {
-                subsystem_files.insert(f.clone());
-            }
-            // Boost existing results that are in subsystem
-            let routes_set: std::collections::HashSet<_> = sub.routes.iter().cloned().collect();
-            let symbols_set: std::collections::HashSet<_> = sub.symbols.iter().cloned().collect();
-
-            for r in &mut results {
-                let mut boosted = false;
-                if routes_set.contains(&r.name) {
-                    r.score += 5000;
-                    r.confidence = "High (Subsystem Route)".to_string();
-                    boosted = true;
-                } else if symbols_set.contains(&r.name) {
-                    r.score += 3000;
-                    r.confidence = "High (Subsystem Core)".to_string();
-                    boosted = true;
-                } else if subsystem_files.contains(&r.path) {
-                    r.score += 1000;
-                    if !r.confidence.starts_with("High") {
-                        r.confidence = "Medium (Subsystem Peripheral)".to_string();
-                    }
-                    boosted = true;
-                }
-
-                // Penalize massive generic UI components if we have a subsystem
-                // so they don't drown out focused backend services.
-                if boosted && r.path.contains("components/") || r.name == "Dashboard" {
-                    r.score -= 2000;
-                }
-            }
-            results.sort_by(|a, b| b.score.cmp(&a.score));
-        }
-    }
-
-    // Capsule pivots are rendered with their FULL implementation, so a pivot
-    // should be a definition worth reading in full — a function, method, route,
-    // class, or component — not a bare module-level variable or a loop-local.
-    // Demote pure data/locals so a lexical token collision (the query word
-    // "metrics" matching an empty `METRICS_QUEUES = {}` dict, or byte-math
-    // locals like `rx_bytes`/`network_usage_mb`) can never outrank the
-    // semantically central function (e.g. `stream_metrics`) that actually
-    // answers the query. This is a property of what a capsule pivot IS, not a
-    // per-query heuristic.
-    for r in &mut results {
-        if matches!(
-            r.kind.as_str(),
-            "variable" | "local" | "parameter" | "field" | "property"
-        ) {
-            r.score -= 4000;
-        }
-    }
-    results.sort_by(|a, b| b.score.cmp(&a.score));
-
-    let mut pivots = Vec::new();
-    for r in results.into_iter().take(3) {
-        let reason = if r.confidence.starts_with("High (Subsystem") {
-            "Anchor point discovered via graph expansion of the subsystem."
-        } else if r.confidence.starts_with("High (Semantic") {
-            "Strong semantic vector match for the conceptual query."
-        } else if r.confidence.starts_with("High") {
-            "Exact or highly confident lexical match."
-        } else if r.confidence.starts_with("Medium") {
-            "Partial semantic or lexical match."
-        } else {
-            "Fuzzy fallback match."
-        };
-        pivots.push((
-            r.name.clone(),
-            r.path.clone(),
-            reason.to_string(),
-            r.confidence.clone(),
-        ));
-    }
-
-    if pivots.is_empty() {
-        let _ = writeln!(
-            md,
-            "_No matching symbols found for this query. Try search_codebase with mode: \"both\" for a broader sweep._"
-        );
-        return md;
-    }
-
-    // Capsule Confidence.
-    //
-    // Pivots are sorted by score, so the first is the strongest match; use its
-    // confidence rather than a lexicographic `max()` over the strings (which
-    // wrongly ranked "Medium..." above "High..." because 'M' > 'H'). The
-    // "Subsystem Validated" label is now gated on the top pivot ITSELF being
-    // high-confidence — previously it was applied whenever the subsystem graph
-    // was connected, even if the chosen pivots were low-relevance, which is
-    // exactly what made the label confidently wrong. Structural connectivity
-    // ("these symbols form a subsystem") is not the same as answer relevance
-    // ("these symbols answer the query"); the label must reflect the latter.
-    let capsule_conf = pivots
-        .first()
-        .map(|p| p.3.clone())
-        .unwrap_or_else(|| "Low".to_string());
-    let capsule_conf =
-        if subsystem_confidence.starts_with("High") && capsule_conf.starts_with("High") {
-            "High (Subsystem Validated)".to_string()
-        } else {
-            capsule_conf
-        };
-    let _ = writeln!(md, "**Capsule Confidence:** {}\n", capsule_conf);
-
-    let _ = writeln!(md, "## Pivot Symbols (Full Implementation)\n");
-
-    let mut seen_support: std::collections::HashSet<(String, String)> =
-        std::collections::HashSet::new();
-    let mut support_sections: Vec<(String, i32, String)> = Vec::new(); // (markdown, score, path)
-
-    for (name, hint, reason, _) in &pivots {
-        let rel_hint = relative_hint(db, hint);
-        let sources = query::retrieval::read_symbol_source_scoped(db, name, false, Some(rel_hint))
-            .unwrap_or_default();
-        let Some(src) = sources.into_iter().next() else {
-            continue;
-        };
-
-        let _ = writeln!(md, "### `{}::{}`", src.file_path, src.symbol_name);
-        let _ = writeln!(md, "*Selection Reasoning:* {}\n", reason);
-
-        let src_body = if src.file_path.ends_with(".json") {
-            "/* JSON symbol – no source body */".to_string()
-        } else {
-            let lines: Vec<&str> = src.source.lines().collect();
-            let total = lines.len();
-            let max_lines = 100;
-            if total > max_lines {
-                let hidden = total - max_lines;
-                let mut out = lines[..max_lines].join("\n");
-                out.push_str(&format!(
-                    "\n    ... // [{} lines hidden for token reduction]",
-                    hidden
-                ));
-                out
-            } else {
-                src.source.clone()
-            }
-        };
-
-        let _ = writeln!(md, "```\n{}\n```\n", src_body);
-        seen_support.insert((src.symbol_name.clone(), src.file_path.clone()));
-
-        // Gather adjacent symbols for relevance scoring
-        if let Ok(Some(ctx)) = query::context::ContextResponseBuilder::new(
-            db,
-            name,
-            Some(rel_hint),
-            query::response::ResponseProfile::Verbose,
-        ) {
-            let mut candidates = Vec::new();
-            if let Ok(deps) = ctx.fetch_forward_dependencies() {
-                for d in deps {
-                    candidates.push((d, "Forward Dependency"));
-                }
-            }
-            if let Ok(deps) = ctx.fetch_same_file_callers() {
-                for d in deps {
-                    candidates.push((d, "Same-File Caller"));
-                }
-            }
-            if let Ok(deps) = ctx.fetch_reverse_dependencies() {
-                for d in deps {
-                    candidates.push((d, "Reverse Dependency"));
-                }
-            }
-            if let Ok(deps) = ctx.fetch_callees() {
-                for d in deps {
-                    candidates.push((d, "Callee"));
-                }
-            }
-            if let Ok(deps) = ctx.fetch_callers() {
-                for d in deps {
-                    candidates.push((d, "Caller"));
-                }
-            }
-
-            for (cand, rel_type) in candidates {
-                if let Ok(cand_sources) =
-                    query::retrieval::read_symbol_source_scoped(db, &cand, true, None)
-                {
-                    for cand_src in cand_sources {
-                        if seen_support
-                            .contains(&(cand_src.symbol_name.clone(), cand_src.file_path.clone()))
-                        {
-                            continue;
-                        }
-
-                        // Compute Relevance Score
-                        let mut score = 0;
-                        if cand_src.file_path.contains(query)
-                            || cand_src.symbol_name.contains(query)
-                        {
-                            score += 500;
-                        }
-                        for t in semantic_tokens {
-                            if cand_src.symbol_name.contains(t) || cand_src.file_path.contains(t) {
-                                score += 100;
-                            }
-                        }
-                        // IMPORTANT: subsystem_files contains ABSOLUTE paths.
-                        // cand_src.file_path is ABSOLUTE.
-                        // db_path must be RELATIVE with ./ for SQL query.
-                        let rel_cand_path = relative_hint(db, &cand_src.file_path);
-                        let db_path = if rel_cand_path.starts_with("./") {
-                            rel_cand_path.to_string()
-                        } else {
-                            format!("./{}", rel_cand_path)
-                        };
-                        if subsystem_files.contains(&cand_src.file_path) {
-                            score += 1500; // High subsystem relevance
-                        }
-
-                        if let Some(qv) = query_vector {
-                            if let Ok(mut stmt) = db.conn.prepare("SELECT embedding FROM symbol_embeddings WHERE symbol_id = (SELECT id FROM symbols WHERE name = ?1 AND file_id = (SELECT id FROM files WHERE path = ?2) LIMIT 1)") {
-                                if let Ok(mut rows) = stmt.query(rusqlite::params![cand_src.symbol_name, db_path]) {
-                                    if let Ok(Some(row)) = rows.next() {
-                                        let blob: Vec<u8> = row.get(0).unwrap_or_default();
-                                        if !blob.is_empty() {
-                                            let s_vec = storage::blob_to_embedding(&blob);
-                                            let sim = storage::cosine_similarity(qv, &s_vec);
-                                            score += ((sim + 1.0) * 500.0) as i32;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if score > 200 {
-                            let md_block = format!(
-                                "### `{}::{}` (Skeleton)\n*Relationship to {}*: {}\n```\n{}\n```\n",
-                                cand_src.file_path,
-                                cand_src.symbol_name,
-                                src.symbol_name,
-                                rel_type,
-                                cand_src.source
-                            );
-                            support_sections.push((md_block, score, cand_src.file_path.clone()));
-                            seen_support
-                                .insert((cand_src.symbol_name.clone(), cand_src.file_path.clone()));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = writeln!(md, "## Supporting Context (Relevant Adjacencies)\n");
-    if support_sections.is_empty() {
-        let _ = writeln!(md, "_No highly relevant supporting context found._");
-    } else {
-        // Apply diversity scoring: penalize items from the same file path
-        support_sections.sort_by(|a, b| b.1.cmp(&a.1));
-        let mut final_support = Vec::new();
-        let mut path_counts = std::collections::HashMap::new();
-        let mut token_budget = 2000;
-
-        for (md_block, mut score, path) in support_sections {
-            let count = path_counts.entry(path.clone()).or_insert(0);
-            score -= *count * 200; // penalize 200 points per prior inclusion from same path
-            if score > 0 {
-                // insert and re-sort
-                final_support.push((md_block.clone(), score));
-                *count += 1;
-            }
-        }
-
-        final_support.sort_by(|a, b| b.1.cmp(&a.1));
-
-        for (md_block, _) in final_support {
-            let approx_tokens = md_block.split_whitespace().count();
-            if token_budget >= approx_tokens {
-                let _ = write!(md, "{}", md_block);
-                token_budget -= approx_tokens;
-            }
-            if token_budget <= 0 {
-                break;
-            }
-        }
-    }
-
-    md
 }
 
 fn add_response_size_hint(value: &mut serde_json::Value) {
@@ -1051,24 +695,6 @@ Treat native tools as the repository's implementation layer."#;
                             result: serde_json::json!({
                                 "tools": [
                                     {
-                                        "name": "generate_context_capsule",
-                                        "description": "One-shot discovery tool. Given a symbol, feature, or natural-language query, finds the best matching symbols, retrieves their implementations, and expands to immediate callers/callees. Returns a single token-efficient Markdown context bundle with full pivot implementations and skeletonized supporting code. Use this first for understanding a feature before falling back to lower-level search or graph tools. Matching is deterministic keyword-based first; if that finds nothing, falls back to embedding-based semantic search (requires symbols to have been embedded at index time, i.e. OPENAI_API_KEY set during indexing/reindexing) so purely conceptual queries with no literal vocabulary overlap can still resolve.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "query": {
-                                                    "type": "string",
-                                                    "description": "Symbol name, feature, or natural-language description of what to find."
-                                                },
-                                                "file_path": {
-                                                    "type": "string",
-                                                    "description": "Optional. Substring of the defining file's path, used to disambiguate when 'query' matches multiple definitions. 'path_scope' is also accepted as an alias."
-                                                }
-                                            },
-                                            "required": ["query"]
-                                        }
-                                    },
-                                    {
                                         "name": "project_overview",
                                         "description": "Fast deterministic repository overview. Returns file, symbol, edge, and language counts, per-directory density metrics (with total_directories/directories_truncated so nothing is silently dropped), and repo-wide entrypoints (API routes + pages/layouts). Use for navigation and architectural discovery.",
                                         "inputSchema": {
@@ -1548,7 +1174,7 @@ Treat native tools as the repository's implementation layer."#;
                                                     estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                                     let provider = Box::new(semantic::openai::OpenAiProvider::new(openai_key));
                                                     let generator = semantic::generator::SummaryGenerator::new(&db, provider);
-                                                    match generator.generate_scoped(symbol, file_hint) {
+                                                    match generator.generate_by_id(symbol_id, symbol) {
                                                         Ok((summary, hit)) => {
                                                             cache_hit = hit;
                                                             match &stale_warning {
@@ -2255,7 +1881,7 @@ Treat native tools as the repository's implementation layer."#;
                                             // boundaries are most dangerous to act on.
                                             let context = semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
                                             let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
-                                            let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
+                                            let source = query::retrieval::read_symbol_source_by_id(&db, symbol_id, false).unwrap_or_default();
                                             let mut edit_context = serde_json::json!({
                                                 "target_implementation": source,
                                                 "forward_dependencies": context.as_ref().map(|c| c.fetch_forward_dependencies().unwrap_or_default()).unwrap_or_default(),
@@ -2308,22 +1934,6 @@ Treat native tools as the repository's implementation layer."#;
                                 }
                             }
 
-                            "generate_context_capsule" => {
-                                let query_str = arguments.get("query").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = get_file_hint(&arguments);
-                                if query_str.is_empty() {
-                                    "Error: 'query' is required".to_string()
-                                } else {
-                                    match storage::Database::new(&db_path) {
-                                        Ok(db) => {
-                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                            let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(query_str);
-                                            generate_context_capsule(&db, query_str, file_hint, &semantic_tokens, query_vector_opt.as_deref())
-                                        }
-                                        Err(_) => "Error connecting to db".to_string(),
-                                    }
-                                }
-                            }
                             _ => {
                                 serde_json::json!({"success": false, "error": format!("Tool {} not recognized", tool_name)}).to_string()
                             }

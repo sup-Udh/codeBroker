@@ -123,7 +123,7 @@ pub fn list_entrypoints(
         let attributes: Option<String> = row.get(4).unwrap_or(None);
 
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }

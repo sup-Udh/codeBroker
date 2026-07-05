@@ -1073,7 +1073,7 @@ pub fn architectural_hotspots(
         let kind: String = row.get(2)?;
         let path: String = row.get(3)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
@@ -1238,7 +1238,7 @@ pub fn dependency_cycles(
         let target_id: i64 = row.get(1)?;
         let path: String = row.get(2)?;
         if let Some(scope) = path_scope {
-            if !path.contains(scope) {
+            if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
