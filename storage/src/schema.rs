@@ -159,6 +159,8 @@ pub const INIT_SQL: &str = "
     CREATE TABLE IF NOT EXISTS mcp_analytics_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tool_name TEXT NOT NULL,
+        prompt TEXT,
+        success BOOLEAN NOT NULL DEFAULT 1,
         execution_time_ms INTEGER NOT NULL,
         delivered_token_count INTEGER NOT NULL,
         estimated_raw_context_tokens INTEGER NOT NULL,

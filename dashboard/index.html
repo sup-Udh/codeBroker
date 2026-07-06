@@ -1,106 +1,12 @@
 <!DOCTYPE html>
-<html>
-<head>
-    <title>CodeBroker Analytics Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; margin: 40px; }
-        .card { background-color: #161b22; padding: 20px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 20px;}
-        h1 { color: #58a6ff; }
-        .stats-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 20px; margin-bottom: 40px; }
-        .stat-box { background: #238636; padding: 20px; border-radius: 8px; text-align: center; }
-        .stat-box h2 { margin: 0; font-size: 2em; color: white;}
-        .stat-box p { margin: 5px 0 0 0; color: #e6ffed; }
-    </style>
-</head>
-<body>
-    <h1>CodeBroker Observability</h1>
-    
-    <div class="stats-grid">
-        <div class="stat-box">
-            <h2 id="tokensSaved">0</h2>
-            <p>Tokens Avoided</p>
-        </div>
-        <div class="stat-box">
-            <h2 id="costSaved">$0.00</h2>
-            <p>Est. Cost Saved</p>
-        </div>
-        <div class="stat-box">
-            <h2 id="cacheHitRate">0%</h2>
-            <p>Global Cache Hit Rate</p>
-        </div>
-        <div class="stat-box">
-            <h2 id="llmAvoided">0</h2>
-            <p>LLM Calls Avoided</p>
-        </div>
-        <div class="stat-box" style="background: #6e40c9;">
-            <h2 id="optimizationRatio">0%</h2>
-            <p>Prompt Reduction</p>
-        </div>
-    </div>
-
-    <div style="display: flex; gap: 20px;">
-        <div class="card" style="width: 600px;">
-            <canvas id="tokenChart"></canvas>
-        </div>
-
-        <div class="card" style="flex: 1;">
-            <h2 style="margin-top: 0;">MCP Agent Usage</h2>
-            <div id="mcpUsageContainer"></div>
-        </div>
-    </div>
-
-    <script>
-        // Fetch real data from our Axum API!
-        fetch('/api/v1/stats/overview')
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('tokensSaved').innerText = (data.total_tokens_avoided / 1000000).toFixed(2) + "M";
-                document.getElementById('costSaved').innerText = "$" + data.total_cost_saved_cents / 100;
-                document.getElementById('cacheHitRate').innerText = data.global_cache_hit_rate;
-                document.getElementById('llmAvoided').innerText = data.total_llm_calls_avoided;
-
-                // The Prompt Reduction Math
-                if (data.total_tokens_avoided > 0) {
-                    let total_raw = data.total_tokens_avoided;
-                    let total_used = data.total_context_tokens_used || 0;
-                    
-                    let reduction = (1.0 - (total_used / total_raw)) * 100.0;
-                    document.getElementById('optimizationRatio').innerText = reduction.toFixed(2) + "%";
-                }
-
-                // Update MCP Usage Stats dynamically
-                if (data.mcp_usage) {
-                    const container = document.getElementById('mcpUsageContainer');
-                    container.innerHTML = '';
-                    for (const [tool, count] of Object.entries(data.mcp_usage)) {
-                        container.innerHTML += `
-                            <div style="margin-top: 15px;">
-                                <h3 style="color: #58a6ff; margin-bottom: 5px; font-size: 1em;">${tool}</h3>
-                                <p style="font-size: 1.2em; margin: 0; color: white;">${count.toLocaleString()} calls</p>
-                            </div>
-                        `;
-                    }
-                }
-
-                // Render Chart.js
-                const ctx = document.getElementById('tokenChart').getContext('2d');
-                new Chart(ctx, {
-                    type: 'bar',
-                    data: {
-                        labels: ['Context Tokens Used', 'Raw Tokens Avoided'],
-                        datasets: [{
-                            label: 'Tokens (Millions)',
-                            data: [0.15, data.total_tokens_avoided / 1000000],
-                            backgroundColor: ['#d73a49', '#28a745']
-                        }]
-                    },
-                    options: {
-                        plugins: { legend: { display: false } },
-                        scales: { y: { beginAtZero: true } }
-                    }
-                });
-            });
-    </script>
-</body>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodeBroker Dashboard</title>
+  </head>
+  <body class="bg-background text-foreground antialiased selection:bg-primary/30">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>

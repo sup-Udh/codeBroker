@@ -12,6 +12,8 @@ impl<'a> MetricsCollector<'a> {
     pub fn log_comprehensive_event(
         &self,
         tool_name: &str,
+        prompt: Option<&str>,
+        success: bool,
         execution_time_ms: usize,
         delivered_token_count: usize,
         estimated_raw_context_tokens: usize,
@@ -26,10 +28,12 @@ impl<'a> MetricsCollector<'a> {
 
         let _ = self.db.conn.execute(
             "INSERT INTO mcp_analytics_events 
-             (tool_name, execution_time_ms, delivered_token_count, estimated_raw_context_tokens, token_reduction, cache_hit, model_used) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (tool_name, prompt, success, execution_time_ms, delivered_token_count, estimated_raw_context_tokens, token_reduction, cache_hit, model_used) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 tool_name,
+                prompt,
+                success,
                 execution_time_ms as i64,
                 delivered_token_count as i64,
                 estimated_raw_context_tokens as i64,

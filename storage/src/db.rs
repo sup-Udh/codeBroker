@@ -240,6 +240,14 @@ impl Database {
             "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0;",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE mcp_analytics_events ADD COLUMN prompt TEXT;",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE mcp_analytics_events ADD COLUMN success BOOLEAN NOT NULL DEFAULT 1;",
+            [],
+        );
 
         Ok(())
     }

@@ -1834,9 +1834,17 @@ Treat native tools as the repository's implementation layer."#;
                         );
 
                         if let Ok(db) = storage::Database::new(&db_path) {
+                            let prompt_str = serde_json::to_string(&arguments).unwrap_or_default();
+                            let is_success = !tool_result.contains("\"success\":false") && 
+                                             !tool_result.contains("\"success\": false") && 
+                                             !tool_result.starts_with("Error:") && 
+                                             !tool_result.contains("\"error\":");
+
                             let collector = analytics::collector::MetricsCollector::new(&db);
                             collector.log_comprehensive_event(
                                 tool_name,
+                                Some(&prompt_str),
+                                is_success,
                                 execution_time_ms,
                                 delivered_token_count,
                                 estimated_raw_context_tokens,
