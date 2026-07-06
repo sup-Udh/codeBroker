@@ -305,7 +305,7 @@ impl<'a> ContextResponseBuilder<'a> {
         callers.extend(crate::graph::get_incoming_edges_min_confidence(
             self.db,
             id,
-            &["method_call"],
+            crate::graph::RECEIVER_RESOLVED_EDGES,
             crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
         )?);
         callers.sort();
@@ -400,7 +400,7 @@ impl<'a> ContextResponseBuilder<'a> {
             callees.extend(crate::graph::get_outgoing_edges_min_confidence(
                 self.db,
                 id,
-                &["method_call"],
+                crate::graph::RECEIVER_RESOLVED_EDGES,
                 crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
             )?);
             callees.sort();

@@ -110,7 +110,7 @@ fn extract_ts_symbols(
         (lexical_declaration
             (variable_declarator
                 name: (identifier) @data_const
-                value: [(array) (object) (string) (template_string) (number) (new_expression)]
+                value: (_)
             )
         )
     ",

@@ -74,6 +74,12 @@ fn extract_js_symbols(
                 value: (call_expression)
             )
         )
+        (lexical_declaration
+            (variable_declarator
+                name: (identifier) @data_const
+                value: (_)
+            )
+        )
     ";
 
     crate::pool::with_query("javascript_symbols", &language, query_str, |query| {
@@ -138,6 +144,13 @@ fn extract_js_symbols(
                         continue; // Skip indexing this local generic variable
                     }
                     kind = "variable".to_string();
+                }
+
+                if kind == "data_const" {
+                    if !is_exported {
+                        continue;
+                    }
+                    kind = "constant".to_string();
                 }
 
                 if parent.kind() == "variable_declarator" {

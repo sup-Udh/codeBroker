@@ -726,29 +726,6 @@ Treat native tools as the repository's implementation layer."#;
                                         }
                                     },
                                     {
-                                        "name": "subsystem_stats",
-                                        "description": "Deterministically discovers a subsystem and reports its files, symbols, dependencies, consumers, routes, and entrypoints. No AI required.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "subsystem_name": { "type": "string", "description": "Subsystem name to discover — e.g. a folder name like 'auth' or 'billing'. Matched as a substring, not an exact path." },
-                                                "scope": { "type": "string", "enum": ["strict", "expanded", "full"], "description": "How far graph expansion walks past the initial seed matches: 'strict' returns only the seeds, 'expanded' (default) allows up to 3 cohesion-gated hops, 'full' allows up to 8. A hard cap of 150 files always applies regardless of scope (see the 'truncated' field in the response). Does not affect whether the subsystem is found — only how much detail is reported." }
-                                            },
-                                            "required": ["subsystem_name"]
-                                        }
-                                    },
-                                    {
-                                        "name": "prepare_context",
-                                        "description": "A high-level tool to gather full context (Summary, Architecture, Files, Symbols, Tests, Routes, Dependencies, Impact, and Hotspots) for a specific subsystem. This is the preferred way for LLMs to understand a subsystem.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "target": { "type": "string", "description": "The target subsystem name (e.g. 'authentication')" }
-                                            },
-                                            "required": ["target"]
-                                        }
-                                    },
-                                    {
                                         "name": "list_entrypoints",
                                         "description": "Repo-wide enumeration of every entrypoint (API routes/endpoints and Next.js page/layout files) with no subsystem name required. Use this for 'what are this repo's entrypoints' questions instead of guessing subsystem names to feed into subsystem_stats.",
                                         "inputSchema": {
@@ -1191,53 +1168,6 @@ Treat native tools as the repository's implementation layer."#;
                                         serde_json::to_string_pretty(&payload).unwrap_or_default()
                                     }
                                     Err(_) => serde_json::json!({"success": false, "error": "Error connecting to db"}).to_string(),
-                                }
-                            }
-
-                            "prepare_context" => {
-                                let target = arguments.get("target").and_then(|t| t.as_str()).unwrap_or_default();
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        // Previously built its own capsule from
-                                        // `indexer::developer::analyzer::RepositoryAnalyzer` +
-                                        // `indexer::resolver::index::SymbolIndex` — a subsystem
-                                        // detector entirely unrelated to the one `subsystem_stats`/
-                                        // `subsystem_communication` use, so a subsystem name that
-                                        // resolved with high confidence there could still come back
-                                        // "not found" here. Now gated on the same
-                                        // `resolver::resolve_subsystem` + `discover_subsystem` pair,
-                                        // so all three subsystem tools agree by construction.
-                                        let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(target);
-                                        match resolver::resolve_subsystem(&db, target, &semantic_tokens, query_vector_opt.as_deref()) {
-                                            resolver::ResolvedEntity::Subsystem(_) => {
-                                                match query::subsystem::discover_subsystem(&db, target, &semantic_tokens, query_vector_opt.as_deref(), query::subsystem::TraversalScope::Expanded) {
-                                                    Ok(stats) => {
-                                                        let models: Vec<&String> = stats.files.iter()
-                                                            .filter(|p| p.contains("model") || p.contains("schema") || p.contains("entities"))
-                                                            .collect();
-                                                        let tests: Vec<&String> = stats.files.iter()
-                                                            .filter(|p| p.contains("test") || p.contains("spec"))
-                                                            .collect();
-                                                        let entry_points = if stats.entrypoints.is_empty() { &stats.routes } else { &stats.entrypoints };
-                                                        let capsule = serde_json::json!({
-                                                            "target": stats.name,
-                                                            "core_files": stats.files,
-                                                            "public_apis": stats.routes,
-                                                            "models": models,
-                                                            "tests": tests,
-                                                            "dependencies": stats.dependencies,
-                                                            "dependents": stats.consumers,
-                                                            "entry_points": entry_points,
-                                                        });
-                                                        serde_json::to_string_pretty(&capsule).unwrap_or_default()
-                                                    }
-                                                    Err(e) => serde_json::json!({"error": format!("Failed to discover subsystem '{}': {}", target, e)}).to_string(),
-                                                }
-                                            }
-                                            other => other.to_json_string(),
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
 
@@ -1744,36 +1674,6 @@ Treat native tools as the repository's implementation layer."#;
                                             add_response_size_hint(&mut edit_context);
                                             serde_json::to_string_pretty(&edit_context).unwrap_or_default()
                                         }
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
-                            "subsystem_stats" => {
-                                let name = arguments.get("subsystem_name").and_then(|s| s.as_str()).unwrap_or("");
-                                // Controls how much detail is returned about an already-resolved
-                                // subsystem, not whether it resolves at all — the gate below
-                                // always uses Expanded, matching every other subsystem tool, so
-                                // a narrower/wider `scope` here can never change which subsystem
-                                // was found, only how much of it is reported.
-                                let scope = query::subsystem::TraversalScope::from_str(
-                                    arguments.get("scope").and_then(|s| s.as_str()).unwrap_or("expanded"),
-                                );
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        let (semantic_tokens, query_vector_opt, _) = prepare_semantic_context(name);
-                                        // Gate on the resolver's confidence decision first — a
-                                        // name that can't be confidently discovered as a
-                                        // subsystem returns NotFound instead of an empty/Low
-                                        // stats struct that looked like a (wrong) answer.
-                                        match resolver::resolve_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref()) {
-                                            resolver::ResolvedEntity::Subsystem(_) => {
-                                                match query::subsystem::discover_subsystem(&db, name, &semantic_tokens, query_vector_opt.as_deref(), scope) {
-                                                    Ok(stats) => serde_json::to_string_pretty(&stats).unwrap_or_default(),
-                                                    Err(e) => format!("Error discovering subsystem: {}", e),
-                                                }
-                                            }
-                                            other => other.to_json_string(),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),

@@ -63,7 +63,8 @@ fn query_symbols_by_name(
         name_clause
     );
     let mut stmt = db.conn.prepare(&sql)?;
-    let mut rows = stmt.query(rusqlite::params![name_param, file_hint.unwrap_or("")])?;
+    let normalized_hint = file_hint.map(|h| h.replace("\\", "/"));
+    let mut rows = stmt.query(rusqlite::params![name_param, normalized_hint.as_deref().unwrap_or("")])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(SymbolRow {
@@ -727,43 +728,45 @@ pub fn resolve_search(
     // that pure lexical search misses — e.g. a query for "auth" finds
     // createClient/signInWithOAuth even though those names don't contain "auth".
     // Centralized here instead of being inline in each tool that needs it.
-    let mut seen: std::collections::HashSet<(String, String)> = results
-        .iter()
-        .map(|r| (r.name.clone(), r.path.clone()))
-        .collect();
-    let mut concept_added = 0usize;
-    for concept in query::concepts::concepts_matching_term(query) {
-        if concept_added >= 10 {
-            break;
-        }
-        if let Ok(matches) = query::concepts::symbols_for_concept(db, concept) {
-            for m in matches {
-                if concept_added >= 10 {
-                    break;
-                }
-                if let Some(scope) = path_scope {
-                    if !m.file_path.contains(scope) {
+    if mode != query::engine::SearchMode::Text {
+        let mut seen: std::collections::HashSet<(String, String)> = results
+            .iter()
+            .map(|r| (r.name.clone(), r.path.clone()))
+            .collect();
+        let mut concept_added = 0usize;
+        for concept in query::concepts::concepts_matching_term(query) {
+            if concept_added >= 10 {
+                break;
+            }
+            if let Ok(matches) = query::concepts::symbols_for_concept(db, concept) {
+                for m in matches {
+                    if concept_added >= 10 {
+                        break;
+                    }
+                    if let Some(scope) = path_scope {
+                        if !m.file_path.contains(scope) {
+                            continue;
+                        }
+                    }
+                    let key = (m.symbol_name.clone(), m.file_path.clone());
+                    if !seen.insert(key) {
                         continue;
                     }
+                    results.push(query::engine::SearchResult {
+                        path: m.file_path,
+                        name: m.symbol_name,
+                        kind: m.symbol_kind,
+                        score: 150,
+                        confidence: format!("Concept Match ({})", m.concept),
+                        explanation: format!("Matched conceptual tag '{}'", m.concept),
+                        line: None,
+                    });
+                    concept_added += 1;
                 }
-                let key = (m.symbol_name.clone(), m.file_path.clone());
-                if !seen.insert(key) {
-                    continue;
-                }
-                results.push(query::engine::SearchResult {
-                    path: m.file_path,
-                    name: m.symbol_name,
-                    kind: m.symbol_kind,
-                    score: 150,
-                    confidence: format!("Concept Match ({})", m.concept),
-                    explanation: format!("Matched conceptual tag '{}'", m.concept),
-                    line: None,
-                });
-                concept_added += 1;
             }
         }
+        results.sort_by(|a, b| b.score.cmp(&a.score));
     }
-    results.sort_by(|a, b| b.score.cmp(&a.score));
     (results, reason)
 }
 

@@ -1,0 +1,188 @@
+From 9a78e923e3bcb79068b6a361b9d26730ebad5499 Mon Sep 17 00:00:00 2001
+From: udhay rajeev <57910021+sup-Udh@users.noreply.github.com>
+Date: Sat, 4 Jul 2026 19:42:37 +0530
+Subject: [PATCH] Bump version to 0.1.15: Fix consistency validator and flow
+ engine
+
+---
+ cli/Cargo.toml                         |  2 +-
+ indexer/src/flow/engine.rs             | 32 +++++++++++++++---------
+ indexer/src/resolver/stages/ranking.rs | 18 +++++++++++---
+ parser/src/discovery/javascript.rs     | 34 ++++++++++++++++++++++++++
+ parser/src/discovery/typescript.rs     |  5 +++-
+ 5 files changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/cli/Cargo.toml b/cli/Cargo.toml
+index e20189a..c1735d0 100644
+--- a/cli/Cargo.toml
++++ b/cli/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "cli"
+-version = "0.1.14"
++version = "0.1.15"
+ edition = "2024"
+ 
+ [dependencies]
+diff --git a/indexer/src/flow/engine.rs b/indexer/src/flow/engine.rs
+index 36d875f..7d94345 100644
+--- a/indexer/src/flow/engine.rs
++++ b/indexer/src/flow/engine.rs
+@@ -165,16 +165,15 @@ impl VariableFlowEngine {
+                     }
+                 } else if k == "calls" || k == "method_call" {
+                     if let Some(var_name) = source {
+-                        let ret_type = self.function_returns.get(&name).cloned();
+-                        if let Some(ret_type) = ret_type {
+-                            let var = self.get_or_create_var(file_id, &var_name);
+-                            var.apply_type(
+-                                ret_type,
+-                                VariableOrigin::ReturnValue,
+-                                ResolutionConfidence::Medium,
+-                                ResolutionEvidence::ReturnFlow,
+-                            );
+-                        }
++                        // Fallback to the function/method name as a provisional type if we don't know the exact return type
++                        let ret_type = self.function_returns.get(&name).cloned().unwrap_or_else(|| name.clone());
++                        let var = self.get_or_create_var(file_id, &var_name);
++                        var.apply_type(
++                            ret_type,
++                            VariableOrigin::ReturnValue,
++                            ResolutionConfidence::Medium,
++                            ResolutionEvidence::ReturnFlow,
++                        );
+                     }
+                 }
+             }
+@@ -186,7 +185,7 @@ impl VariableFlowEngine {
+         let mut file_bindings: HashMap<i64, Vec<(String, String, SemanticBindingKind)>> = HashMap::new();
+         if let Ok(all_bindings) = db.get_all_semantic_bindings() {
+             for (file_id, binding) in all_bindings {
+-                if matches!(binding.kind, SemanticBindingKind::Alias | SemanticBindingKind::Destructuring | SemanticBindingKind::ObjectLiteral) {
++                if matches!(binding.kind, SemanticBindingKind::Alias | SemanticBindingKind::Destructuring | SemanticBindingKind::ObjectLiteral | SemanticBindingKind::Assignment) {
+                     file_bindings.entry(file_id).or_default().push((binding.name, binding.type_name, binding.kind));
+                 }
+             }
+@@ -225,6 +224,17 @@ impl VariableFlowEngine {
+                                 }
+                             }
+                         }
++                        SemanticBindingKind::Assignment => {
++                            let has_type = self.get_var(file_id, name).and_then(|v| v.inferred_type.clone()).is_some();
++                            if !has_type {
++                                if let Some(ret_type) = self.function_returns.get(source_name).cloned() {
++                                    updates.push((name.clone(), ret_type, VariableOrigin::ReturnValue, ResolutionEvidence::ReturnFlow));
++                                } else {
++                                    // Provisional fallback to function name
++                                    updates.push((name.clone(), source_name.clone(), VariableOrigin::ReturnValue, ResolutionEvidence::ReturnFlow));
++                                }
++                            }
++                        }
+                         SemanticBindingKind::ObjectLiteral => {
+                             let field_path = format!("{}.{}", source_name, name);
+                             let has_type = self.get_var(file_id, &field_path).and_then(|v| v.inferred_type.clone()).is_some();
+diff --git a/indexer/src/resolver/stages/ranking.rs b/indexer/src/resolver/stages/ranking.rs
+index 7a3046f..36b523b 100644
+--- a/indexer/src/resolver/stages/ranking.rs
++++ b/indexer/src/resolver/stages/ranking.rs
+@@ -33,8 +33,13 @@ impl ResolutionStage for RankingStage {
+             context.resolve_with(self.stage_type(), state, reason, None);
+             return Ok(());
+         } else if context.candidates.len() == 1 {
+-            let state = context.candidates[0].state.clone();
+-            context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
++            let winning_id = context.candidates[0].symbol_id;
++            if Some(winning_id) == context.ir.enclosing_symbol_id {
++                context.resolve_with(self.stage_type(), ResolutionState::Recursive, DecisionReason::RecursiveRelationship, None);
++            } else {
++                let state = context.candidates[0].state.clone();
++                context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
++            }
+             return Ok(());
+         } else {
+             context.candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+@@ -43,8 +48,13 @@ impl ResolutionStage for RankingStage {
+                 context.resolve_with(self.stage_type(), ResolutionState::Ambiguous, DecisionReason::MultipleCandidates, None);
+                 return Ok(());
+             } else {
+-                let state = context.candidates[0].state.clone();
+-                context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
++                let winning_id = context.candidates[0].symbol_id;
++                if Some(winning_id) == context.ir.enclosing_symbol_id {
++                    context.resolve_with(self.stage_type(), ResolutionState::Recursive, DecisionReason::RecursiveRelationship, None);
++                } else {
++                    let state = context.candidates[0].state.clone();
++                    context.resolve_with(self.stage_type(), state, DecisionReason::LexicalScopeMatch, None);
++                }
+                 return Ok(());
+             }
+         }
+diff --git a/parser/src/discovery/javascript.rs b/parser/src/discovery/javascript.rs
+index 73d9441..476e7a9 100644
+--- a/parser/src/discovery/javascript.rs
++++ b/parser/src/discovery/javascript.rs
+@@ -346,6 +346,40 @@ fn emit_semantic_bindings(
+ ) -> Vec<graph::SemanticBinding> {
+     let mut bindings = Vec::new();
+ 
++    // ── Variable assignments from constructors: const x = new Foo() ────────
++    let q_var_type = "
++        (lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
++        (variable_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
++        (assignment_expression left: (identifier) @var_name right: (new_expression constructor: (identifier) @type_name))
++        (assignment_expression left: (member_expression object: (this) property: (property_identifier) @var_name) right: (new_expression constructor: (identifier) @type_name))
++    ";
++    if let Ok(query) = Query::new(language, q_var_type) {
++        let mut cursor = QueryCursor::new();
++        let mut matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
++        while let Some(m) = matches.next() {
++            let mut var_name = String::new();
++            let mut type_name = String::new();
++            for capture in m.captures {
++                let cn = &query.capture_names()[capture.index as usize];
++                if let Ok(text) = capture.node.utf8_text(source_code.as_bytes()) {
++                    match *cn {
++                        "var_name" => var_name = text.trim().to_string(),
++                        "type_name" => type_name = text.trim().to_string(),
++                        _ => {}
++                    }
++                }
++            }
++            if !var_name.is_empty() && !type_name.is_empty() {
++                bindings.push(graph::SemanticBinding {
++                    kind: graph::SemanticBindingKind::VarType,
++                    name: var_name,
++                    type_name,
++                    context: None,
++                });
++            }
++        }
++    }
++
+     // ── Alias assignments: const x = y (bare identifier RHS) ────────────────
+     let q_alias = "
+         (lexical_declaration (variable_declarator name: (identifier) @alias_name value: (identifier) @source_name))
+diff --git a/parser/src/discovery/typescript.rs b/parser/src/discovery/typescript.rs
+index d778f00..755de21 100644
+--- a/parser/src/discovery/typescript.rs
++++ b/parser/src/discovery/typescript.rs
+@@ -460,12 +460,15 @@ fn emit_semantic_bindings(
+ ) -> Vec<SemanticBinding> {
+     let mut bindings = Vec::new();
+ 
+-    // ── Variable type annotations: const x: Type = ... (plain and generic) ────
+     let q_var_type = "
+         (lexical_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (type_identifier) @type_name)))
+         (variable_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (type_identifier) @type_name)))
+         (lexical_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (generic_type name: (type_identifier) @type_name))))
+         (variable_declaration (variable_declarator name: (identifier) @var_name type: (type_annotation (generic_type name: (type_identifier) @type_name))))
++        (lexical_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
++        (variable_declaration (variable_declarator name: (identifier) @var_name value: (new_expression constructor: (identifier) @type_name)))
++        (assignment_expression left: (identifier) @var_name right: (new_expression constructor: (identifier) @type_name))
++        (assignment_expression left: (member_expression object: (this) property: (property_identifier) @var_name) right: (new_expression constructor: (identifier) @type_name))
+     ";
+     if let Ok(query) = Query::new(language, q_var_type) {
+         let mut cursor = QueryCursor::new();
+-- 
+2.43.0
+
