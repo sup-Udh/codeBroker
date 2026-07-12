@@ -26,7 +26,7 @@ case "${ARCH}" in
     *)          echo "Unsupported architecture: ${ARCH}"; exit 1;;
 esac
 
-R2_URL="https://pub-aa0624d820a7465aa2d7388f8ad39d1b.r2.dev"
+R2_URL="https://www.codebroker.space"
 
 # Formulate asset name based on github actions workflow
 ASSET_NAME="codebroker-${OS_NAME}-${ARCH_NAME}.tar.gz"

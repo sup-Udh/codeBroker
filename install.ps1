@@ -8,7 +8,7 @@ $AssetName = "codebroker-windows-x86_64.zip"
 
 Write-Host "Installing CodeBroker..." -ForegroundColor Cyan
 
-$R2Url = "https://pub-aa0624d820a7465aa2d7388f8ad39d1b.r2.dev"
+$R2Url = "https://www.codebroker.space"
 $DownloadUrl = "$R2Url/$AssetName"
 
 Write-Host "Downloading latest release: $DownloadUrl"
