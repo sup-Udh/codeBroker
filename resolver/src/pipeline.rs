@@ -34,6 +34,7 @@ fn normalize_query_path(db: &Database, q: &str) -> String {
 // Symbol stages
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SymbolRow {
     #[allow(dead_code)]
     id: i64,
@@ -51,7 +52,6 @@ fn query_symbols_by_name(
     db: &Database,
     name_clause: &str,
     name_param: &str,
-    file_hint: Option<&str>,
 ) -> rusqlite::Result<Vec<SymbolRow>> {
     let sql = format!(
         "SELECT symbols.id, symbols.name, symbols.kind, symbols.start_line, symbols.end_line,
@@ -59,12 +59,11 @@ fn query_symbols_by_name(
          FROM symbols
          JOIN files ON symbols.file_id = files.id
          LEFT JOIN symbol_features sf ON sf.symbol_id = symbols.id
-         WHERE {} AND (?2 = '' OR files.path LIKE '%' || ?2 || '%')",
+         WHERE {}",
         name_clause
     );
     let mut stmt = db.conn.prepare(&sql)?;
-    let normalized_hint = file_hint.map(|h| normalize_query_path(db, h));
-    let mut rows = stmt.query(rusqlite::params![name_param, normalized_hint.as_deref().unwrap_or("")])?;
+    let mut rows = stmt.query(rusqlite::params![name_param])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         out.push(SymbolRow {
@@ -188,7 +187,36 @@ fn stage_exact_symbol(
     file_hint: Option<&str>,
     line_hint: Option<i64>,
 ) -> Option<ResolvedEntity> {
-    let rows = query_symbols_by_name(db, "symbols.name = ?1", query, file_hint).ok()?;
+    let mut rows = query_symbols_by_name(db, "symbols.name = ?1", query).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    if let Some(hint) = file_hint {
+        let hint_norm = normalize_query_path(db, hint).to_lowercase();
+        let filtered: Vec<_> = rows.iter().filter(|r| {
+            let path_norm = r.path.replace('\\', "/").to_lowercase();
+            path_norm.contains(&hint_norm)
+        }).cloned().collect();
+        
+        if filtered.is_empty() {
+            return Some(ResolvedEntity::Ambiguous(AmbiguousMatch {
+                query: query.to_string(),
+                candidates: rows.into_iter().map(|r| Candidate {
+                    entity_type: EntityType::Symbol,
+                    name: r.name,
+                    kind: r.kind,
+                    file_path: db.resolve_path(&r.path),
+                    start_line: r.start_line,
+                    start_byte: r.start_byte,
+                    end_byte: r.end_byte,
+                }).collect(),
+                hint: format!("Symbol exists, but not in a file matching '{}'. Did you mean one of these?", hint),
+            }));
+        }
+        rows = filtered;
+    }
+
     rows_to_entity(
         db,
         query,
@@ -207,8 +235,36 @@ fn stage_canonical_symbol(
     file_hint: Option<&str>,
     line_hint: Option<i64>,
 ) -> Option<ResolvedEntity> {
-    let rows =
-        query_symbols_by_name(db, "LOWER(symbols.name) = LOWER(?1)", query, file_hint).ok()?;
+    let mut rows = query_symbols_by_name(db, "LOWER(symbols.name) = LOWER(?1)", query).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    if let Some(hint) = file_hint {
+        let hint_norm = normalize_query_path(db, hint).to_lowercase();
+        let filtered: Vec<_> = rows.iter().filter(|r| {
+            let path_norm = r.path.replace('\\', "/").to_lowercase();
+            path_norm.contains(&hint_norm)
+        }).cloned().collect();
+        
+        if filtered.is_empty() {
+            return Some(ResolvedEntity::Ambiguous(AmbiguousMatch {
+                query: query.to_string(),
+                candidates: rows.into_iter().map(|r| Candidate {
+                    entity_type: EntityType::Symbol,
+                    name: r.name,
+                    kind: r.kind,
+                    file_path: db.resolve_path(&r.path),
+                    start_line: r.start_line,
+                    start_byte: r.start_byte,
+                    end_byte: r.end_byte,
+                }).collect(),
+                hint: format!("Symbol exists, but not in a file matching '{}'. Did you mean one of these?", hint),
+            }));
+        }
+        rows = filtered;
+    }
+
     rows_to_entity(
         db,
         query,

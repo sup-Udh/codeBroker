@@ -256,7 +256,7 @@ pub fn subsystem_communication(
     known_subsystems.sort();
     known_subsystems.dedup();
 
-    let resolve = |query: &str| -> Result<String, serde_json::Value> {
+    let resolve = |query: &str| -> Result<Vec<String>, serde_json::Value> {
         let q = query.replace("\\", "/");
         let q_trimmed = q.trim_end_matches('/');
         
@@ -268,31 +268,28 @@ pub fn subsystem_communication(
             if stripped == q_trimmed || dir.ends_with(&format!("/{}", q_trimmed)) {
                 exact_matches.push(dir.clone());
             }
-            if stripped.contains(q_trimmed) {
+            if stripped.starts_with(&format!("{}/", q_trimmed)) || stripped == q_trimmed {
                 substring_matches.push(dir.clone());
             }
         }
 
-        if exact_matches.len() == 1 {
-            return Ok(exact_matches[0].clone());
-        }
-        if exact_matches.len() > 1 {
-            let mut d: Vec<String> = exact_matches.iter().map(|s| strip_prefix(s)).collect();
-            d.sort();
-            d.dedup();
-            return Err(serde_json::json!({
-                "resolved_as": "not_found",
-                "query": query,
-                "did_you_mean": d,
-                "known_subsystems": known_subsystems
-            }));
+        if !exact_matches.is_empty() {
+            return Ok(exact_matches);
         }
 
-        if substring_matches.len() == 1 {
-            return Ok(substring_matches[0].clone());
+        if !substring_matches.is_empty() {
+            return Ok(substring_matches);
         }
         
-        let mut d: Vec<String> = substring_matches.iter().map(|s| strip_prefix(s)).collect();
+        let mut fuzzy_matches = Vec::new();
+        for dir in dir_counts.keys() {
+            let stripped = strip_prefix(dir);
+            if stripped.contains(q_trimmed) {
+                fuzzy_matches.push(dir.clone());
+            }
+        }
+        
+        let mut d: Vec<String> = fuzzy_matches.iter().map(|s| strip_prefix(s)).collect();
         d.sort();
         d.dedup();
         Err(serde_json::json!({
@@ -303,10 +300,10 @@ pub fn subsystem_communication(
         }))
     };
 
-    let dir_a = resolve(a)?;
-    let dir_b = resolve(b)?;
+    let dirs_a = resolve(a)?;
+    let dirs_b = resolve(b)?;
 
-    let sql_edges = "
+    let mut sql_edges = "
         SELECT 
           src.name, srcf.path, 
           tgt.name, tgtf.path, 
@@ -316,16 +313,28 @@ pub fn subsystem_communication(
         JOIN files srcf ON edges.source_file_id = srcf.id
         JOIN files tgtf ON tgt.file_id = tgtf.id
         LEFT JOIN symbols src ON edges.source_symbol_id = src.id
-        WHERE srcf.path LIKE ?1 AND tgtf.path LIKE ?2
-    ";
+        WHERE ".to_string();
 
-    let mut stmt_edges = db.conn.prepare(sql_edges).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
-    let like_a = format!("{}%", dir_a);
-    let like_b = format!("{}%", dir_b);
+    let make_like_clause = |dirs: &[String], prefix: &str| -> String {
+        let clauses: Vec<String> = dirs.iter().map(|_| format!("{}.path LIKE ?", prefix)).collect();
+        format!("({})", clauses.join(" OR "))
+    };
+
+    let a_srcf = make_like_clause(&dirs_a, "srcf");
+    let b_tgtf = make_like_clause(&dirs_b, "tgtf");
+    let a_tgtf = make_like_clause(&dirs_a, "tgtf");
+    let b_srcf = make_like_clause(&dirs_b, "srcf");
+
+    let sql_a_to_b = format!("{}{} AND {}", sql_edges, a_srcf, b_tgtf);
+    let mut stmt_a_to_b = db.conn.prepare(&sql_a_to_b).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+    
+    let mut params_a_b: Vec<String> = Vec::new();
+    for d in &dirs_a { params_a_b.push(format!("{}%", d)); }
+    for d in &dirs_b { params_a_b.push(format!("{}%", d)); }
     
     let mut a_to_b = Vec::new();
     {
-        let mut rows_a_b = stmt_edges.query(rusqlite::params![like_a, like_b]).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        let mut rows_a_b = stmt_a_to_b.query(rusqlite::params_from_iter(params_a_b.iter())).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
         while let Ok(Some(row)) = rows_a_b.next() {
             let src_name: Option<String> = row.get(0).unwrap_or(None);
             let src_path: String = row.get(1).unwrap_or_default();
@@ -351,9 +360,15 @@ pub fn subsystem_communication(
         }
     }
     
+    let sql_b_to_a = format!("{}{} AND {}", sql_edges, b_srcf, a_tgtf);
+    let mut stmt_b_to_a = db.conn.prepare(&sql_b_to_a).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+    let mut params_b_a: Vec<String> = Vec::new();
+    for d in &dirs_b { params_b_a.push(format!("{}%", d)); }
+    for d in &dirs_a { params_b_a.push(format!("{}%", d)); }
+
     let mut b_to_a = Vec::new();
     {
-        let mut rows_b_a = stmt_edges.query(rusqlite::params![like_b, like_a]).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        let mut rows_b_a = stmt_b_to_a.query(rusqlite::params_from_iter(params_b_a.iter())).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
         while let Ok(Some(row)) = rows_b_a.next() {
             let src_name: Option<String> = row.get(0).unwrap_or(None);
             let src_path: String = row.get(1).unwrap_or_default();
@@ -380,8 +395,8 @@ pub fn subsystem_communication(
     }
     
     Ok(SubsystemCommunication {
-        subsystem_a: strip_prefix(&dir_a),
-        subsystem_b: strip_prefix(&dir_b),
+        subsystem_a: strip_prefix(&dirs_a[0]),
+        subsystem_b: strip_prefix(&dirs_b[0]),
         a_to_b_edges: a_to_b.len(),
         b_to_a_edges: b_to_a.len(),
         a_to_b_examples: a_to_b.into_iter().take(10).collect(),

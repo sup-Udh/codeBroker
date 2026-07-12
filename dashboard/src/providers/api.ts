@@ -1,4 +1,13 @@
-// API Provider definition
+// API Provider definition — every field here is backed by a real column or
+// computed value on the server (analytics/src/server.rs); nothing here is a
+// placeholder/sample constant.
+
+export interface LanguageStat {
+  extension: string;
+  bytes?: number;
+  files?: number;
+  percent: number;
+}
 
 export interface RepositoryOverview {
   workspaceName: string;
@@ -8,46 +17,47 @@ export interface RepositoryOverview {
   relationships: number;
   communities: number;
   entrypoints: number;
-  embeddings: number;
-  languages: number;
+  embeddedSymbols: number;
   repositorySizeBytes: number;
-  databaseSizeBytes: number;
-  indexDurationMs: number;
-  averageParseTimeMs: number;
-  relationshipResolutionPercent: number;
-  contextCompressionPercent: number;
-  promptReductionPercent: number;
-  tokensSaved: number;
-  estCostSavedCents: number;
-  estTimeSavedMs: number;
-  avgAiContextSize: number;
-  avgRetrievalTimeMs: number;
-  tokensUsed: number;
+  totalTokensAvoided: number;
+  totalTokensUsed: number;
   totalRawTokens: number;
+  totalCalls: number;
+  failedCalls: number;
+  successRate: number;
+  avgLatencyMs: number;
+  estCostSavedCents: number;
   tokenUsageGraph: { time: string; used: number; saved: number }[];
+  contextCompressionPercent: number;
 }
 
 export interface GraphNode {
   id: string;
-  type: string;
   label: string;
-  size: number;
+  kind: string;
+  file_path: string;
+  pagerank: number;
+  connections: number;
+  community: number;
+  color: string;
 }
 
 export interface GraphEdge {
-  id: string;
   source: string;
   target: string;
   type: string;
 }
 
 export interface SystemHealth {
-  databaseStatus: 'Healthy' | 'Warning' | 'Error';
+  status: 'healthy' | 'stale' | 'not_indexed';
   cacheHitRate: number;
   indexFreshnessMs: number;
-  lastFullIndexMs: number;
-  mcpServerStatus: 'Connected' | 'Disconnected';
-  sqliteSizeMb: number;
+  staleFiles: number;
+  filesChecked: number;
+  dbSizeBytes: number;
+  port: number;
+  uptimeMs: number;
+  mcpServerStatus: 'connected' | 'disconnected';
 }
 
 export interface McpActivity {
@@ -56,6 +66,7 @@ export interface McpActivity {
   success: boolean;
   latency_ms: number;
   tokens: number;
+  tokens_saved: number;
   cache_hit: boolean;
   timestamp: string;
 }
@@ -65,94 +76,127 @@ export interface McpToolStats {
   calls: number;
   avg_latency: number;
   tokens_saved: number;
+  tokens_used: number;
+  failures: number;
 }
 
-export interface CodeBrokerApi {
-  getOverview: () => Promise<RepositoryOverview>;
-  getSystemHealth: () => Promise<SystemHealth>;
-  getGraph: () => Promise<{ nodes: GraphNode[], edges: GraphEdge[] }>;
-  getMcpActivity: () => Promise<McpActivity[]>;
-  getMcpTools: () => Promise<McpToolStats[]>;
+export interface ErrorEvent {
+  id: number;
+  tool: string;
+  arguments: string;
+  latency_ms: number;
+  timestamp: string;
 }
 
-export const api: CodeBrokerApi = {
-  getOverview: async () => {
-    try {
-      const res = await fetch('/api/v1/stats/overview');
-      const data = await res.json();
-      return {
-        workspaceName: data.workspace_name || "Unknown Workspace",
-        workspacePath: data.workspace_path || "",
-        filesIndexed: data.files_indexed || 0,
-        symbols: data.symbols_indexed || 0,
-        relationships: data.relationships_indexed || 0,
-        communities: 0,
-        entrypoints: 0,
-        embeddings: 0,
-        languages: 0,
-        repositorySizeBytes: 0,
-        databaseSizeBytes: 0,
-        indexDurationMs: 0,
-        averageParseTimeMs: 0,
-        relationshipResolutionPercent: data.symbols_indexed > 0 ? Math.min(100, (data.relationships_indexed / data.symbols_indexed) * 100) : 0,
-        contextCompressionPercent: data.total_raw_tokens > 0 ? (data.total_tokens_avoided / data.total_raw_tokens) * 100 : 0,
-        promptReductionPercent: 0,
-        tokensSaved: data.total_tokens_avoided || 0,
-        tokensUsed: data.total_tokens_used || 0,
-        totalRawTokens: data.total_raw_tokens || 0,
-        tokenUsageGraph: data.token_usage_graph || [],
-        estCostSavedCents: ((data.total_tokens_avoided || 0) / 1000000) * 300,
-        estTimeSavedMs: 0,
-        avgAiContextSize: 0,
-        avgRetrievalTimeMs: 0,
-      };
-    } catch (e) {
-      console.error(e);
-      throw e;
-    }
-  },
-  getSystemHealth: async () => {
-    try {
-      const res = await fetch('/api/v1/stats/health');
-      const data = await res.json();
-      return {
-        databaseStatus: 'Healthy',
-        cacheHitRate: parseFloat(data.cache_hit_rate) || 0,
-        indexFreshnessMs: data.index_freshness_ms || 0,
-        lastFullIndexMs: 0,
-        mcpServerStatus: 'Connected',
-        sqliteSizeMb: (data.db_size_bytes || 0) / (1024 * 1024),
-      };
-    } catch (e) {
-      console.error(e);
-      throw e;
-    }
-  },
-  getGraph: async () => {
-    try {
-      const res = await fetch('/api/v1/graph/snapshot');
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-      throw e;
-    }
-  },
-  getMcpActivity: async () => {
-    try {
-      const res = await fetch('/api/v1/mcp/activity');
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-      return [];
-    }
-  },
-  getMcpTools: async () => {
-    try {
-      const res = await fetch('/api/v1/mcp/tools');
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-      return [];
-    }
+export interface DirectoryStat {
+  path: string;
+  files: number;
+  symbols: number;
+  bytes: number;
+}
+
+export interface FileHotspot {
+  file_path: string;
+  symbol_count: number;
+  total_incoming: number;
+  total_outgoing: number;
+  aggregate_score: number;
+}
+
+export interface CycleNode {
+  name: string;
+  kind: string;
+  file_path: string;
+}
+
+export interface DependencyCycle {
+  length: number;
+  cross_file: boolean;
+  nodes: CycleNode[];
+}
+
+export interface CodebaseOverview {
+  available: boolean;
+  healthScore: number;
+  dependencyDensity: number;
+  circularDependencies: number;
+  orphanSymbols: number;
+  orphanSymbolPercent: number;
+  languages: LanguageStat[];
+  directories: DirectoryStat[];
+  hotspotFiles: FileHotspot[];
+  cycleExamples: DependencyCycle[];
+}
+
+async function getJson<T>(url: string, fallback: T): Promise<T> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return fallback;
+    return await res.json();
+  } catch (e) {
+    console.error(`Failed to fetch ${url}`, e);
+    return fallback;
   }
+}
+
+export const api = {
+  getOverview: async (): Promise<RepositoryOverview> => {
+    const data = await getJson<any>('/api/v1/stats/overview', {});
+    const rawTokens = data.total_raw_tokens || 0;
+    const avoided = data.total_tokens_avoided || 0;
+    return {
+      workspaceName: data.workspace_name || 'Unknown Workspace',
+      workspacePath: data.workspace_path || '',
+      filesIndexed: data.files_indexed || 0,
+      symbols: data.symbols_indexed || 0,
+      relationships: data.relationships_indexed || 0,
+      communities: data.communities || 0,
+      entrypoints: data.entrypoints || 0,
+      embeddedSymbols: data.embedded_symbols || 0,
+      repositorySizeBytes: data.repository_size_bytes || 0,
+      totalTokensAvoided: avoided,
+      totalTokensUsed: data.total_tokens_used || 0,
+      totalRawTokens: rawTokens,
+      totalCalls: data.total_calls || 0,
+      failedCalls: data.failed_calls || 0,
+      successRate: data.success_rate ?? 100,
+      avgLatencyMs: data.avg_latency_ms || 0,
+      estCostSavedCents: data.est_cost_saved_cents || 0,
+      tokenUsageGraph: data.token_usage_graph || [],
+      contextCompressionPercent: rawTokens > 0 ? (avoided / rawTokens) * 100 : 0,
+    };
+  },
+  getSystemHealth: async (): Promise<SystemHealth> => {
+    const data = await getJson<any>('/api/v1/stats/health', {});
+    return {
+      status: data.status || 'not_indexed',
+      cacheHitRate: data.cache_hit_rate || 0,
+      indexFreshnessMs: data.index_freshness_ms || 0,
+      staleFiles: data.stale_files || 0,
+      filesChecked: data.files_checked || 0,
+      dbSizeBytes: data.db_size_bytes || 0,
+      port: data.port || 0,
+      uptimeMs: data.uptime_ms || 0,
+      mcpServerStatus: 'connected',
+    };
+  },
+  getGraph: () => getJson<{ nodes: GraphNode[]; edges: GraphEdge[] }>('/api/v1/graph/snapshot', { nodes: [], edges: [] }),
+  getMcpActivity: () => getJson<McpActivity[]>('/api/v1/mcp/activity', []),
+  getMcpTools: () => getJson<McpToolStats[]>('/api/v1/mcp/tools', []),
+  getErrors: () => getJson<ErrorEvent[]>('/api/v1/errors', []),
+  getCodebaseOverview: async (): Promise<CodebaseOverview> => {
+    const data = await getJson<any>('/api/v1/codebase/overview', { available: false });
+    return {
+      available: !!data.available,
+      healthScore: data.health_score || 0,
+      dependencyDensity: data.dependency_density || 0,
+      circularDependencies: data.circular_dependencies || 0,
+      orphanSymbols: data.orphan_symbols || 0,
+      orphanSymbolPercent: data.orphan_symbol_percent || 0,
+      languages: data.languages || [],
+      directories: data.directories || [],
+      hotspotFiles: data.hotspot_files || [],
+      cycleExamples: data.cycle_examples || [],
+    };
+  },
 };

@@ -8,6 +8,30 @@ Your native tools are still available, but they should NOT be your first choice 
 
 ---
 
+# Available Tools
+
+You MUST only use the following listed deterministic tools for the CodeBroker MCP Server:
+- set_workspace
+- reindex_workspace
+- subsystem_communication
+- architectural_hotspots
+- dependency_cycles
+- get_context
+- impact_analysis
+- search_codebase
+- repository_stats
+- read_symbol_source
+- read_file_skeleton
+- explore_graph
+- shortest_path
+- read_file_snippet
+- get_edit_context
+- find_duplicate_logic
+
+All tools are purely deterministic. There are no OpenAI API calls, semantic search, or embedding-based lookups available.
+
+---
+
 # Core Philosophy
 
 CodeBroker exists to solve a specific problem:
@@ -40,7 +64,7 @@ Native tools should be used to implement.
 
 ---
 
-# Mandatory Rule
+# Default Rule
 
 If the user asks ANY question about the codebase:
 
@@ -54,15 +78,24 @@ If the user asks ANY question about the codebase:
 * Find this feature.
 * What would break if I change this?
 
-You MUST use CodeBroker FIRST.
+You SHOULD try CodeBroker FIRST for discovery and architecture questions.
 
 Do not guess.
 
-Do not immediately use grep.
+Try CodeBroker before defaulting to grep or recursively scanning directories.
 
-Do not immediately read files manually.
+CodeBroker is the repository memory layer, but it is not an absolute ban on native tools when needed.
 
-Do not recursively scan directories.
+---
+
+# Verification Rule
+
+You MUST fall back to native tools (like grep or full file reads) to double-check CodeBroker's output in the following scenarios:
+
+1. **Thin or empty dependencies:** If `get_context` or `impact_analysis` returns suspiciously empty or thin dependency results.
+2. **Duplicate lists:** If you notice duplicate caller or reverse-dependency lists in the output.
+3. **Stale index:** If the index appears stale compared to uncommitted changes or recent native edits you made.
+4. **Critical domains:** Anything related to Auth, Payments, or Data-Integrity must be manually verified via native tools before acting on an impact-analysis claim from CodeBroker.
 
 CodeBroker is the repository memory layer.
 
@@ -122,7 +155,7 @@ Instead of:
 
 Prefer:
 
-find_symbol
+read_symbol_source
 
 Instead of:
 
@@ -131,7 +164,7 @@ Instead of:
 
 Prefer:
 
-project_overview
+repository_stats
 
 Instead of:
 
@@ -185,12 +218,10 @@ Use CodeBroker.
 
 Preferred tools:
 
-* project_overview
-* subsystem_stats
-
+* repository_stats
 * architectural_hotspots
 * get_context
-* get_implementation
+* read_symbol_source
 
 ---
 
@@ -213,7 +244,6 @@ Preferred tools:
 * explore_graph
 * shortest_path
 * dependency_cycles
-* graph_subtree
 
 ---
 

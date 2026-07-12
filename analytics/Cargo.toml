@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 storage = { path = "../storage" }
+query = { path = "../query" }
 
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

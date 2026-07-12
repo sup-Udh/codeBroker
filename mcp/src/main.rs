@@ -129,8 +129,9 @@ fn normalized_path_scope(db: &storage::Database, raw: Option<&str>) -> Option<St
 }
 
 fn add_response_size_hint(value: &mut serde_json::Value) {
-    let char_count = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
-    let approx_tokens = analytics::accounting::TokenAccounting::estimate_tokens(char_count);
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    let char_count = serialized.len();
+    let approx_tokens = analytics::accounting::TokenAccounting::estimate_tokens_from_text(&serialized);
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "response_size_hint".to_string(),
@@ -658,7 +659,7 @@ Treat native tools as the repository's implementation layer."#;
                                     },
                                     {
                                         "name": "subsystem_communication",
-                                        "description": "Diffs two subsystems' edge sets to answer 'how do A and B communicate': counts of edges from A's symbols to B's and vice versa, with example symbol pairs per direction. Use instead of manually calling subsystem_stats twice and diffing the results.",
+                                        "description": "Diffs two subsystems' edge sets to answer 'how do A and B communicate': counts of edges from A's symbols to B's and vice versa, with example symbol pairs per direction. Use instead of manually calling subsystem_stats twice and diffing the results. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -670,7 +671,7 @@ Treat native tools as the repository's implementation layer."#;
                                     },
                                     {
                                         "name": "architectural_hotspots",
-                                        "description": "Identifies highly connected and heavily depended-on code. Useful for locating critical files, shared infrastructure, and architectural bottlenecks.",
+                                        "description": "Identifies highly connected and heavily depended-on code. Useful for locating critical files, shared infrastructure, and architectural bottlenecks. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -681,7 +682,7 @@ Treat native tools as the repository's implementation layer."#;
                                     },
                                     {
                                         "name": "dependency_cycles",
-                                        "description": "Detects circular dependencies in the repository graph. Reports cross-file cycles by default and can optionally include same-file cycles. Ignores self-recursive functions.",
+                                        "description": "Detects circular dependencies in the repository graph. Reports cross-file cycles by default and can optionally include same-file cycles. Ignores self-recursive functions. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -725,7 +726,7 @@ Treat native tools as the repository's implementation layer."#;
 
                                     {
                                         "name": "repository_stats",
-                                        "description": "Returns file, symbol, edge, and language statistics for a repository or repository subsection, plus entrypoints (API routes + pages/layouts) scoped the same way as the stats themselves.",
+                                        "description": "Returns file, symbol, edge, and language statistics for a repository or repository subsection, plus entrypoints (API routes + pages/layouts) scoped the same way as the stats themselves. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -740,7 +741,20 @@ Treat native tools as the repository's implementation layer."#;
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "Single symbol name to read." },
-                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Batch form: multiple symbol names to read in one call." },
+                                                "symbols": { "type": "array", "items": { "type": "string" }, "description": "Legacy array of symbol names to read." },
+                                                "targets": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "symbol": { "type": "string" },
+                                                            "file_path": { "type": "string" },
+                                                            "line": { "type": "number" }
+                                                        },
+                                                        "required": ["symbol"]
+                                                    },
+                                                    "description": "Preferred array of objects to read multiple symbols with individual disambiguation."
+                                                },
                                                 "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." },
                                                 "line": { "type": "number", "description": "Optional 1-based line number. When a file contains multiple definitions with the same name, picks the definition whose start_line is closest to (and not after) this line." },
                                                 "include_dependencies": { "type": "boolean", "description": "Default false. Also include source for immediate forward dependencies." }
@@ -761,7 +775,7 @@ Treat native tools as the repository's implementation layer."#;
                                     },
                                     {
                                         "name": "explore_graph",
-                                        "description": "Performs breadth-first traversal of the dependency graph from a symbol. Use to understand nearby relationships and dependency neighborhoods.",
+                                        "description": "Performs breadth-first traversal of the dependency graph from a symbol. Use to understand nearby relationships and dependency neighborhoods. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -777,7 +791,7 @@ Treat native tools as the repository's implementation layer."#;
                                     },
                                     {
                                         "name": "shortest_path",
-                                        "description": "Finds the shortest dependency path between two symbols. Useful for understanding how components are connected. If `from` or `to` matches multiple symbols, returns an ambiguity response listing candidates instead of guessing.",
+                                        "description": "Finds the shortest dependency path between two symbols. Useful for understanding how components are connected. If `from` or `to` matches multiple symbols, returns an ambiguity response listing candidates instead of guessing. Note: This tool reads from the indexed graph. If you suspect the graph is out of date (e.g. after modifying files), call `reindex_workspace` first.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
@@ -810,7 +824,8 @@ Treat native tools as the repository's implementation layer."#;
                                             "type": "object",
                                             "properties": {
                                                 "symbol": { "type": "string", "description": "Symbol name you intend to edit." },
-                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." }
+                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." },
+                                                "line": { "type": "number", "description": "Optional 1-based line number. Disambiguates between same-named symbols in the same file." }
                                             },
                                             "required": ["symbol"]
                                         }
@@ -884,7 +899,6 @@ Treat native tools as the repository's implementation layer."#;
                                             let symbol_id = resolved.id;
                                             let symbol = resolved.name.as_str();
                                             let file_hint = Some(relative_hint(&db, &resolved.file_path));
-                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                             // Self-heals a stale defining file (incrementally
                                             // reindexes it, then re-assembles) instead of serving
                                             // or silently flagging stale data — see
@@ -898,6 +912,13 @@ Treat native tools as the repository's implementation layer."#;
                                             };
                                             match semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, profile).map_err(|e| e.to_string()) {
                                                 Ok(Some(context)) => {
+                                                    // Built once regardless of output format: it's the
+                                                    // cheapest way to get the real set of files this
+                                                    // answer actually touched (callers/callees/deps),
+                                                    // which is what the token-savings baseline below is
+                                                    // grounded in.
+                                                    let baseline_json = context.build_json().unwrap_or(serde_json::json!({}));
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &baseline_json);
                                                     if format_opt == "markdown" {
                                                         let mut md = context.build_markdown().unwrap_or_else(|_| "Error building markdown".to_string());
                                                         if include_source {
@@ -911,7 +932,7 @@ Treat native tools as the repository's implementation layer."#;
                                                         }
                                                         md
                                                     } else {
-                                                        let mut value = context.build_json().unwrap_or(serde_json::json!({}));
+                                                        let mut value = baseline_json;
                                                         if include_source {
                                                             let source = query::retrieval::read_symbol_source_scoped(&db, symbol, false, file_hint).unwrap_or_default();
                                                             if let Some(obj) = value.as_object_mut() {
@@ -942,7 +963,6 @@ Treat native tools as the repository's implementation layer."#;
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
                                         let outcome = semantic::search::resolve_search_semantic(
                                             &db, keyword, path_scope, mode, whole_word, limit, include_concepts
                                         );
@@ -962,6 +982,10 @@ Treat native tools as the repository's implementation layer."#;
                                         if let Some(why) = outcome.semantic_degraded_reason {
                                             payload["semantic_degraded_reason"] = serde_json::Value::String(why);
                                         }
+                                        // Baseline = real bytes of every matched file: the naive
+                                        // alternative to a ranked, precise search is grepping the
+                                        // repo and opening each match in full to check it.
+                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &payload);
                                         add_response_size_hint(&mut payload);
                                         serde_json::to_string_pretty(&payload).unwrap_or_default()
                                     }
@@ -975,7 +999,11 @@ Treat native tools as the repository's implementation layer."#;
                                     Ok(db) => {
                                         let path_scope = normalized_path_scope(&db, path_scope_raw);
                                         let path_scope = path_scope.as_deref();
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
+                                        // repository_stats characterizes the WHOLE scope rather
+                                        // than a filtered subset, so the honest baseline is the
+                                        // real size of every file in that scope, not just the
+                                        // files a narrower answer happened to name.
+                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_scope_bytes_tokens(&db, path_scope);
                                         match query::engine::build_project_overview_scoped(&db, path_scope) {
                                             Ok(overview) => {
                                                 // Real state, not a hardcoded flag: rows stored for
@@ -1008,31 +1036,59 @@ Treat native tools as the repository's implementation layer."#;
                                 let file_hint = get_file_hint(&arguments);
                                 let line_hint = arguments.get("line").and_then(|n| n.as_i64());
 
+                                struct ReadTarget {
+                                    symbol: String,
+                                    file_hint: Option<String>,
+                                    line_hint: Option<i64>,
+                                }
                                 let mut targets = Vec::new();
+
+                                if let Some(arr) = arguments.get("targets").and_then(|a| a.as_array()) {
+                                    for v in arr {
+                                        if let Some(obj) = v.as_object() {
+                                            if let Some(s) = obj.get("symbol").and_then(|s| s.as_str()) {
+                                                targets.push(ReadTarget {
+                                                    symbol: s.to_string(),
+                                                    file_hint: obj.get("file_path").and_then(|f| f.as_str()).map(|s| s.to_string()),
+                                                    line_hint: obj.get("line").and_then(|l| l.as_i64()),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
-                                    targets.push(s.to_string());
+                                    targets.push(ReadTarget {
+                                        symbol: s.to_string(),
+                                        file_hint: file_hint.map(|s| s.to_string()),
+                                        line_hint,
+                                    });
                                 }
                                 if let Some(arr) = arguments.get("symbols").and_then(|a| a.as_array()) {
                                     for v in arr {
                                         if let Some(s) = v.as_str() {
-                                            targets.push(s.to_string());
+                                            targets.push(ReadTarget {
+                                                symbol: s.to_string(),
+                                                file_hint: file_hint.map(|s| s.to_string()),
+                                                line_hint,
+                                            });
                                         }
                                     }
                                 }
 
                                 if targets.is_empty() {
-                                    "Error: Must provide 'symbol' or 'symbols'".to_string()
+                                    "Error: Must provide 'targets', 'symbol' or 'symbols'".to_string()
                                 } else {
                                     match storage::Database::new(&db_path) {
                                         Ok(db) => {
                                             // The new Phase 20 architecture:
                                             let mut combined_results = Vec::new();
-                                            for symbol in &targets {
+                                            for target in &targets {
                                                 let result = tools::read_symbol_source::ReadSymbolSource::execute(
                                                     &db,
-                                                    symbol,
-                                                    file_hint,
-                                                    line_hint,
+                                                    &target.symbol,
+                                                    target.file_hint.as_deref(),
+                                                    target.line_hint,
                                                     include_deps,
                                                 );
                                                 // If it's a JSON array (from our tool), accumulate it. Otherwise, it's an error.
@@ -1045,6 +1101,11 @@ Treat native tools as the repository's implementation layer."#;
                                                     }
                                                 }
                                             }
+                                            // Baseline = real bytes of every distinct file these
+                                            // targets actually live in — the naive alternative is
+                                            // Read-ing each whole file to find the symbol by hand.
+                                            let combined_value = serde_json::Value::Array(combined_results.clone());
+                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &combined_value);
                                             to_string_with_hint(&combined_results).unwrap_or_default()
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
@@ -1143,6 +1204,10 @@ Treat native tools as the repository's implementation layer."#;
                                         // reimplements its own "is this a directory" matching.
                                         match resolver::resolve_path(&db, path) {
                                             resolver::ResolvedEntity::File(f) => {
+                                                // The whole point of a skeleton is replacing a full
+                                                // Read of this exact file, so its real on-disk size
+                                                // IS the baseline — no estimation needed.
+                                                estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_file_tokens(&db, &f.file_path);
                                                 match query::retrieval::skeletonize_file(&db, &f.file_path, target_symbol) {
                                                     Ok(res) => res,
                                                     Err(e) => format!("Error reading file skeleton: {}", e),
@@ -1178,15 +1243,16 @@ Treat native tools as the repository's implementation layer."#;
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                         let hint = relative_hint(&db, &resolved.file_path);
-                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::graph::explore_graph_scoped(&db, &resolved.name, depth, direction, max_nodes, Some(hint), Some(resolved.id)) {
                                             Ok(res) => {
+                                                let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
+                                                let profile = query::response::ResponseProfile::from(profile_str);
+                                                let baseline_json = res.build_json(profile);
+                                                estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &baseline_json);
                                                 if format_opt == "markdown" {
                                                     res.to_markdown()
                                                 } else {
-                                                    let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
-                                                    let profile = query::response::ResponseProfile::from(profile_str);
-                                                    to_string_with_hint(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph".to_string())
+                                                    to_string_with_hint(&baseline_json).unwrap_or_else(|_| "Error serializing graph".to_string())
                                                 }
                                             },
                                             Err(e) => format!("Error exploring graph: {}", e),
@@ -1220,7 +1286,12 @@ Treat native tools as the repository's implementation layer."#;
                                             let to_hint = relative_hint(&db, &to_resolved.file_path);
                                             match query::graph::shortest_path(&db, &from_resolved.name, &to_resolved.name, Some(from_hint), Some(to_hint), Some(from_resolved.id), Some(to_resolved.id)) {
                                                 Ok(res) => {
-                                                    estimated_raw_context_tokens = res.nodes.len() * 50; // rough estimation
+                                                    // Baseline = real bytes of every file the path
+                                                    // actually passes through — tracing this by hand
+                                                    // means opening each of those files in full.
+                                                    if let Ok(v) = serde_json::to_value(&res) {
+                                                        estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &v);
+                                                    }
                                                     to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing path".to_string())
                                                 },
                                                 Err(e) => format!("Error finding shortest path: {}", e),
@@ -1239,7 +1310,12 @@ Treat native tools as the repository's implementation layer."#;
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         match query::subsystem::subsystem_communication(&db, subsystem_a, subsystem_b) {
-                                            Ok(res) => to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
+                                            Ok(res) => {
+                                                if let Ok(v) = serde_json::to_value(&res) {
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &v);
+                                                }
+                                                to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string())
+                                            },
                                             Err(e) => to_string_with_hint(&e).unwrap_or_else(|_| "Error in subsystem communication".to_string()),
                                         }
                                     }
@@ -1256,7 +1332,12 @@ Treat native tools as the repository's implementation layer."#;
                                         let path_scope = path_scope.as_deref();
                                         match query::graph::architectural_hotspots(&db, limit, path_scope) {
                                             Ok(res) => {
-                                                estimated_raw_context_tokens = res.top_hotspots.len() * 50; // rough estimation
+                                                // Baseline = real bytes of every file these hotspots
+                                                // live in — that's what manually surveying the same
+                                                // set of critical files would cost.
+                                                if let Ok(v) = serde_json::to_value(&res) {
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &v);
+                                                }
                                                 to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
                                             },
                                             Err(e) => format!("Error calculating architectural hotspots: {}", e),
@@ -1275,7 +1356,12 @@ Treat native tools as the repository's implementation layer."#;
                                         let path_scope = path_scope.as_deref();
                                         match query::graph::dependency_cycles(&db, limit, path_scope, include_same_file) {
                                             Ok(res) => {
-                                                estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
+                                                // Baseline = real bytes of every file involved in a
+                                                // returned cycle — tracing cycles by hand means
+                                                // opening each of those files in full.
+                                                if let Ok(v) = serde_json::to_value(&res) {
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &v);
+                                                }
                                                 to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
                                             },
                                             Err(e) => {
@@ -1304,7 +1390,12 @@ Treat native tools as the repository's implementation layer."#;
                                         let path_scope = path_scope.as_deref();
                                         match query::duplicates::find_duplicate_logic(&db, min_length, path_scope, limit) {
                                             Ok(res) => {
-                                                estimated_raw_context_tokens = res.groups.len() * 60; // rough estimation
+                                                // Baseline = real bytes of every file that appears
+                                                // in a duplicate group — finding the same overlaps by
+                                                // hand means opening and diffing those files in full.
+                                                if let Ok(v) = serde_json::to_value(&res) {
+                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &v);
+                                                }
                                                 to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing duplicate logic report".to_string())
                                             }
                                             Err(e) => format!("Error scanning for duplicate logic: {}", e),
@@ -1321,6 +1412,9 @@ Treat native tools as the repository's implementation layer."#;
                                     Ok(db) => {
                                         match resolver::resolve_path(&db, path) {
                                             resolver::ResolvedEntity::File(f) => {
+                                                // A snippet stands in for a full Read of this exact
+                                                // file, so its real on-disk size is the baseline.
+                                                estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_file_tokens(&db, &f.file_path);
                                                 match query::retrieval::read_file_snippet(&f.file_path, start_line, end_line) {
                                                     Ok(res) => to_string_with_hint(&res).unwrap_or_default(),
                                                     Err(e) => format!("Error reading file snippet: {}", e),
@@ -1337,6 +1431,9 @@ Treat native tools as the repository's implementation layer."#;
                                                 // filesystem read rather than refusing outright
                                                 // just because the index doesn't know this path.
                                                 let resolved_path = db.resolve_path(path);
+                                                estimated_raw_context_tokens = std::fs::metadata(&resolved_path)
+                                                    .map(|m| analytics::accounting::TokenAccounting::estimate_tokens(m.len() as usize))
+                                                    .unwrap_or(0);
                                                 match query::retrieval::read_file_snippet(&resolved_path, start_line, end_line) {
                                                     Ok(res) => to_string_with_hint(&res).unwrap_or_default(),
                                                     Err(e) => format!("Error reading file snippet: {}", e),
@@ -1352,9 +1449,10 @@ Treat native tools as the repository's implementation layer."#;
                             "get_edit_context" => {
                                 let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
                                 let file_hint = get_file_hint(&arguments);
+                                let line_hint = arguments.get("line").and_then(|l| l.as_i64());
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint, None) {
+                                        match resolve_symbol_for_tool(&db, symbol, file_hint, line_hint) {
                                         Err(resp) => resp,
                                         Ok(resolved) => {
                                             let symbol_id = resolved.id;
@@ -1383,6 +1481,10 @@ Treat native tools as the repository's implementation layer."#;
                                                     symbol
                                                 ));
                                             }
+                                            // Baseline = real bytes of the target file plus every
+                                            // caller/callee/dependency file named above — assembling
+                                            // this by hand means opening all of them in full.
+                                            estimated_raw_context_tokens = analytics::accounting::TokenAccounting::real_baseline_from_json(&db, &edit_context);
                                             add_response_size_hint(&mut edit_context);
                                             serde_json::to_string_pretty(&edit_context).unwrap_or_default()
                                         }
