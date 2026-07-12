@@ -9,19 +9,48 @@ async fn get_overview() -> Json<Value> {
     let mut symbols_indexed = 0_i64;
     let mut relationships_indexed = 0_i64;
     let mut total_tokens_avoided = 0_i64;
+    let mut total_tokens_used = 0_i64;
+    let mut total_raw_tokens = 0_i64;
+    let mut token_usage_graph = Vec::new();
     
     if let Ok(conn) = rusqlite::Connection::open(".codebroker/codebroker.db") {
         files_indexed = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap_or(0);
         symbols_indexed = conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0)).unwrap_or(0);
         relationships_indexed = conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap_or(0);
         total_tokens_avoided = conn.query_row("SELECT SUM(token_reduction) FROM mcp_analytics_events", [], |r| r.get(0)).unwrap_or(0);
+        total_tokens_used = conn.query_row("SELECT SUM(delivered_token_count) FROM mcp_analytics_events", [], |r| r.get(0)).unwrap_or(0);
+        total_raw_tokens = conn.query_row("SELECT SUM(estimated_raw_context_tokens) FROM mcp_analytics_events", [], |r| r.get(0)).unwrap_or(0);
+
+        if let Ok(mut stmt) = conn.prepare("SELECT strftime('%H:00', created_at) as time, SUM(delivered_token_count) as used, SUM(token_reduction) as saved FROM mcp_analytics_events GROUP BY time ORDER BY time") {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Some(row) = rows.next().unwrap_or(None) {
+                    let time: String = row.get(0).unwrap_or_default();
+                    let used: i64 = row.get(1).unwrap_or(0);
+                    let saved: i64 = row.get(2).unwrap_or(0);
+                    token_usage_graph.push(json!({
+                        "time": time,
+                        "used": used,
+                        "saved": saved
+                    }));
+                }
+            }
+        }
     }
     
+    let current_dir = std::env::current_dir().unwrap_or_default();
+    let workspace_path = current_dir.to_string_lossy().to_string();
+    let workspace_name = current_dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+
     Json(json!({
+        "workspace_name": workspace_name,
+        "workspace_path": workspace_path,
         "files_indexed": files_indexed,
         "symbols_indexed": symbols_indexed,
         "relationships_indexed": relationships_indexed,
         "total_tokens_avoided": total_tokens_avoided,
+        "total_tokens_used": total_tokens_used,
+        "total_raw_tokens": total_raw_tokens,
+        "token_usage_graph": token_usage_graph,
     }))
 }
 
@@ -29,9 +58,15 @@ async fn get_health() -> Json<Value> {
     let mut cache_hits = 0_i64;
     let mut cache_misses = 0_i64;
     let mut db_size_bytes = 0_u64;
+    let mut index_freshness_ms = 0_u64;
 
     if let Ok(metadata) = std::fs::metadata(".codebroker/codebroker.db") {
         db_size_bytes = metadata.len();
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(duration) = std::time::SystemTime::now().duration_since(modified) {
+                index_freshness_ms = duration.as_millis() as u64;
+            }
+        }
     }
 
     if let Ok(conn) = rusqlite::Connection::open(".codebroker/codebroker.db") {
@@ -48,6 +83,7 @@ async fn get_health() -> Json<Value> {
     Json(json!({
         "cache_hit_rate": hit_rate,
         "db_size_bytes": db_size_bytes,
+        "index_freshness_ms": index_freshness_ms,
         "status": "healthy"
     }))
 }

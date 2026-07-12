@@ -23,7 +23,7 @@ impl PipelineValidator for RetrievalValidator {
 
         // In a real-world scenario, we would sample ~50-100 symbols here and 
         // run them through the full Traversal Engine to verify the exact MCP Tool Contracts 
-        // (read_symbol_source -> impact_analysis -> shortest_path).
+        // (read_symbol_source -> get_context -> shortest_path).
         // Since the MCP Tool Engine is being re-written right now, we will perform a query-level
         // validation to prove the graph contains all necessary context for these tools.
         

@@ -1,360 +1,176 @@
-use crate::provider::LlmProvider;
+use crate::cards;
+use crate::embedder::Embedder;
 use std::collections::HashMap;
-use std::time::Instant;
-use storage::{blob_to_embedding, Database};
+use storage::Database;
 
-/// Keeps each embeddings API request to a reasonable payload size — OpenAI's
-/// endpoint accepts far more than this per call, but batching too aggressively
-/// just makes one slow request's failure (timeout, transient error) cost a
-/// full repo's worth of retries instead of one chunk's.
-const BATCH_SIZE: usize = 100;
-
-pub struct EmbeddingBackfillStats {
+/// Result of one backfill pass.
+#[derive(Debug, Default)]
+pub struct BackfillStats {
+    /// Symbols embedded fresh (model/API actually called for them).
     pub embedded: usize,
-    pub batches: usize,
-    /// Batches that failed after all retries — symbols in these batches are
-    /// not embedded this run but will be picked up on the next run via
-    /// `symbols_missing_embeddings`.
+    /// Symbols whose vector was carried over from `reuse` by body_hash —
+    /// no model call needed (full-rebuild path).
+    pub reused: usize,
+    /// Symbols whose stored body_hash already matched — nothing written.
+    pub skipped_unchanged: usize,
+    /// Batches that failed after the embedder's own retries. Their symbols
+    /// stay un-embedded this pass and are picked up by the next one.
     pub failed_batches: usize,
 }
 
-const MAX_RETRIES: u32 = 3;
+/// Same chunk size the embedding APIs are batched at; for the local model
+/// this just bounds peak tokenization memory.
+const EMBED_BATCH_SIZE: usize = 100;
 
-/// Embeds every symbol that doesn't have a stored embedding yet (per
-/// `Database::symbols_missing_embeddings`), optionally narrowed to
-/// `only_symbol_ids` — used after an incremental reindex to embed exactly the
-/// symbols that were just (re)inserted, instead of rescanning the whole repo.
-/// A no-op (returns `Ok` with zero counts) when there's nothing to embed, so
-/// callers can call this unconditionally after every index/reindex without
-/// special-casing "nothing changed."
+/// Brings the `embeddings` table up to date with the symbol table for
+/// `embedder`'s model:
 ///
-/// The embedding text per symbol is intentionally short and structured
-/// (`kind name in path: signature`) rather than the full source body — the
-/// goal is to let a conceptual query land near the right symbol's NAME and
-/// SIGNATURE, not to embed implementation details that would dilute the
-/// vector with noise irrelevant to "what is this and where does it live."
-pub fn backfill_missing_embeddings(
+/// - builds each symbol's card (see `cards::build_card`) from the file on
+///   disk and hashes it;
+/// - skips symbols whose stored `body_hash` for this model already matches;
+/// - reuses vectors from `reuse` (old-database carry-over keyed by
+///   body_hash) when provided;
+/// - embeds the rest in batches, then writes every new row inside ONE
+///   transaction with a cached prepared statement.
+///
+/// `only_symbol_ids` narrows the pass to an incremental reindex's touched
+/// symbols instead of rescanning the whole repo. Vectors of REMOVED symbols
+/// are not this function's job: `Database::delete_file_data` deletes them
+/// when the file is re-parsed (and a full rebuild starts from an empty
+/// table).
+///
+/// Symbols in ignored paths never appear here at all — candidates come from
+/// the `symbols` table, which only ever contains files the indexer's
+/// ignore-aware walker accepted.
+///
+/// This runs strictly AFTER symbol/graph indexing and must never fail it:
+/// callers treat an `Err` as "semantic search degraded", log it, and move on.
+pub fn backfill_embeddings(
     db: &Database,
-    provider: &dyn LlmProvider,
+    embedder: &dyn Embedder,
     only_symbol_ids: Option<&[i64]>,
-) -> Result<EmbeddingBackfillStats, String> {
-    let t_total = Instant::now();
-
-    let t0 = Instant::now();
-    let mut candidates = db.symbols_missing_embeddings().map_err(|e| e.to_string())?;
+    reuse: Option<&HashMap<String, Vec<u8>>>,
+) -> Result<BackfillStats, String> {
+    let model_id = embedder.model_id().to_string();
+    let mut candidates = db.embedding_candidates(&model_id).map_err(|e| e.to_string())?;
     if let Some(ids) = only_symbol_ids {
+        let ids: std::collections::HashSet<i64> = ids.iter().copied().collect();
         candidates.retain(|(id, ..)| ids.contains(id));
     }
-    let candidate_count = candidates.len();
-    eprintln!(
-        "[TIMING:embeddings] Load missing symbols query: {}ms ({} candidates)",
-        t0.elapsed().as_millis(),
-        candidate_count
-    );
 
-    let mut stats = EmbeddingBackfillStats {
-        embedded: 0,
-        batches: 0,
-        failed_batches: 0,
-    };
+    let mut stats = BackfillStats::default();
     if candidates.is_empty() {
-        eprintln!("[TIMING:embeddings] No candidates — skipping. Total: {}ms", t_total.elapsed().as_millis());
         return Ok(stats);
     }
 
-    let model = provider.embedding_model_name().to_string();
-    let total_batches = (candidate_count + BATCH_SIZE - 1) / BATCH_SIZE;
-    let mut total_text_prep_ms = 0u128;
-    let mut total_http_ms = 0u128;
-    let mut total_db_write_ms = 0u128;
+    // One file read per file, not per symbol.
+    let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
 
-    for (batch_idx, chunk) in candidates.chunks(BATCH_SIZE).enumerate() {
-        let t_prep = Instant::now();
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, name, kind, path, signature, summary)| {
-                let sig = signature.clone().unwrap_or_else(|| name.clone());
-                if let Some(summ) = summary {
-                    format!("{} {} in {}: {}\nSummary: {}", kind, name, path, sig, summ)
-                } else {
-                    format!("{} {} in {}: {}", kind, name, path, sig)
-                }
-            })
-            .collect();
-        let text_prep_ms = t_prep.elapsed().as_millis();
-        total_text_prep_ms += text_prep_ms;
+    // (symbol_id, body_hash, card) still needing a model call, and
+    // (symbol_id, body_hash, vector) rows ready to write.
+    let mut to_embed: Vec<(i64, String, String)> = Vec::new();
+    let mut to_write: Vec<(i64, String, Vec<f32>)> = Vec::new();
 
-        let avg_bytes: usize = texts.iter().map(|t| t.len()).sum::<usize>() / texts.len().max(1);
-        let payload_bytes: usize = texts.iter().map(|t| t.len()).sum();
-
-        // Retry up to MAX_RETRIES times with exponential backoff. Transient
-        // network errors (body truncation, connection reset) are common on
-        // large responses; a single retry almost always succeeds.
-        let t_http = Instant::now();
-        let mut vectors_result: Result<Vec<Vec<f32>>, String> = Err(String::new());
-        for attempt in 0..MAX_RETRIES {
-            if attempt > 0 {
-                let backoff_ms = 500u64 * (1u64 << (attempt - 1)); // 500ms, 1000ms
-                eprintln!(
-                    "[TIMING:embeddings] Batch {}/{} attempt {}/{} retrying in {}ms…",
-                    batch_idx + 1, total_batches, attempt + 1, MAX_RETRIES, backoff_ms
-                );
-                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-            }
-            match provider.embed_texts(&texts) {
-                Ok(v) => { vectors_result = Ok(v); break; }
-                Err(e) => {
-                    eprintln!(
-                        "[TIMING:embeddings] Batch {}/{} attempt {}/{} failed: {}",
-                        batch_idx + 1, total_batches, attempt + 1, MAX_RETRIES, e
-                    );
-                    vectors_result = Err(e);
-                }
-            }
-        }
-        let http_ms = t_http.elapsed().as_millis();
-        total_http_ms += http_ms;
-
-        let vectors = match vectors_result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "[TIMING:embeddings] Batch {}/{} failed after {} retries ({} symbols skipped): {}",
-                    batch_idx + 1, total_batches, MAX_RETRIES, chunk.len(), e
-                );
-                stats.failed_batches += 1;
-                // Continue rather than abort — remaining batches may succeed,
-                // and skipped symbols will be picked up on the next init/reindex.
-                continue;
-            }
+    for (symbol_id, name, kind, path, signature, start_byte, end_byte, _line, stored_hash) in
+        &candidates
+    {
+        let content = file_cache
+            .entry(path.clone())
+            .or_insert_with(|| std::fs::read_to_string(db.resolve_path(path)).ok());
+        let Some(content) = content else {
+            continue; // unreadable/deleted file; its rows go away on next reindex
         };
-
-        if vectors.len() != chunk.len() {
-            eprintln!(
-                "[TIMING:embeddings] Batch {}/{}: vector count mismatch ({} vs {}), skipping",
-                batch_idx + 1, total_batches, vectors.len(), chunk.len()
-            );
-            stats.failed_batches += 1;
+        let card = cards::build_card(
+            path,
+            kind,
+            name,
+            signature.as_deref(),
+            content,
+            *start_byte as usize,
+            *end_byte as usize,
+        );
+        let hash = cards::card_hash(&card);
+        if stored_hash.as_deref() == Some(hash.as_str()) {
+            stats.skipped_unchanged += 1;
             continue;
         }
-        stats.batches += 1;
-
-        eprintln!(
-            "[TIMING:embeddings] Batch {}/{}: symbols={}, payload_bytes={}, avg_text_bytes={}, text_prep={}ms, http_request={}ms",
-            batch_idx + 1,
-            total_batches,
-            chunk.len(),
-            payload_bytes,
-            avg_bytes,
-            text_prep_ms,
-            http_ms
-        );
-
-        let t_db = Instant::now();
-        for ((id, ..), vector) in chunk.iter().zip(vectors.iter()) {
-            db.upsert_symbol_embedding(*id, vector, &model)
-                .map_err(|e| e.to_string())?;
-            stats.embedded += 1;
+        if let Some(reuse) = reuse {
+            if let Some(blob) = reuse.get(&hash) {
+                to_write.push((*symbol_id, hash, storage::blob_to_embedding(blob)));
+                stats.reused += 1;
+                continue;
+            }
         }
-        let db_write_ms = t_db.elapsed().as_millis();
-        total_db_write_ms += db_write_ms;
-        eprintln!(
-            "[TIMING:embeddings]   └─ DB writes ({} rows, individual): {}ms ({:.2}ms/row)",
-            chunk.len(),
-            db_write_ms,
-            db_write_ms as f64 / chunk.len() as f64
-        );
+        to_embed.push((*symbol_id, hash, card));
     }
 
-    eprintln!(
-        "[TIMING:embeddings] Summary: batches={}, failed={}, embedded={}, text_prep={}ms, http_total={}ms, db_writes={}ms, total={}ms",
-        stats.batches,
-        stats.failed_batches,
-        stats.embedded,
-        total_text_prep_ms,
-        total_http_ms,
-        total_db_write_ms,
-        t_total.elapsed().as_millis()
-    );
+    // Embed everything BEFORE opening the write transaction: a transaction
+    // held across model inference (or worse, API round-trips) would block
+    // every other writer on this database for its whole duration.
+    for chunk in to_embed.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = chunk.iter().map(|(_, _, card)| card.clone()).collect();
+        match embedder.embed(&texts) {
+            Ok(vectors) if vectors.len() == chunk.len() => {
+                for ((symbol_id, hash, _), vector) in chunk.iter().zip(vectors) {
+                    to_write.push((*symbol_id, hash.clone(), vector));
+                    stats.embedded += 1;
+                }
+            }
+            Ok(vectors) => {
+                eprintln!(
+                    "[semantic] embedding batch returned {} vectors for {} texts; skipping batch",
+                    vectors.len(),
+                    chunk.len()
+                );
+                stats.failed_batches += 1;
+            }
+            Err(e) => {
+                eprintln!("[semantic] embedding batch failed: {}", e);
+                stats.failed_batches += 1;
+                // Keep going: later batches may succeed, and failed symbols
+                // are retried by the next backfill via their missing rows.
+            }
+        }
+    }
 
+    if to_write.is_empty() {
+        return Ok(stats);
+    }
+
+    db.conn
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| e.to_string())?;
+    let write_result: Result<(), String> = (|| {
+        for (symbol_id, hash, vector) in &to_write {
+            db.upsert_symbol_embedding(*symbol_id, &model_id, vector, hash)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    match write_result {
+        Ok(()) => db.conn.execute_batch("COMMIT").map_err(|e| e.to_string())?,
+        Err(e) => {
+            let _ = db.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
     Ok(stats)
 }
 
-fn embedding_cache_key(name: &str, kind: &str, path: &str, sig: &str) -> String {
-    format!("{}:{}:{}:{}", name, kind, path, sig)
-}
-
-/// Loads all symbol embeddings from an existing database, keyed by a canonical
-/// string of `name:kind:path:signature`. Safe to call when no database exists
-/// at `db_path` — returns an empty map in that case.
-///
-/// Used by `codebroker init` to carry forward embeddings that are still valid
-/// into the freshly-rebuilt database, so only new or modified symbols need API calls.
-pub fn load_embedding_cache(db_path: &str) -> HashMap<String, (Vec<f32>, String)> {
-    let mut cache = HashMap::new();
-    let Ok(old_db) = Database::new(db_path) else {
-        return cache;
-    };
-    let Ok(mut stmt) = old_db.conn.prepare(
-        "SELECT s.name, s.kind, f.path, s.signature, e.embedding, e.model
-         FROM symbol_embeddings e
-         JOIN symbols s ON e.symbol_id = s.id
-         JOIN files f ON s.file_id = f.id",
-    ) else {
-        return cache;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Vec<u8>>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    }) else {
-        return cache;
-    };
-    for row in rows.flatten() {
-        let (name, kind, path, signature, blob, model) = row;
-        let sig = signature.as_deref().unwrap_or(&name).to_string();
-        let key = embedding_cache_key(&name, &kind, &path, &sig);
-        cache.insert(key, (blob_to_embedding(&blob), model));
+/// Loads the previous published database's vectors keyed by body_hash, for
+/// carry-over across a full `init` rebuild (which reassigns every symbol id
+/// but leaves most symbols' embeddable content — and therefore hash —
+/// untouched). Returns an empty map when there is no previous database or it
+/// has no vectors for this model; the caller then simply embeds everything.
+pub fn load_reuse_cache(old_db_path: &str, model_id: &str) -> HashMap<String, Vec<u8>> {
+    if !std::path::Path::new(old_db_path).exists() {
+        return HashMap::new();
     }
-    cache
-}
-
-/// For each symbol in `db` whose `(name, kind, path, signature)` key exists in
-/// `cache`, writes the cached embedding directly — bypassing any API call.
-/// Returns the number of symbols served from cache.
-///
-/// Called after rebuilding symbols and before `backfill_missing_embeddings`, so
-/// the backfill only sees genuinely new or changed symbols.
-pub fn apply_embedding_cache(
-    db: &Database,
-    cache: &HashMap<String, (Vec<f32>, String)>,
-) -> usize {
-    if cache.is_empty() {
-        return 0;
-    }
-    let Ok(mut stmt) = db.conn.prepare(
-        "SELECT s.id, s.name, s.kind, f.path, s.signature
-         FROM symbols s
-         JOIN files f ON s.file_id = f.id",
-    ) else {
-        return 0;
-    };
-    let Ok(rows) = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-        ))
-    }) else {
-        return 0;
-    };
-    let symbols: Vec<_> = rows.flatten().collect();
-    let mut hits = 0usize;
-    for (id, name, kind, path, signature) in symbols {
-        let sig = signature.as_deref().unwrap_or(&name).to_string();
-        let key = embedding_cache_key(&name, &kind, &path, &sig);
-        if let Some((vector, model)) = cache.get(&key) {
-            if db.upsert_symbol_embedding(id, vector, model).is_ok() {
-                hits += 1;
-            }
-        }
-    }
-    hits
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::MockProvider;
-
-    #[test]
-    fn embeds_only_missing_symbols_and_is_idempotent() {
-        let db = Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_id = db.insert_file("a.ts", "h").unwrap();
-        let id = db
-            .insert_symbol(
-                file_id,
-                &graph::SymbolNode {
-                    name: "foo".to_string(),
-                    kind: "function".to_string(),
-                    start_line: 1,
-                    end_line: 1,
-                    start_byte: 0,
-                    end_byte: 0,
-                    signature: None,
-                    attributes: Vec::new(),
-                    metadata: None,
-                },
-            )
-            .unwrap();
-
-        let provider = MockProvider;
-        let stats = backfill_missing_embeddings(&db, &provider, None).unwrap();
-        assert_eq!(stats.embedded, 1);
-        assert_eq!(stats.batches, 1);
-
-        // Re-running with nothing missing must be a true no-op (zero API calls).
-        let stats2 = backfill_missing_embeddings(&db, &provider, None).unwrap();
-        assert_eq!(stats2.embedded, 0);
-        assert_eq!(stats2.batches, 0);
-
-        let missing = db.symbols_missing_embeddings().unwrap();
-        assert!(missing.is_empty());
-        let _ = id;
-    }
-
-    #[test]
-    fn only_symbol_ids_scopes_the_backfill() {
-        let db = Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-        let file_id = db.insert_file("a.ts", "h").unwrap();
-        let keep_unembedded = db
-            .insert_symbol(
-                file_id,
-                &graph::SymbolNode {
-                    name: "untouched".to_string(),
-                    kind: "function".to_string(),
-                    start_line: 1,
-                    end_line: 1,
-                    start_byte: 0,
-                    end_byte: 0,
-                    signature: None,
-                    attributes: Vec::new(),
-                    metadata: None,
-                },
-            )
-            .unwrap();
-        let touched = db
-            .insert_symbol(
-                file_id,
-                &graph::SymbolNode {
-                    name: "touched".to_string(),
-                    kind: "function".to_string(),
-                    start_line: 2,
-                    end_line: 2,
-                    start_byte: 0,
-                    end_byte: 0,
-                    signature: None,
-                    attributes: Vec::new(),
-                    metadata: None,
-                },
-            )
-            .unwrap();
-
-        let provider = MockProvider;
-        let stats = backfill_missing_embeddings(&db, &provider, Some(&[touched])).unwrap();
-        assert_eq!(stats.embedded, 1);
-
-        let missing = db.symbols_missing_embeddings().unwrap();
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].0, keep_unembedded);
+    match Database::new(old_db_path) {
+        Ok(old_db) => old_db
+            .embeddings_by_body_hash(model_id)
+            .map(|rows| rows.into_iter().collect())
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
     }
 }

@@ -1,26 +1,40 @@
-import React from 'react';
-import { Card, StatCard } from '../ui';
-import { Cpu, Zap, Activity, Coins, Percent } from 'lucide-react';
-import { Area, AreaChart, Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis, Cell } from 'recharts';
-
-const savingsData = [
-  { name: 'Mon', saved: 12000, used: 25000 },
-  { name: 'Tue', saved: 15000, used: 22000 },
-  { name: 'Wed', saved: 25000, used: 18000 },
-  { name: 'Thu', saved: 18000, used: 30000 },
-  { name: 'Fri', saved: 32000, used: 20000 },
-  { name: 'Sat', saved: 45000, used: 15000 },
-  { name: 'Sun', saved: 38000, used: 12000 },
-];
-
-const contextEfficiencyData = [
-  { name: 'Week 1', ratio: 65 },
-  { name: 'Week 2', ratio: 72 },
-  { name: 'Week 3', ratio: 78 },
-  { name: 'Week 4', ratio: 85 },
-];
+import React, { useState, useEffect, useCallback } from 'react';
+import { StatCard } from '../ui';
+import { Activity, Coins, Percent, Zap } from 'lucide-react';
+import { api, RepositoryOverview } from '../../providers/api';
+import { useLiveEvents } from '../../hooks/useLiveEvents';
 
 export function Tokens() {
+  const [data, setData] = useState<RepositoryOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const loadData = useCallback(() => {
+    api.getOverview().then((overview) => {
+      setData(overview);
+      setLoading(false);
+    });
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  useLiveEvents((type) => {
+    if (type === 'mcp_activity' || type === 'index_update') {
+      loadData();
+    }
+  });
+
+  if (loading || !data) {
+    return <div className="text-[#71717a] flex items-center justify-center h-full">Loading insights...</div>;
+  }
+
+  const formatNumber = (num: number) => {
+    if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
+    return num.toString();
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in duration-500">
       <div className="flex justify-between items-center">
@@ -28,54 +42,10 @@ export function Tokens() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard label="Tokens Avoided" value="8.91M" icon={<Zap />} trend="18.3%" trendUp={true} />
-        <StatCard label="OpenAI Cost Saved" value="$26.73" icon={<Coins />} trend="15.7%" trendUp={true} />
-        <StatCard label="Context Reduction" value="85.2%" icon={<Percent />} trend="5.1%" trendUp={true} />
-        <StatCard label="Graph Efficiency" value="94.1%" icon={<Activity />} trend="1.2%" trendUp={true} />
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Card>
-          <h3 className="text-lg font-medium mb-6">Weekly Savings Trend</h3>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={savingsData}>
-                <XAxis dataKey="name" stroke="#71717a" fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis stroke="#71717a" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(v) => `${v/1000}k`} />
-                <Tooltip 
-                  cursor={{ fill: '#1f1f22' }}
-                  contentStyle={{ backgroundColor: '#111113', borderColor: '#1f1f22', borderRadius: '8px' }}
-                  itemStyle={{ color: '#fafafa' }}
-                />
-                <Bar dataKey="used" fill="#71717a" radius={[4, 4, 0, 0]} name="Tokens Used" stackId="a" />
-                <Bar dataKey="saved" fill="#ff6b35" radius={[4, 4, 0, 0]} name="Tokens Saved" stackId="a" />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
-
-        <Card>
-          <h3 className="text-lg font-medium mb-6">Context Compression Ratio</h3>
-          <div className="h-[300px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={contextEfficiencyData}>
-                <defs>
-                  <linearGradient id="colorRatio" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#22c55e" stopOpacity={0.3}/>
-                    <stop offset="95%" stopColor="#22c55e" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="name" stroke="#71717a" fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis stroke="#71717a" fontSize={12} tickLine={false} axisLine={false} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#111113', borderColor: '#1f1f22', borderRadius: '8px' }}
-                  itemStyle={{ color: '#fafafa' }}
-                />
-                <Area type="monotone" dataKey="ratio" stroke="#22c55e" strokeWidth={2} fillOpacity={1} fill="url(#colorRatio)" name="Compression Ratio" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </Card>
+        <StatCard label="Tokens Avoided" value={formatNumber(data.tokensSaved)} icon={<Zap />} />
+        <StatCard label="OpenAI Cost Saved" value={`$${(data.estCostSavedCents / 100).toFixed(2)}`} icon={<Coins />} />
+        <StatCard label="Context Reduction" value={`${data.contextCompressionPercent.toFixed(1)}%`} icon={<Percent />} />
+        <StatCard label="Graph Efficiency" value={`${data.relationshipResolutionPercent.toFixed(1)}%`} icon={<Activity />} />
       </div>
     </div>
   );

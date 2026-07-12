@@ -226,6 +226,10 @@ fn extract_ts_symbols(
                 if !is_exported {
                     continue;
                 }
+                let val_kind = decl_node.map(|n| n.kind()).unwrap_or("");
+                if val_kind == "arrow_function" || val_kind == "call_expression" {
+                    continue;
+                }
                 kind = "constant".to_string();
             }
 

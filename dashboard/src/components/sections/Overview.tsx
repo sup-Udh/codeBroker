@@ -5,16 +5,6 @@ import { api, RepositoryOverview, SystemHealth } from '../../providers/api';
 import { Card, StatCard, Badge } from '../ui';
 import { useLiveEvents } from '../../hooks/useLiveEvents';
 
-const dummyTokenData = [
-  { time: '00:00', used: 1000, saved: 500 },
-  { time: '04:00', used: 2000, saved: 1200 },
-  { time: '08:00', used: 1500, saved: 2500 },
-  { time: '12:00', used: 3000, saved: 4000 },
-  { time: '16:00', used: 2800, saved: 3800 },
-  { time: '20:00', used: 4000, saved: 6000 },
-  { time: '24:00', used: 3500, saved: 5800 },
-];
-
 export function Overview() {
   const [data, setData] = useState<RepositoryOverview | null>(null);
   const [health, setHealth] = useState<SystemHealth | null>(null);
@@ -63,11 +53,9 @@ export function Overview() {
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard label="Tokens Used" value={formatNumber(850000)} icon={<Cpu />} trend="12.5%" trendUp={false} />
-        <StatCard label="Tokens Saved" value={formatNumber(data.tokensSaved)} icon={<Zap />} trend="18.3%" trendUp={true} />
-        <StatCard label="Est. Cost Saved" value={`$${(data.estCostSavedCents / 100).toFixed(2)}`} icon={<CoinsIcon />} trend="15.7%" trendUp={true} />
-        <StatCard label="Success Rate" value="98.6%" icon={<Activity />} trend="2.1%" trendUp={true} />
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <StatCard label="Tokens Used" value={formatNumber(data.tokensUsed)} icon={<Cpu />} />
+        <StatCard label="Est. Cost Saved" value={`$${(data.estCostSavedCents / 100).toFixed(2)}`} icon={<CoinsIcon />} />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -75,7 +63,7 @@ export function Overview() {
           <h3 className="text-lg font-medium mb-6">Token Usage Over Time</h3>
           <div className="h-[300px]">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={dummyTokenData}>
+              <AreaChart data={data.tokenUsageGraph}>
                 <defs>
                   <linearGradient id="colorUsed" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#71717a" stopOpacity={0.3}/>

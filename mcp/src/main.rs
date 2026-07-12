@@ -88,7 +88,7 @@ fn resolve_db_path() -> String {
 
 /// Reads the path-disambiguation hint for a symbol lookup. Accepts both
 /// `file_path` (this tool's documented param name) and `path_scope` (the name
-/// every scoping param uses on search_codebase/find_symbol/impact_analysis/
+/// every scoping param uses on search_codebase/find_symbol/get_context/
 /// architectural_hotspots/dependency_cycles/find_duplicate_logic) so a caller
 /// that reasonably guesses the wrong one based on the rest of the tool
 /// surface still gets it applied, instead of the hint being silently dropped
@@ -100,18 +100,8 @@ fn get_file_hint<'a>(arguments: &'a serde_json::Map<String, serde_json::Value>) 
         .and_then(|s| s.as_str())
 }
 
-/// Decides whether impact_analysis should take the cheap, deterministic path
+/// Decides whether get_context should take the cheap, deterministic path
 /// (no LLM): true when the symbol's total dependency count is below the
-/// threshold, OR when no model is available at all. Kept as a standalone fn so
-/// the cheap/LLM boundary is unit-testable without the full MCP request loop.
-fn use_cheap_impact_path(
-    total_dependencies: usize,
-    risk_threshold: usize,
-    has_openai_key: bool,
-) -> bool {
-    total_dependencies < risk_threshold || !has_openai_key
-}
-
 /// find_symbol_candidates/search_symbols resolve paths to absolute (via
 /// db.resolve_path) before returning, but read_symbol_source_scoped's
 /// file_hint is matched against the RAW relative path stored in the `files`
@@ -138,31 +128,6 @@ fn normalized_path_scope(db: &storage::Database, raw: Option<&str>) -> Option<St
     raw.map(|s| resolver::CanonicalNameResolver::normalize_path(db, s))
 }
 
-/// Computes semantic expansion tokens and a query embedding vector for a
-/// given query string. Returns `(tokens, vector, llm_used)`.
-///
-/// Centralizes the four-times-repeated pattern of:
-///   getenv OPENAI_API_KEY → embed query → expand_query → (tokens, vector)
-/// so that `search_codebase`, `subsystem_stats`, and `prepare_context`
-/// all call one function instead of each inlining the same OpenAI round-trips.
-fn prepare_semantic_context(query: &str) -> (Vec<String>, Option<Vec<f32>>, bool) {
-    let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
-    if openai_key.is_empty() {
-        return (vec![], None, false);
-    }
-    use semantic::provider::LlmProvider;
-    let provider = semantic::openai::OpenAiProvider::new(openai_key);
-    let query_vector = provider
-        .embed_texts(&[query.to_string()])
-        .ok()
-        .and_then(|mut v| v.pop());
-    let (tokens, _) = provider.expand_query(query, 5).unwrap_or_else(|e| {
-        eprintln!("Semantic expansion failed/skipped: {}", e);
-        (vec![], 0)
-    });
-    (tokens, query_vector, true)
-}
-
 fn add_response_size_hint(value: &mut serde_json::Value) {
     let char_count = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
     let approx_tokens = analytics::accounting::TokenAccounting::estimate_tokens(char_count);
@@ -177,37 +142,10 @@ fn add_response_size_hint(value: &mut serde_json::Value) {
     }
 }
 
-#[cfg(test)]
-mod impact_analysis_tests {
-    use super::*;
-
-    // #2 — small symbols take the cheap (no-LLM) path; large ones use the LLM.
-    #[test]
-    fn cheap_path_below_threshold() {
-        // 2 total deps, threshold 5, model available -> cheap path.
-        assert!(use_cheap_impact_path(2, 5, true));
-    }
-
-    #[test]
-    fn llm_path_at_or_above_threshold() {
-        // 5 total deps, threshold 5, model available -> LLM path.
-        assert!(!use_cheap_impact_path(5, 5, true));
-        assert!(!use_cheap_impact_path(9, 5, true));
-    }
-
-    #[test]
-    fn cheap_path_when_no_model_even_if_large() {
-        // No OpenAI key -> always deterministic, regardless of size.
-        assert!(use_cheap_impact_path(50, 5, false));
-    }
-
-    #[test]
-    fn threshold_is_configurable() {
-        // Raising the threshold keeps a mid-size symbol on the cheap path.
-        assert!(use_cheap_impact_path(9, 20, true));
-        // Lowering it (to 0) forces the LLM path for any symbol.
-        assert!(!use_cheap_impact_path(1, 0, true));
-    }
+fn to_string_with_hint<T: serde::Serialize>(val: &T) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(val)?;
+    add_response_size_hint(&mut value);
+    serde_json::to_string_pretty(&value)
 }
 
 #[cfg(test)]
@@ -290,7 +228,7 @@ fn resolve_symbol_for_tool(
     file_hint: Option<&str>,
     line_hint: Option<i64>,
 ) -> Result<resolver::ResolvedSymbol, String> {
-    match resolver::resolve_symbol(db, symbol, file_hint, None, line_hint) {
+    match resolver::resolve_symbol(db, symbol, file_hint, line_hint) {
         resolver::ResolvedEntity::Symbol(s) => Ok(s),
         other => Err(other.to_json_string()),
     }
@@ -570,6 +508,7 @@ Preferred tools:
 
 * project_overview
 * subsystem_stats
+* subsystem_communication (Note: this only works with an exact leaf path from its own known_subsystems list. It is brittle and will return not_found for partial paths like "app/api" if they are not exact known leaves. Verify exact subsystem names first.)
 
 * architectural_hotspots
 * get_context
@@ -592,7 +531,7 @@ Use CodeBroker.
 Preferred tools:
 
 * get_context
-* impact_analysis
+* get_context
 * explore_graph
 * shortest_path
 * dependency_cycles
@@ -696,14 +635,6 @@ Treat native tools as the repository's implementation layer."#;
                                 "tools": [
 
                                     {
-                                        "name": "get_workspace",
-                                        "description": "Returns the active CodeBroker workspace, including project root, database path, and indexing status.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {}
-                                        }
-                                    },
-                                    {
                                         "name": "set_workspace",
                                         "description": "Switches the active workspace. Automatically initializes and indexes the target workspace if required.",
                                         "inputSchema": {
@@ -722,16 +653,6 @@ Treat native tools as the repository's implementation layer."#;
                                             "properties": {
                                                 "absolute_path": { "type": "string", "description": "Optional. Absolute path to re-index. Defaults to the currently active workspace." },
                                                 "changed_paths": { "type": "array", "items": { "type": "string" }, "description": "Optional. Specific file paths (absolute or relative to the workspace root) to incrementally re-parse instead of doing a full rebuild." }
-                                            }
-                                        }
-                                    },
-                                    {
-                                        "name": "list_entrypoints",
-                                        "description": "Repo-wide enumeration of every entrypoint (API routes/endpoints and Next.js page/layout files) with no subsystem name required. Use this for 'what are this repo's entrypoints' questions instead of guessing subsystem names to feed into subsystem_stats.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "path_scope": { "type": "string", "description": "Optional substring to restrict results to files whose path contains it." }
                                             }
                                         }
                                     },
@@ -781,38 +702,24 @@ Treat native tools as the repository's implementation layer."#;
                                                 "include_source": { "type": "boolean", "description": "Default false. Include the symbol's own source body in the response." },
                                                 "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." }
                                             },
-                                            "required": ["symbol"]
-                                        }
-                                    },
-                                    {
-                                        "name": "impact_analysis",
-                                        "description": "Estimates the blast radius of changing a symbol. Returns dependency relationships and risk information, with optional AI-generated analysis for larger dependency graphs.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "symbol": { "type": "string", "description": "Symbol name to analyze." },
-                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." },
-                                                "line": { "type": "number", "description": "Optional 1-based line number. When a file contains multiple definitions with the same name, picks the definition whose start_line is closest to (and not after) this line." },
-                                                "format": { "type": "string", "enum": ["prose", "structured", "json"], "description": "Default \"prose\". \"structured\"/\"json\" always return the deterministic graph data, skipping the LLM." },
-                                                "risk_threshold": { "type": "number", "description": "Default 5. Total dependency count below which the cheap deterministic path is used instead of an LLM call." }
-                                            },
-                                            "required": ["symbol"]
                                         }
                                     },
                                     {
                                         "name": "search_codebase",
-                                        "description": "Deterministic keyword search across symbols, file paths, and optionally file contents. Supports exact, substring, and light stemming matches. When the keyword/token match is empty or all-Low-confidence, automatically falls back to embedding-based semantic search over symbols embedded at index time (requires OPENAI_API_KEY to have been set when the workspace was indexed/reindexed) — results from that fallback are labeled \"Semantic Match\" in the confidence field.",
+                                        "description": "Keyword search across symbols, file paths, and optionally file contents (exact, substring, and light stemming matches), plus embedding-based semantic retrieval for conceptual queries. Mode \"both\" fuses keyword and semantic rankings; if embeddings are unavailable it degrades to keyword results and reports semantic_degraded_reason.",
                                         "inputSchema": {
                                             "type": "object",
                                             "properties": {
-                                                "keyword": { "type": "string", "description": "Search term, symbol name fragment, or natural-language phrase." },
+                                                "query": { "type": "string", "description": "Search term, symbol name fragment, or natural-language phrase. (Previously 'keyword')" },
+                                                "keyword": { "type": "string", "description": "Legacy alias for 'query'." },
                                                 "path_scope": { "type": "string", "description": "Optional substring to restrict results to files whose path contains it." },
-                                                "mode": { "type": "string", "enum": ["symbol", "text", "both"], "description": "Default \"symbol\". \"text\" greps indexed file content; \"both\" tries symbol names first and falls back to text." },
+                                                "mode": { "type": "string", "enum": ["symbol", "text", "both", "semantic"], "description": "Default \"symbol\". \"text\" greps indexed file content; \"both\" fuses symbol+text keyword matching with semantic retrieval; \"semantic\" is embedding-only retrieval for conceptual queries." },
                                                 "whole_word": { "type": "boolean", "description": "Default false. Require a whole-word match rather than substring, for text/both modes." },
-                                                "min_confidence": { "type": "string", "description": "Optional minimum confidence tier (\"Low\"/\"Medium\"/\"High\") to filter results by." },
-                                                "include_source": { "type": "boolean", "description": "Default false. If true, fetches and embeds the source code for the top 1-2 matches." }
+                                                "include_source": { "type": "boolean", "description": "Default false. If true, fetches and embeds the source code for the top 1-2 matches." },
+                                                "limit": { "type": "number", "description": "Default 15. Maximum number of search results to return." },
+                                                "include_concepts": { "type": "boolean", "description": "Default false. If true, includes matches from domain concepts (e.g. 'auth' returning createClient)." }
                                             },
-                                            "required": ["keyword"]
+                                            "required": ["query"]
                                         }
                                     },
 
@@ -835,6 +742,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 "symbol": { "type": "string", "description": "Single symbol name to read." },
                                                 "symbols": { "type": "array", "items": { "type": "string" }, "description": "Batch form: multiple symbol names to read in one call." },
                                                 "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." },
+                                                "line": { "type": "number", "description": "Optional 1-based line number. When a file contains multiple definitions with the same name, picks the definition whose start_line is closest to (and not after) this line." },
                                                 "include_dependencies": { "type": "boolean", "description": "Default false. Also include source for immediate forward dependencies." }
                                             }
                                         }
@@ -882,32 +790,6 @@ Treat native tools as the repository's implementation layer."#;
                                         }
                                     },
                                     {
-                                        "name": "find_duplicate_logic",
-                                        "description": "Detects exact and near-duplicate code across symbols. Useful for identifying copy-pasted logic and refactoring opportunities.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "min_length": { "type": "number", "description": "Default 15. Minimum AST node count a symbol's body must have to be considered — not character length. Low enough to catch small copy-pasted functions, high enough to skip trivial one-liners." },
-                                                "path_scope": { "type": "string", "description": "Optional substring to restrict the scan to files whose path contains it." }
-                                            }
-                                        }
-                                    },
-                                    {
-                                        "name": "graph_subtree",
-                                        "description": "Returns the downstream dependency subtree rooted at a symbol. Use when you need the full dependency hierarchy rather than a local graph neighborhood.",
-                                        "inputSchema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "root_symbol": { "type": "string", "description": "Root symbol name." },
-                                                "depth": { "type": "number", "description": "Default 3, capped at 5. How many hops to traverse outward. Start at 1-2 for a hub symbol (e.g. a widely-imported helper) to avoid truncation." },
-                                                "max_nodes": { "type": "number", "description": "Default 100, capped at 500. Caps the returned node count (edges are capped at 3x this)." },
-                                                "format": { "type": "string", "enum": ["json", "markdown"], "description": "Default \"json\". Set to \"markdown\" to return a condensed, token-light bulleted list instead of raw JSON." },
-                                                "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous root symbol name (when the same name is defined in multiple files)." }
-                                            },
-                                            "required": ["root_symbol"]
-                                        }
-                                    },
-                                    {
                                         "name": "read_file_snippet",
                                         "description": "Reads a raw line range directly from a file. Useful when exact file locations are already known.",
                                         "inputSchema": {
@@ -931,6 +813,18 @@ Treat native tools as the repository's implementation layer."#;
                                                 "file_path": { "type": "string", "description": "Optional substring of the file path to disambiguate an ambiguous symbol name." }
                                             },
                                             "required": ["symbol"]
+                                        }
+                                    },
+                                    {
+                                        "name": "find_duplicate_logic",
+                                        "description": "Detects exact and near-duplicate code across symbols. Useful for identifying copy-pasted logic and refactoring opportunities.",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "min_length": { "type": "number", "description": "Default 15. Minimum AST node count a symbol's body must have to be considered — not character length. Low enough to catch small copy-pasted functions, high enough to skip trivial one-liners." },
+                                                "path_scope": { "type": "string", "description": "Optional substring to restrict the scan to files whose path contains it." },
+                                                "limit": { "type": "number", "description": "Optional limit to the number of duplicate groups returned." }
+                                            }
                                         }
                                     }
                                 ]
@@ -959,6 +853,17 @@ Treat native tools as the repository's implementation layer."#;
                         let mut cache_hit = false;
                         let start_time = std::time::Instant::now();
                         let model_used = "Claude Desktop";
+
+                        if tool_name != "set_workspace" && tool_name != "reindex_workspace" {
+                            if let Ok(db) = storage::Database::new(&db_path) {
+                                if let Ok(stale_paths) = db.get_stale_files(2000) {
+                                    if !stale_paths.is_empty() {
+                                        eprintln!("Auto-reindexing {} stale file(s) before running {}", stale_paths.len(), tool_name);
+                                        let _ = run_incremental_index(&db.project_root, &stale_paths);
+                                    }
+                                }
+                            }
+                        }
 
                         let tool_result = match std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
@@ -1013,7 +918,7 @@ Treat native tools as the repository's implementation layer."#;
                                                                 obj.insert("source".to_string(), serde_json::to_value(&source).unwrap_or_default());
                                                             }
                                                         }
-                                                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing context JSON".to_string())
+                                                        to_string_with_hint(&value).unwrap_or_else(|_| "Error serializing context JSON".to_string())
                                                     }
                                                 }
                                                 Ok(None) => format!("Symbol '{}' not found in database.", symbol),
@@ -1025,144 +930,37 @@ Treat native tools as the repository's implementation layer."#;
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
-                            "impact_analysis" => {
-                                let symbol = arguments.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let file_hint = get_file_hint(&arguments);
-                                // "structured" always skips the LLM and returns the full get_context
-                                // graph JSON. Default ("prose") now also has a cheap path: for a
-                                // low-fan-in/out symbol (total dependencies below `risk_threshold`)
-                                // the LLM adds little over the deterministic graph, so we return a
-                                // compact {risk_level, callers, callees, reason} instead — instant
-                                // and zero model cost. Larger symbols still get the LLM narrative.
-                                let format = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("prose");
-                                let risk_threshold = arguments.get("risk_threshold").and_then(|n| n.as_u64()).unwrap_or(5) as usize;
-                                let line_hint = arguments.get("line").and_then(|n| n.as_i64());
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        match resolve_symbol_for_tool(&db, symbol, file_hint, line_hint) {
-                                        Err(resp) => resp,
-                                        Ok(resolved) => {
-                                            let symbol_id = resolved.id;
-                                            let symbol = resolved.name.as_str();
-                                            let file_hint = Some(relative_hint(&db, &resolved.file_path));
-                                            // Self-heals a stale defining file instead of just
-                                            // warning: `get_edit_context` already refuses/self-heals
-                                            // on stale boundaries, and serving a
-                                            // "LOW risk, 2 dependencies" cheap-path verdict built on
-                                            // stale byte offsets is actively misleading even with a
-                                            // warning attached if the caller doesn't act on it. If
-                                            // the incremental reindex itself fails, falls back to
-                                            // the stale context with a loud warning rather than
-                                            // erroring outright.
-                                            let context = semantic::staleness::assemble_context_self_healing_by_id(&db, Some(symbol_id), symbol, file_hint, query::response::ResponseProfile::Verbose).unwrap_or(None);
-                                            let still_stale = context.as_ref().map(|c| c.stale).unwrap_or(false);
-                                            let stale_warning = still_stale.then(|| format!(
-                                                "WARNING: '{}' has been modified on disk since it was indexed, and the automatic incremental reindex failed. The dependency data below may be computed against stale symbol boundaries. Run reindex_workspace before trusting this analysis.\n\n",
-                                                symbol
-                                            ));
-                                            if context.is_none() {
-                                                // `resolve_symbol_for_tool` just confirmed this exact id
-                                                // resolves — if context assembly then can't find a
-                                                // matching row, that's a graph inconsistency (e.g. a
-                                                // stale/just-deleted symbol), not a legitimate "zero
-                                                // dependencies" answer. Silently falling through to the
-                                                // cheap path below would report a confident-looking
-                                                // "risk_level: LOW, total_dependencies: 0" that's actively
-                                                // wrong rather than surfacing the real problem.
-                                                serde_json::json!({
-                                                    "symbol": symbol,
-                                                    "error": "graph_inconsistent",
-                                                    "semantic_node_resolved": true,
-                                                    "context_available": false,
-                                                    "reason": format!(
-                                                        "'{}' resolved to a valid symbol (id {}), but context assembly could not find a matching row afterward. This is a graph inconsistency, not a 'this symbol has no dependencies' answer — re-run reindex_workspace and retry.",
-                                                        symbol, symbol_id
-                                                    ),
-                                                }).to_string()
-                                            } else if format == "structured" || format == "json" {
-                                                let mut out = context.as_ref().map(|c| serde_json::to_string_pretty(&c.build_json().unwrap_or(serde_json::json!({}))).unwrap_or_default()).unwrap_or_default();
-                                                if let Some(w) = &stale_warning {
-                                                    out = format!("{}{}", w, out);
-                                                }
-                                                out
-                                            } else {
-                                                let fwd = context.as_ref().map(|c| c.fetch_forward_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
-                                                let rev = context.as_ref().map(|c| c.fetch_reverse_dependencies().map(|v| v.len()).unwrap_or(0)).unwrap_or(0);
-                                                let total_dependencies = fwd + rev;
-                                                let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
-
-                                                // Cheap path: below threshold (or no model available) ->
-                                                // deterministic graph-derived output, no LLM call.
-                                                if use_cheap_impact_path(total_dependencies, risk_threshold, !openai_key.is_empty()) {
-                                                    let mut reason = if total_dependencies < risk_threshold {
-                                                        format!("Dependency count ({}) below threshold ({}); returned deterministic graph data instead of an LLM analysis. Raise risk_threshold or use format:\"structured\" for the full graph.", total_dependencies, risk_threshold)
-                                                    } else {
-                                                        "OPENAI_API_KEY not set; returned deterministic graph data instead of an LLM analysis.".to_string()
-                                                    };
-                                                    if still_stale {
-                                                        reason = format!("STALE DATA WARNING: this symbol's file has changed on disk since indexing, and the automatic incremental reindex failed; the dependency counts below may be wrong. Reindex before trusting this. {}", reason);
-                                                    }
-                                                    let payload = serde_json::json!({
-                                                        "symbol": symbol,
-                                                        "stale": still_stale,
-                                                        "risk_level": "LOW",
-                                                        "total_dependencies": total_dependencies,
-                                                        "threshold": risk_threshold,
-                                                        "callers": context.as_ref().map(|c| c.fetch_callers().unwrap_or_default()).unwrap_or_default(),
-                                                        "callees": context.as_ref().map(|c| c.fetch_callees().unwrap_or_default()).unwrap_or_default(),
-                                                        "forward_dependencies": context.as_ref().map(|c| c.fetch_forward_dependencies().unwrap_or_default()).unwrap_or_default(),
-                                                        "reverse_dependencies": context.as_ref().map(|c| c.fetch_reverse_dependencies().unwrap_or_default()).unwrap_or_default(),
-                                                        "llm_used": false,
-                                                        "reason": reason,
-                                                    });
-                                                    serde_json::to_string_pretty(&payload).unwrap_or_default()
-                                                } else {
-                                                    // Complex symbol: existing LLM workflow.
-                                                    estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
-                                                    let provider = Box::new(semantic::openai::OpenAiProvider::new(openai_key));
-                                                    let generator = semantic::generator::SummaryGenerator::new(&db, provider);
-                                                    match generator.generate_by_id(symbol_id, symbol) {
-                                                        Ok((summary, hit)) => {
-                                                            cache_hit = hit;
-                                                            match &stale_warning {
-                                                                Some(w) => format!("{}{}", w, summary),
-                                                                None => summary,
-                                                            }
-                                                        },
-                                                        Err(e) => format!("Error generating impact analysis: {}", e),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
                             "search_codebase" => {
-                                let keyword = arguments.get("keyword").and_then(|s| s.as_str()).unwrap_or("");
+                                let keyword = arguments.get("query").or_else(|| arguments.get("keyword")).and_then(|s| s.as_str()).unwrap_or("");
                                 let path_scope = arguments.get("path_scope").and_then(|s| s.as_str());
                                 let mode_str = arguments.get("mode").and_then(|s| s.as_str()).unwrap_or("symbol");
                                 let mode = query::engine::SearchMode::from(mode_str);
                                 let whole_word = arguments.get("whole_word").and_then(|b| b.as_bool()).unwrap_or(false);
-                                let min_confidence = arguments.get("min_confidence").and_then(|s| s.as_str());
                                 let _include_source = arguments.get("include_source").and_then(|b| b.as_bool()).unwrap_or(false);
-
-                                let (semantic_tokens, query_vector_opt, llm_used) = prepare_semantic_context(keyword);
+                                let limit = arguments.get("limit").and_then(|n| n.as_u64()).unwrap_or(15) as usize;
+                                let include_concepts = arguments.get("include_concepts").and_then(|b| b.as_bool()).unwrap_or(false);
 
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_search_context(&db);
-                                        let (results, reason) = resolver::resolve_search(
-                                            &db, keyword, &semantic_tokens, query_vector_opt.as_deref(),
-                                            llm_used, path_scope, mode, whole_word, min_confidence,
+                                        let outcome = semantic::search::resolve_search_semantic(
+                                            &db, keyword, path_scope, mode, whole_word, limit, include_concepts
                                         );
                                         let mut payload = serde_json::json!({
                                             "workspace_root": db.project_root,
-                                            "results": results
+                                            "total_occurrences": outcome.total_occurrences,
+                                            "files_matched": outcome.files_matched,
+                                            "truncated": outcome.truncated,
+                                            "results": outcome.results
                                         });
-                                        if let Some(r) = reason {
+                                        if let Some(r) = outcome.reason {
                                             payload["reason"] = serde_json::Value::String(r);
+                                        }
+                                        if let Some(available) = outcome.semantic_search_available {
+                                            payload["semantic_search_available"] = serde_json::Value::Bool(available);
+                                        }
+                                        if let Some(why) = outcome.semantic_degraded_reason {
+                                            payload["semantic_degraded_reason"] = serde_json::Value::String(why);
                                         }
                                         add_response_size_hint(&mut payload);
                                         serde_json::to_string_pretty(&payload).unwrap_or_default()
@@ -1180,11 +978,11 @@ Treat native tools as the repository's implementation layer."#;
                                         estimated_raw_context_tokens = analytics::accounting::TokenAccounting::estimate_graph_context(&db);
                                         match query::engine::build_project_overview_scoped(&db, path_scope) {
                                             Ok(overview) => {
-                                                let embedded_symbols: i64 = db.conn.query_row(
-                                                    "SELECT COUNT(*) FROM symbol_embeddings",
-                                                    [],
-                                                    |r| r.get(0),
-                                                ).unwrap_or(0);
+                                                // Real state, not a hardcoded flag: rows stored for
+                                                // the ACTIVE model only — vectors left behind by a
+                                                // previous model don't count as available.
+                                                let embedding_model = semantic::config::EmbeddingsConfig::load(&db.project_root).model_id();
+                                                let embedded_symbols = db.count_symbol_embeddings(&embedding_model).unwrap_or(0);
                                                 let entrypoints = query::subsystem::list_entrypoints(&db, path_scope).ok();
                                                 let stats = serde_json::json!({
                                                     "path_scope": path_scope,
@@ -1192,11 +990,12 @@ Treat native tools as the repository's implementation layer."#;
                                                     "symbols": overview.symbols,
                                                     "edges": overview.edges,
                                                     "languages": overview.languages,
+                                                    "embedding_model": embedding_model,
                                                     "embedded_symbols": embedded_symbols,
                                                     "semantic_search_available": embedded_symbols > 0,
                                                     "entrypoints": entrypoints,
                                                 });
-                                                serde_json::to_string_pretty(&stats).unwrap_or_default()
+                                                to_string_with_hint(&stats).unwrap_or_default()
                                             }
                                             Err(e) => format!("Error fetching stats: {}", e),
                                         }
@@ -1207,6 +1006,7 @@ Treat native tools as the repository's implementation layer."#;
                             "read_symbol_source" => {
                                 let include_deps = arguments.get("include_dependencies").and_then(|s| s.as_bool()).unwrap_or(false);
                                 let file_hint = get_file_hint(&arguments);
+                                let line_hint = arguments.get("line").and_then(|n| n.as_i64());
 
                                 let mut targets = Vec::new();
                                 if let Some(s) = arguments.get("symbol").and_then(|s| s.as_str()) {
@@ -1232,6 +1032,7 @@ Treat native tools as the repository's implementation layer."#;
                                                     &db,
                                                     symbol,
                                                     file_hint,
+                                                    line_hint,
                                                     include_deps,
                                                 );
                                                 // If it's a JSON array (from our tool), accumulate it. Otherwise, it's an error.
@@ -1244,29 +1045,11 @@ Treat native tools as the repository's implementation layer."#;
                                                     }
                                                 }
                                             }
-                                            serde_json::to_string_pretty(&combined_results).unwrap_or_default()
+                                            to_string_with_hint(&combined_results).unwrap_or_default()
                                         }
                                         Err(_) => "Error connecting to db".to_string(),
                                     }
                                 }
-                            }
-                            "get_workspace" => {
-                                let resolved = resolve_workspace();
-                                let (stale_files, files_checked) = if resolved.exists {
-                                    storage::Database::new(&resolved.db_path)
-                                        .ok()
-                                        .and_then(|db| db.count_stale_files(2000).ok())
-                                        .unwrap_or((0, 0))
-                                } else {
-                                    (0, 0)
-                                };
-                                serde_json::json!({
-                                    "project_root": resolved.project_root,
-                                    "db_path": resolved.db_path,
-                                    "indexed": resolved.exists,
-                                    "stale_files": stale_files,
-                                    "stale_files_scan_limit": files_checked,
-                                }).to_string()
                             }
                             "set_workspace" => {
                                 let path = arguments.get("absolute_path").and_then(|s| s.as_str()).unwrap_or("");
@@ -1290,7 +1073,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 let staleness_note = match storage::Database::new(&new_db_path) {
                                                     Ok(db) => match db.count_stale_files(2000) {
                                                         Ok((stale, _checked)) if stale > 0 => format!(
-                                                            " Warning: {} indexed file(s) have changed on disk since the last index — call reindex_workspace before relying on line numbers, get_edit_context, or impact_analysis.",
+                                                            " Warning: {} indexed file(s) have changed on disk since the last index — call reindex_workspace before relying on line numbers, get_edit_context, or get_context.",
                                                             stale
                                                         ),
                                                         _ => String::new(),
@@ -1403,7 +1186,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 } else {
                                                     let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
                                                     let profile = query::response::ResponseProfile::from(profile_str);
-                                                    serde_json::to_string_pretty(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph".to_string())
+                                                    to_string_with_hint(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph".to_string())
                                                 }
                                             },
                                             Err(e) => format!("Error exploring graph: {}", e),
@@ -1438,7 +1221,7 @@ Treat native tools as the repository's implementation layer."#;
                                             match query::graph::shortest_path(&db, &from_resolved.name, &to_resolved.name, Some(from_hint), Some(to_hint), Some(from_resolved.id), Some(to_resolved.id)) {
                                                 Ok(res) => {
                                                     estimated_raw_context_tokens = res.nodes.len() * 50; // rough estimation
-                                                    serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing path".to_string())
+                                                    to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing path".to_string())
                                                 },
                                                 Err(e) => format!("Error finding shortest path: {}", e),
                                             }
@@ -1450,53 +1233,14 @@ Treat native tools as the repository's implementation layer."#;
                                     Err(_) => "Error connecting to db".to_string(),
                                 }
                             }
-                            "list_entrypoints" => {
-                                let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        let path_scope = normalized_path_scope(&db, path_scope_raw);
-                                        let path_scope = path_scope.as_deref();
-                                        match query::subsystem::list_entrypoints(&db, path_scope) {
-                                            Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing entrypoints".to_string()),
-                                            Err(e) => format!("Error listing entrypoints: {}", e),
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
                             "subsystem_communication" => {
                                 let subsystem_a = arguments.get("subsystem_a").and_then(|s| s.as_str()).unwrap_or("");
                                 let subsystem_b = arguments.get("subsystem_b").and_then(|s| s.as_str()).unwrap_or("");
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
-                                        // Gate both names on the resolver first: a name that
-                                        // can't be confidently discovered as a subsystem at all
-                                        // must say so, instead of silently producing a "0 edges
-                                        // in both directions" answer that reads the same as "they
-                                        // genuinely don't communicate".
-                                        let a_resolved = resolver::resolve_subsystem(&db, subsystem_a, &[], None);
-                                        let b_resolved = resolver::resolve_subsystem(&db, subsystem_b, &[], None);
-                                        if a_resolved.is_not_found() {
-                                            a_resolved.to_json_string()
-                                        } else if b_resolved.is_not_found() {
-                                            b_resolved.to_json_string()
-                                        } else {
-                                            // Reuse the files each side already resolved instead of
-                                            // handing subsystem_communication the raw input strings
-                                            // to re-derive independently — a name resolved via a
-                                            // canonicalized alias (e.g. "authentication" -> "auth")
-                                            // must not silently re-resolve differently (or fail) a
-                                            // second time on the un-canonicalized input.
-                                            match (&a_resolved, &b_resolved) {
-                                                (resolver::ResolvedEntity::Subsystem(a), resolver::ResolvedEntity::Subsystem(b)) => {
-                                                    match query::subsystem::subsystem_communication(&db, &a.name, &b.name, &a.files, &b.files) {
-                                                        Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
-                                                        Err(e) => format!("Error computing subsystem communication: {}", e),
-                                                    }
-                                                }
-                                                _ if !matches!(a_resolved, resolver::ResolvedEntity::Subsystem(_)) => a_resolved.to_json_string(),
-                                                _ => b_resolved.to_json_string(),
-                                            }
+                                        match query::subsystem::subsystem_communication(&db, subsystem_a, subsystem_b) {
+                                            Ok(res) => to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing subsystem communication".to_string()),
+                                            Err(e) => to_string_with_hint(&e).unwrap_or_else(|_| "Error in subsystem communication".to_string()),
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1513,7 +1257,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match query::graph::architectural_hotspots(&db, limit, path_scope) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.top_hotspots.len() * 50; // rough estimation
-                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
+                                                to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing hotspots".to_string())
                                             },
                                             Err(e) => format!("Error calculating architectural hotspots: {}", e),
                                         }
@@ -1532,7 +1276,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match query::graph::dependency_cycles(&db, limit, path_scope, include_same_file) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.cycles.len() * 100; // rough estimation
-                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
+                                                to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing cycles".to_string())
                                             },
                                             Err(e) => {
                                                 let msg = e.to_string();
@@ -1553,51 +1297,17 @@ Treat native tools as the repository's implementation layer."#;
                             "find_duplicate_logic" => {
                                 let min_length = arguments.get("min_length").and_then(|n| n.as_u64()).unwrap_or(15) as usize;
                                 let path_scope_raw = arguments.get("path_scope").and_then(|s| s.as_str());
+                                let limit = arguments.get("limit").and_then(|n| n.as_u64()).map(|n| n as usize);
                                 match storage::Database::new(&db_path) {
                                     Ok(db) => {
                                         let path_scope = normalized_path_scope(&db, path_scope_raw);
                                         let path_scope = path_scope.as_deref();
-                                        match query::duplicates::find_duplicate_logic(&db, min_length, path_scope) {
+                                        match query::duplicates::find_duplicate_logic(&db, min_length, path_scope, limit) {
                                             Ok(res) => {
                                                 estimated_raw_context_tokens = res.groups.len() * 60; // rough estimation
-                                                serde_json::to_string_pretty(&res).unwrap_or_else(|_| "Error serializing duplicate logic report".to_string())
+                                                to_string_with_hint(&res).unwrap_or_else(|_| "Error serializing duplicate logic report".to_string())
                                             }
                                             Err(e) => format!("Error scanning for duplicate logic: {}", e),
-                                        }
-                                    }
-                                    Err(_) => "Error connecting to db".to_string(),
-                                }
-                            }
-                            "graph_subtree" => {
-                                let root_symbol = arguments.get("root_symbol").and_then(|s| s.as_str()).unwrap_or("");
-                                let depth = arguments.get("depth").and_then(|n| n.as_u64()).unwrap_or(3) as usize;
-                                let max_nodes = arguments.get("max_nodes").and_then(|n| n.as_u64()).map(|n| n as usize);
-                                let format_opt = arguments.get("format").and_then(|s| s.as_str()).unwrap_or("json");
-                                let file_hint = get_file_hint(&arguments);
-
-                                match storage::Database::new(&db_path) {
-                                    Ok(db) => {
-                                        // Root resolved through the shared resolver instead of
-                                        // silently picking whichever same-named symbol sorts
-                                        // first and reporting it as an isolated node.
-                                        match resolve_symbol_for_tool(&db, root_symbol, file_hint, None) {
-                                        Err(resp) => resp,
-                                        Ok(resolved) => {
-                                        let hint = relative_hint(&db, &resolved.file_path);
-                                        match query::graph::graph_subtree(&db, &resolved.name, depth, max_nodes, Some(hint), Some(resolved.id)) {
-                                            Ok(res) => {
-                                                estimated_raw_context_tokens = res.node_count * 50; // rough estimation
-                                                if format_opt == "markdown" {
-                                                    res.to_markdown()
-                                                } else {
-                                                    let profile_str = arguments.get("profile").and_then(|s| s.as_str()).unwrap_or("compact");
-                                                    let profile = query::response::ResponseProfile::from(profile_str);
-                                                    serde_json::to_string_pretty(&res.build_json(profile)).unwrap_or_else(|_| "Error serializing graph subtree".to_string())
-                                                }
-                                            },
-                                    Err(e) => format!("Error exploring graph subtree: {}", e),
-                                        }
-                                        }
                                         }
                                     }
                                     Err(_) => "Error connecting to db".to_string(),
@@ -1612,7 +1322,7 @@ Treat native tools as the repository's implementation layer."#;
                                         match resolver::resolve_path(&db, path) {
                                             resolver::ResolvedEntity::File(f) => {
                                                 match query::retrieval::read_file_snippet(&f.file_path, start_line, end_line) {
-                                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                                                    Ok(res) => to_string_with_hint(&res).unwrap_or_default(),
                                                     Err(e) => format!("Error reading file snippet: {}", e),
                                                 }
                                             }
@@ -1628,7 +1338,7 @@ Treat native tools as the repository's implementation layer."#;
                                                 // just because the index doesn't know this path.
                                                 let resolved_path = db.resolve_path(path);
                                                 match query::retrieval::read_file_snippet(&resolved_path, start_line, end_line) {
-                                                    Ok(res) => serde_json::to_string_pretty(&res).unwrap_or_default(),
+                                                    Ok(res) => to_string_with_hint(&res).unwrap_or_default(),
                                                     Err(e) => format!("Error reading file snippet: {}", e),
                                                 }
                                             }
@@ -1662,6 +1372,8 @@ Treat native tools as the repository's implementation layer."#;
                                                 "target_implementation": source,
                                                 "forward_dependencies": context.as_ref().map(|c| c.fetch_forward_dependencies().unwrap_or_default()).unwrap_or_default(),
                                                 "reverse_dependencies": context.as_ref().map(|c| c.fetch_reverse_dependencies().unwrap_or_default()).unwrap_or_default(),
+                                                "callers": context.as_ref().map(|c| c.fetch_callers().unwrap_or_default()).unwrap_or_default(),
+                                                "callees": context.as_ref().map(|c| c.fetch_callees().unwrap_or_default()).unwrap_or_default(),
                                                 "same_file_callers": context.as_ref().map(|c| c.fetch_same_file_callers().unwrap_or_default()).unwrap_or_default(),
                                                 "suggested_edit_boundaries": "Use start_line and end_line from target_implementation"
                                             });

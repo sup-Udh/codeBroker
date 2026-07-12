@@ -16,7 +16,7 @@ impl UniversalResolver {
     /// this function only reshapes whichever `ResolvedEntity` variant comes
     /// back into the coarser `SemanticNode` vocabulary.
     pub fn resolve_query(db: &Database, query: &str, file_hint: Option<&str>) -> ResolutionResult {
-        let resolved = resolve_any(db, query, file_hint, &[], None);
+        let resolved = resolve_any(db, query, file_hint);
         Self::from_resolved_entity(db, query, resolved)
     }
 

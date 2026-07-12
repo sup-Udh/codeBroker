@@ -69,7 +69,7 @@ pub fn hash_content(content: &[u8]) -> String {
 }
 
 /// Serializes an embedding vector to a flat little-endian f32 BLOB for
-/// storage in `symbol_embeddings.embedding`. Chosen over a JSON array of
+/// storage in `embeddings.vector`. Chosen over a JSON array of
 /// floats to keep the table compact and avoid repeated float-formatting
 /// precision loss on every read of a value that's never edited by hand.
 pub fn embedding_to_blob(vector: &[f32]) -> Vec<u8> {
@@ -248,6 +248,12 @@ impl Database {
             "ALTER TABLE mcp_analytics_events ADD COLUMN success BOOLEAN NOT NULL DEFAULT 1;",
             [],
         );
+        // The pre-(model_id, body_hash) embeddings table from the removed
+        // OpenAI-only implementation. Its rows carry neither the model
+        // identity nor the content hash the current pipeline keys on, so
+        // they can't be migrated — drop them and let the next reindex
+        // re-embed with the active model.
+        let _ = self.conn.execute("DROP TABLE IF EXISTS symbol_embeddings;", []);
 
         Ok(())
     }
@@ -285,6 +291,34 @@ impl Database {
             }
         }
         Ok((stale_count, total_checked))
+    }
+
+    /// Returns a list of paths (relative to the project root, as stored in the database)
+    /// for files that have been modified since they were indexed.
+    /// Capped at `limit` to prevent excessive memory usage on massive changes.
+    pub fn get_stale_files(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM files LIMIT ?1")?;
+        let mut rows = stmt.query(params![limit as i64])?;
+        let mut stale_paths = Vec::new();
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let indexed_hash: Option<String> = row.get(1)?;
+            let Some(indexed_hash) = indexed_hash else {
+                continue;
+            };
+            let abs_path = self.resolve_path(&path);
+            match std::fs::read(&abs_path) {
+                Ok(content) => {
+                    if hash_content(&content) != indexed_hash {
+                        stale_paths.push(path);
+                    }
+                }
+                Err(_) => stale_paths.push(path),
+            }
+        }
+        Ok(stale_paths)
     }
 
     /// Inserts a file and returns its new SQLite ID. `content_hash` (from
@@ -328,35 +362,49 @@ impl Database {
         Ok(())
     }
 
-    /// Stores (or replaces) a symbol's embedding vector. `REPLACE` rather
-    /// than `INSERT` since a symbol whose body changed gets re-embedded with
-    /// the same symbol_id when an incremental reindex only touched its
-    /// signature/content, not its declaration identity.
+    /// Stores (or replaces) a symbol's embedding vector for one model.
+    /// `REPLACE` rather than `INSERT` since a symbol whose body changed gets
+    /// re-embedded under the same (symbol_id, model_id) key. Uses a cached
+    /// prepared statement so a reindex batch writing hundreds of rows inside
+    /// one transaction doesn't re-parse the SQL per row.
     pub fn upsert_symbol_embedding(
         &self,
         symbol_id: i64,
+        model_id: &str,
         embedding: &[f32],
-        model: &str,
+        body_hash: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO symbol_embeddings (symbol_id, embedding, model) VALUES (?1, ?2, ?3)",
-            params![symbol_id, embedding_to_blob(embedding), model],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT OR REPLACE INTO embeddings (symbol_id, model_id, dims, vector, body_hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?
+            .execute(params![
+                symbol_id,
+                model_id,
+                embedding.len() as i64,
+                embedding_to_blob(embedding),
+                body_hash
+            ])?;
         Ok(())
     }
 
-    /// All stored embeddings, joined back to their symbol's name/kind/file
-    /// for direct use as search results. A linear scan over this is fine at
-    /// the symbol counts CodeBroker indexes (hundreds to low thousands) —
-    /// not worth standing up a real vector index for.
-    pub fn get_all_symbol_embeddings(&self) -> Result<Vec<(i64, String, String, String, Vec<u8>)>> {
+    /// All stored embeddings for one model, joined back to their symbol's
+    /// name/kind/file/line for direct use as search results. A linear scan
+    /// over this is fine at the symbol counts CodeBroker indexes (hundreds to
+    /// low thousands) — not worth standing up a real vector index for.
+    /// Tuple: (symbol_id, name, kind, path, start_line, vector_blob).
+    pub fn get_all_symbol_embeddings(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(i64, String, String, String, i64, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbol_embeddings.embedding
-             FROM symbol_embeddings
-             JOIN symbols ON symbol_embeddings.symbol_id = symbols.id
-             JOIN files ON symbols.file_id = files.id",
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.start_line, embeddings.vector
+             FROM embeddings
+             JOIN symbols ON embeddings.symbol_id = symbols.id
+             JOIN files ON symbols.file_id = files.id
+             WHERE embeddings.model_id = ?1",
         )?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params![model_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push((
@@ -364,29 +412,35 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
             ));
         }
         Ok(out)
     }
 
-    /// Symbols that have no row in `symbol_embeddings` yet — either never
-    /// embedded (no API key was set at index time) or re-inserted with a new
-    /// id by an incremental reindex (whose old embedding row was deleted by
-    /// `delete_file_data`). Lets a caller backfill embeddings incrementally
-    /// instead of re-embedding the whole repo on every reindex.
-    pub fn symbols_missing_embeddings(
+    /// Every indexed symbol with whatever `body_hash` is stored for it under
+    /// `model_id` (None = never embedded with this model). The caller builds
+    /// the current card text from the file on disk, hashes it, and re-embeds
+    /// only the symbols whose hash differs — this query deliberately does NOT
+    /// try to decide "needs embedding" itself, because the hash is computed
+    /// from file content the database doesn't store.
+    /// Tuple: (symbol_id, name, kind, path, signature, start_byte, end_byte,
+    /// start_line, stored_body_hash).
+    #[allow(clippy::type_complexity)]
+    pub fn embedding_candidates(
         &self,
-    ) -> Result<Vec<(i64, String, String, String, Option<String>, Option<String>)>> {
+        model_id: &str,
+    ) -> Result<Vec<(i64, String, String, String, Option<String>, i64, i64, i64, Option<String>)>>
+    {
         let mut stmt = self.conn.prepare(
-            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.signature, semantic_summaries.summary
+            "SELECT symbols.id, symbols.name, symbols.kind, files.path, symbols.signature,
+                    symbols.start_byte, symbols.end_byte, symbols.start_line, embeddings.body_hash
              FROM symbols
              JOIN files ON symbols.file_id = files.id
-             LEFT JOIN semantic_summaries ON semantic_summaries.symbol_id = symbols.id
-             LEFT JOIN symbol_embeddings ON symbol_embeddings.symbol_id = symbols.id
-             WHERE symbol_embeddings.symbol_id IS NULL",
+             LEFT JOIN embeddings ON embeddings.symbol_id = symbols.id AND embeddings.model_id = ?1",
         )?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query(params![model_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push((
@@ -395,8 +449,41 @@ impl Database {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ));
+        }
+        Ok(out)
+    }
+
+    /// Number of symbols embedded with `model_id` — the real backing state
+    /// for `repository_stats`'s `embedded_symbols`/`semantic_search_available`.
+    pub fn count_symbol_embeddings(&self, model_id: &str) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM embeddings WHERE model_id = ?1",
+            params![model_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// All (body_hash, vector_blob) pairs stored for `model_id`. Used by a
+    /// full `init` rebuild to carry embeddings over from the previous
+    /// published database: symbol ids are freshly assigned by the rebuild,
+    /// but a symbol whose card text hashes the same needs no new API/model
+    /// call — its old vector is byte-for-byte reusable.
+    pub fn embeddings_by_body_hash(
+        &self,
+        model_id: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT body_hash, vector FROM embeddings WHERE model_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![model_id])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?));
         }
         Ok(out)
     }
@@ -556,13 +643,14 @@ impl Database {
     /// re-inserting fresh rows for the same file — `init_schema` never enables
     /// `PRAGMA foreign_keys`, so the `ON DELETE CASCADE` declared in the
     /// schema is inert and stale rows would otherwise dangle or double up on
-    /// re-link. The `symbol_embeddings` delete matters for the same reason:
+    /// re-link. The `embeddings` delete matters for the same reason:
     /// symbols are about to be deleted and reinserted with new ids, so their
     /// old embedding rows (keyed by the old id) would otherwise become
     /// permanently orphaned, silently bloating the table without ever being
-    /// queryable again.
+    /// queryable again. This is also what removes vectors for symbols that
+    /// were deleted from the file outright.
     pub fn delete_file_data(&self, file_id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM symbol_embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
+        self.conn.execute("DELETE FROM embeddings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
         self.conn.execute("DELETE FROM edges WHERE target_symbol_id IN (SELECT id FROM symbols WHERE file_id = ?1)", params![file_id])?;
         self.conn.execute(
             "DELETE FROM edges WHERE source_file_id = ?1",

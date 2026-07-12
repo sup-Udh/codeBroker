@@ -10,7 +10,7 @@ pub struct IncrementalStats {
     pub skipped: Vec<String>,
     /// ids of every symbol (re)inserted into a touched file this pass. A
     /// caller that also wants semantic-search embeddings up to date can pass
-    /// this straight to `semantic::embeddings::backfill_missing_embeddings`'s
+    /// this straight to `semantic::embeddings::backfill_embeddings`'s
     /// `only_symbol_ids` to embed exactly what changed, instead of rescanning
     /// the whole repo for missing embeddings after every small edit.
     pub touched_symbol_ids: Vec<i64>,

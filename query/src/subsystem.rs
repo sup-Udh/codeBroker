@@ -176,99 +176,13 @@ pub fn list_entrypoints(
 /// sets (benchmark run_001's gap #3).
 /// `files_a`/`files_b` must come from the caller's own subsystem resolution
 /// (e.g. `resolver::resolve_subsystem`'s `ResolvedSubsystem.files`) rather
-/// than this function re-deriving them from `a`/`b` via a second, independent
-/// `discover_subsystem` call — otherwise a name that resolved via a
-/// canonicalized alias (e.g. "authentication" -> "auth") could silently
-/// re-resolve differently (or fail) here, using the raw un-canonicalized
-/// input. `a`/`b` are only used as output labels.
-pub fn subsystem_communication(
-    db: &Database,
-    a: &str,
-    b: &str,
-    files_a: &[String],
-    files_b: &[String],
-) -> Result<SubsystemCommunication, String> {
-    // Resolve each subsystem's files to file ids. We key communication on FILE
-    // membership (source_file_id / target symbol's file_id), exactly as
-    // `discover_subsystem`'s `consumers`/`dependencies` do — previously this
-    // function only counted edges whose `source_symbol_id` was non-NULL and
-    // resolved to a symbol, so file-level edges (e.g. a top-level
-    // `import`/`fetch` from a frontend component into an orchestrator symbol,
-    // whose enclosing symbol is NULL) were invisible here while still showing
-    // up in `subsystem_stats(...).consumers`. The two tools now agree on
-    // whether an A<->B edge exists because they read the same edge basis.
-    let file_ids_for = |files: &[String]| -> Result<HashSet<i64>, String> {
-        let mut ids = HashSet::new();
-        for f in files {
-            let mut stmt = db
-                .conn
-                .prepare("SELECT id FROM files WHERE path = ?1")
-                .map_err(|e| e.to_string())?;
-            let mut rows = stmt
-                .query(rusqlite::params![f])
-                .map_err(|e| e.to_string())?;
-            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                ids.insert(row.get(0).map_err(|e| e.to_string())?);
-            }
-        }
-        Ok(ids)
-    };
-
-    let file_ids_a = file_ids_for(files_a)?;
-    let file_ids_b = file_ids_for(files_b)?;
-
-    // Every edge with a target symbol, carrying both the source file and the
-    // target symbol's file so we can classify by file membership. The source
-    // label falls back to the source file's basename when the edge has no
-    // enclosing symbol (NULL source_symbol_id).
-    let mut stmt = db
-        .conn
-        .prepare(
-            "SELECT edges.source_file_id, tgt.file_id, src.name, tgt.name, srcf.path
-             FROM edges
-             JOIN symbols tgt ON edges.target_symbol_id = tgt.id
-             JOIN files srcf ON edges.source_file_id = srcf.id
-             LEFT JOIN symbols src ON edges.source_symbol_id = src.id",
-        )
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-
-    let mut a_to_b: Vec<(String, String)> = Vec::new();
-    let mut b_to_a: Vec<(String, String)> = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let src_file: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let tgt_file: i64 = row.get(1).map_err(|e| e.to_string())?;
-        // Edges entirely within one file aren't cross-subsystem communication.
-        if src_file == tgt_file {
-            continue;
-        }
-        let src_name: Option<String> = row.get(2).map_err(|e| e.to_string())?;
-        let tgt_name: String = row.get(3).map_err(|e| e.to_string())?;
-        let src_path: String = row.get(4).map_err(|e| e.to_string())?;
-        let src_label = src_name.unwrap_or_else(|| {
-            std::path::Path::new(&src_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&src_path)
-                .to_string()
-        });
-
-        if file_ids_a.contains(&src_file) && file_ids_b.contains(&tgt_file) {
-            a_to_b.push((src_label.clone(), tgt_name.clone()));
-        }
-        if file_ids_b.contains(&src_file) && file_ids_a.contains(&tgt_file) {
-            b_to_a.push((src_label, tgt_name));
-        }
-    }
-
-    Ok(SubsystemCommunication {
-        subsystem_a: a.to_string(),
-        subsystem_b: b.to_string(),
-        a_to_b_edges: a_to_b.len(),
-        b_to_a_edges: b_to_a.len(),
-        a_to_b_examples: a_to_b.into_iter().take(10).collect(),
-        b_to_a_examples: b_to_a.into_iter().take(10).collect(),
-    })
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubsystemCommunicationExample {
+    pub from: String,
+    pub from_file: String,
+    pub to: String,
+    pub to_file: String,
+    pub edge_kind: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -277,28 +191,217 @@ pub struct SubsystemCommunication {
     pub subsystem_b: String,
     pub a_to_b_edges: usize,
     pub b_to_a_edges: usize,
-    pub a_to_b_examples: Vec<(String, String)>,
-    pub b_to_a_examples: Vec<(String, String)>,
+    pub a_to_b_examples: Vec<SubsystemCommunicationExample>,
+    pub b_to_a_examples: Vec<SubsystemCommunicationExample>,
+}
+
+fn get_common_prefix(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let mut prefix: Vec<&str> = paths[0].split('/').collect();
+    for path in paths.iter().skip(1) {
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut i = 0;
+        while i < prefix.len() && i < parts.len() && prefix[i] == parts[i] {
+            i += 1;
+        }
+        prefix.truncate(i);
+    }
+    prefix.join("/")
+}
+
+pub fn subsystem_communication(
+    db: &Database,
+    a: &str,
+    b: &str,
+) -> Result<SubsystemCommunication, serde_json::Value> {
+    let mut known_subsystems = Vec::new();
+    let mut dir_counts = std::collections::HashMap::new();
+
+    let sql = "SELECT files.path, COUNT(symbols.id) FROM files LEFT JOIN symbols ON symbols.file_id = files.id GROUP BY files.id";
+    let mut stmt = db.conn.prepare(sql).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+    let mut rows = stmt.query([]).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+    while let Ok(Some(row)) = rows.next() {
+        let path: String = row.get(0).unwrap_or_default();
+        let count: i64 = row.get(1).unwrap_or(0);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let dir = parent.to_string_lossy().replace("\\", "/");
+            *dir_counts.entry(dir).or_insert(0) += count;
+        }
+    }
+
+    let dirs: Vec<String> = dir_counts.keys().cloned().collect();
+    let common_prefix = get_common_prefix(&dirs);
+    let strip_prefix = |p: &str| -> String {
+        let p = p.replace("\\", "/");
+        if common_prefix.is_empty() {
+            p
+        } else {
+            let stripped = p.strip_prefix(&common_prefix).unwrap_or(&p);
+            let stripped = stripped.trim_start_matches('/');
+            if stripped.is_empty() {
+                ".".to_string()
+            } else {
+                stripped.to_string()
+            }
+        }
+    };
+
+    for (dir, count) in &dir_counts {
+        if *count >= 3 {
+            known_subsystems.push(strip_prefix(dir));
+        }
+    }
+    known_subsystems.sort();
+    known_subsystems.dedup();
+
+    let resolve = |query: &str| -> Result<String, serde_json::Value> {
+        let q = query.replace("\\", "/");
+        let q_trimmed = q.trim_end_matches('/');
+        
+        let mut exact_matches = Vec::new();
+        let mut substring_matches = Vec::new();
+
+        for dir in dir_counts.keys() {
+            let stripped = strip_prefix(dir);
+            if stripped == q_trimmed || dir.ends_with(&format!("/{}", q_trimmed)) {
+                exact_matches.push(dir.clone());
+            }
+            if stripped.contains(q_trimmed) {
+                substring_matches.push(dir.clone());
+            }
+        }
+
+        if exact_matches.len() == 1 {
+            return Ok(exact_matches[0].clone());
+        }
+        if exact_matches.len() > 1 {
+            let mut d: Vec<String> = exact_matches.iter().map(|s| strip_prefix(s)).collect();
+            d.sort();
+            d.dedup();
+            return Err(serde_json::json!({
+                "resolved_as": "not_found",
+                "query": query,
+                "did_you_mean": d,
+                "known_subsystems": known_subsystems
+            }));
+        }
+
+        if substring_matches.len() == 1 {
+            return Ok(substring_matches[0].clone());
+        }
+        
+        let mut d: Vec<String> = substring_matches.iter().map(|s| strip_prefix(s)).collect();
+        d.sort();
+        d.dedup();
+        Err(serde_json::json!({
+            "resolved_as": "not_found",
+            "query": query,
+            "did_you_mean": d,
+            "known_subsystems": known_subsystems
+        }))
+    };
+
+    let dir_a = resolve(a)?;
+    let dir_b = resolve(b)?;
+
+    let sql_edges = "
+        SELECT 
+          src.name, srcf.path, 
+          tgt.name, tgtf.path, 
+          edges.kind
+        FROM edges
+        JOIN symbols tgt ON edges.target_symbol_id = tgt.id
+        JOIN files srcf ON edges.source_file_id = srcf.id
+        JOIN files tgtf ON tgt.file_id = tgtf.id
+        LEFT JOIN symbols src ON edges.source_symbol_id = src.id
+        WHERE srcf.path LIKE ?1 AND tgtf.path LIKE ?2
+    ";
+
+    let mut stmt_edges = db.conn.prepare(sql_edges).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+    let like_a = format!("{}%", dir_a);
+    let like_b = format!("{}%", dir_b);
+    
+    let mut a_to_b = Vec::new();
+    {
+        let mut rows_a_b = stmt_edges.query(rusqlite::params![like_a, like_b]).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        while let Ok(Some(row)) = rows_a_b.next() {
+            let src_name: Option<String> = row.get(0).unwrap_or(None);
+            let src_path: String = row.get(1).unwrap_or_default();
+            let tgt_name: String = row.get(2).unwrap_or_default();
+            let tgt_path: String = row.get(3).unwrap_or_default();
+            let edge_kind: String = row.get(4).unwrap_or_default();
+            
+            let src_label = src_name.unwrap_or_else(|| {
+                std::path::Path::new(&src_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&src_path)
+                    .to_string()
+            });
+            
+            a_to_b.push(SubsystemCommunicationExample {
+                from: src_label,
+                from_file: strip_prefix(&src_path),
+                to: tgt_name,
+                to_file: strip_prefix(&tgt_path),
+                edge_kind,
+            });
+        }
+    }
+    
+    let mut b_to_a = Vec::new();
+    {
+        let mut rows_b_a = stmt_edges.query(rusqlite::params![like_b, like_a]).map_err(|e| serde_json::json!({"error": e.to_string()}))?;
+        while let Ok(Some(row)) = rows_b_a.next() {
+            let src_name: Option<String> = row.get(0).unwrap_or(None);
+            let src_path: String = row.get(1).unwrap_or_default();
+            let tgt_name: String = row.get(2).unwrap_or_default();
+            let tgt_path: String = row.get(3).unwrap_or_default();
+            let edge_kind: String = row.get(4).unwrap_or_default();
+            
+            let src_label = src_name.unwrap_or_else(|| {
+                std::path::Path::new(&src_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&src_path)
+                    .to_string()
+            });
+            
+            b_to_a.push(SubsystemCommunicationExample {
+                from: src_label,
+                from_file: strip_prefix(&src_path),
+                to: tgt_name,
+                to_file: strip_prefix(&tgt_path),
+                edge_kind,
+            });
+        }
+    }
+    
+    Ok(SubsystemCommunication {
+        subsystem_a: strip_prefix(&dir_a),
+        subsystem_b: strip_prefix(&dir_b),
+        a_to_b_edges: a_to_b.len(),
+        b_to_a_edges: b_to_a.len(),
+        a_to_b_examples: a_to_b.into_iter().take(10).collect(),
+        b_to_a_examples: b_to_a.into_iter().take(10).collect(),
+    })
 }
 
 pub fn discover_subsystem(
     db: &Database,
     name: &str,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
     scope: TraversalScope,
 ) -> Result<SubsystemStats, String> {
-    // 1. Seed Generation (Hybrid Lexical + Semantic + Graph)
-    let (seed_results, _) = crate::engine::search_symbols(
+    // 1. Seed Generation (Hybrid Lexical + Graph)
+    let (seed_results, _, _, _, _) = crate::engine::search_symbols(
         db,
         name,
-        semantic_tokens,
-        query_vector,
-        !semantic_tokens.is_empty(),
         None,
         crate::engine::SearchMode::Symbol,
         false,
-        Some("low"),
+        50,
     )
     .map_err(|e| e.to_string())?;
 

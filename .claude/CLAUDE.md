@@ -1,4 +1,39 @@
-## vexp - Context-Aware AI Coding <!-- vexp v2.1.0 -->
+# CodeBroker MCP Server — Repository Intelligence Layer
+
+For every task - bug fixes, features, refactors, debugging:
+You are connected to the CodeBroker MCP Server. CodeBroker is the primary repository intelligence, discovery, architecture, and context engine for the active workspace.
+Do NOT use grep, glob, Bash, or cat to search/explore the codebase initially. Use the CodeBroker deterministic tools.
+
+### Available Tools
+You MUST only use the following listed deterministic tools for the CodeBroker MCP Server:
+- `set_workspace`
+- `reindex_workspace`
+- `subsystem_communication`
+- `architectural_hotspots`
+- `dependency_cycles`
+- `get_context`
+- `impact_analysis`
+- `search_codebase`
+- `repository_stats`
+- `read_symbol_source`
+- `read_file_skeleton`
+- `explore_graph`
+- `shortest_path`
+- `read_file_snippet`
+- `get_edit_context`
+- `find_duplicate_logic`
+
+### Workflow
+1. Use `search_codebase`, `explore_graph`, `shortest_path`, `repository_stats`, and `architectural_hotspots` for discovery and architecture.
+2. Need more detail on a file? Use `read_file_skeleton`, `read_symbol_source`, or `read_file_snippet`.
+3. Analyze dependencies using `get_context`, `impact_analysis`, and `dependency_cycles`.
+4. Make targeted changes based on the context returned using your native tools.
+
+**No Semantic Search:**
+All tools are purely deterministic. There are no OpenAI API calls, semantic search, or embedding-based lookups available.
+
+
+## vexp - Context-Aware AI Coding <!-- vexp v2.1.5 -->
 
 ### MANDATORY: use vexp pipeline - do NOT grep or glob the codebase
 For every task - bug fixes, features, refactors, debugging:

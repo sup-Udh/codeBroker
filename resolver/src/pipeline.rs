@@ -63,7 +63,7 @@ fn query_symbols_by_name(
         name_clause
     );
     let mut stmt = db.conn.prepare(&sql)?;
-    let normalized_hint = file_hint.map(|h| h.replace("\\", "/"));
+    let normalized_hint = file_hint.map(|h| normalize_query_path(db, h));
     let mut rows = stmt.query(rusqlite::params![name_param, normalized_hint.as_deref().unwrap_or("")])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -108,6 +108,28 @@ fn rows_to_entity(
             }))
         }
         _ => {
+            // Auto-collapse identical ranges (e.g. arrow function double-indexing).
+            // If all candidates share the same file and byte range, it's not real ambiguity.
+            let first = &rows[0];
+            let all_same = rows.iter().skip(1).all(|r| {
+                r.path == first.path && r.start_byte == first.start_byte && r.end_byte == first.end_byte
+            });
+            if all_same {
+                let r = &rows[0];
+                return Some(ResolvedEntity::Symbol(ResolvedSymbol {
+                    id: r.id,
+                    name: r.name.clone(),
+                    kind: r.kind.clone(),
+                    file_path: db.resolve_path(&r.path),
+                    start_line: r.start_line,
+                    end_line: r.end_line,
+                    start_byte: r.start_byte,
+                    end_byte: r.end_byte,
+                    is_entrypoint: r.is_entrypoint,
+                    confidence,
+                }));
+            }
+
             // When the caller supplies a line number, try to narrow within-file
             // candidates to the definition that encloses that line: keep only
             // rows whose start_line ≤ line_hint, then pick the one with the
@@ -197,92 +219,11 @@ fn stage_canonical_symbol(
     )
 }
 
-/// Embedding-similarity match. Only reachable when the workspace was indexed
-/// with an embedding model AND the caller supplied a query vector — both are
-/// the resolver's responsibility to check, not each tool's.
-fn stage_semantic_symbol(db: &Database, query_vector: Option<&[f32]>) -> Option<ResolvedEntity> {
-    let qv = query_vector?;
-    let embeddings = db.get_all_symbol_embeddings().ok()?;
-    if embeddings.is_empty() {
-        return None;
-    }
-    let mut scored: Vec<(f32, i64, String, String, String)> = embeddings
-        .into_iter()
-        .map(|(id, name, kind, path, blob)| {
-            let v = storage::blob_to_embedding(&blob);
-            let sim = storage::cosine_similarity(qv, &v);
-            (sim, id, name, kind, path)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    let (top_sim, _, _, _, _) = scored.first()?.clone();
-    if top_sim < SEMANTIC_THRESHOLD {
-        return None;
-    }
-
-    let close: Vec<_> = scored
-        .iter()
-        .take_while(|(sim, ..)| top_sim - sim < SEMANTIC_AMBIGUITY_MARGIN)
-        .collect();
-
-    if close.len() > 1 {
-        return Some(ResolvedEntity::Ambiguous(AmbiguousMatch {
-            query: String::new(),
-            candidates: close
-                .iter()
-                .map(|(_, _, name, kind, path)| Candidate {
-                    entity_type: EntityType::Symbol,
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    file_path: db.resolve_path(path),
-                    start_line: 0,
-                    start_byte: 0,
-                    end_byte: 0,
-                })
-                .collect(),
-            hint: "Multiple symbols are equally strong semantic matches. Re-run with `file_path` set to disambiguate.".to_string(),
-        }));
-    }
-
-    let (sim, id, name, kind, path) = scored.into_iter().next()?;
-    let (start_line, end_line, is_entrypoint) = db
-        .conn
-        .query_row(
-            "SELECT symbols.start_line, symbols.end_line, COALESCE(sf.is_entrypoint, 0)
-             FROM symbols LEFT JOIN symbol_features sf ON sf.symbol_id = symbols.id
-             WHERE symbols.id = ?1",
-            rusqlite::params![id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .unwrap_or((0, 0, false));
-
-    Some(ResolvedEntity::Symbol(ResolvedSymbol {
-        id,
-        name,
-        kind,
-        file_path: db.resolve_path(&path),
-        start_line,
-        end_line,
-        start_byte: 0,
-        end_byte: 0,
-        is_entrypoint,
-        confidence: Confidence::new(
-            (sim.clamp(0.0, 1.0) * 100.0) as u8,
-            vec![format!("Semantic embedding similarity {:.2}", sim)],
-        ),
-    }))
-}
 
 /// Resolves a query that is known/expected to name a **symbol** — the
 /// pipeline subset used by tools (`get_context`, `get_implementation`,
-/// `get_edit_context`, `impact_analysis`, `explore_graph`, `shortest_path`,
+/// `get_edit_context`, `get_context`, `explore_graph`, `shortest_path`,
 /// `graph_subtree`) that only ever take a symbol name. Skips the
 /// file/directory/subsystem/feature stages entirely: a tool that already
 /// knows it wants a symbol shouldn't pay for (or risk mis-resolving into)
@@ -291,7 +232,6 @@ pub fn resolve_symbol(
     db: &Database,
     query: &str,
     file_hint: Option<&str>,
-    query_vector: Option<&[f32]>,
     line_hint: Option<i64>,
 ) -> ResolvedEntity {
     let mut stages_tried = Vec::new();
@@ -306,10 +246,6 @@ pub fn resolve_symbol(
         return r;
     }
 
-    stages_tried.push("semantic_symbol".to_string());
-    if let Some(r) = stage_semantic_symbol(db, query_vector) {
-        return r;
-    }
 
     ResolvedEntity::NotFound(NotFound {
         query: query.to_string(),
@@ -532,14 +468,10 @@ fn stage_feature(db: &Database, query: &str) -> Option<ResolvedEntity> {
 fn try_discover_subsystem(
     db: &Database,
     name: &str,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
 ) -> Option<ResolvedEntity> {
     match query::subsystem::discover_subsystem(
         db,
         name,
-        semantic_tokens,
-        query_vector,
         query::subsystem::TraversalScope::Expanded,
     ) {
         Ok(stats) if !stats.files.is_empty() && stats.confidence != "Low" => {
@@ -577,16 +509,14 @@ fn try_discover_subsystem(
 pub fn resolve_subsystem(
     db: &Database,
     name: &str,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
 ) -> ResolvedEntity {
     let canonical = crate::naming::CanonicalNameResolver::resolve_subsystem_name(name);
     if canonical != name.trim().to_lowercase() {
-        if let Some(r) = try_discover_subsystem(db, &canonical, semantic_tokens, query_vector) {
+        if let Some(r) = try_discover_subsystem(db, &canonical) {
             return r;
         }
     }
-    if let Some(r) = try_discover_subsystem(db, name, semantic_tokens, query_vector) {
+    if let Some(r) = try_discover_subsystem(db, name) {
         return r;
     }
     ResolvedEntity::NotFound(NotFound {
@@ -616,8 +546,6 @@ pub fn resolve_any(
     db: &Database,
     query: &str,
     file_hint: Option<&str>,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
 ) -> ResolvedEntity {
     let mut stages_tried = Vec::new();
 
@@ -651,8 +579,6 @@ pub fn resolve_any(
     if let Ok(stats) = query::subsystem::discover_subsystem(
         db,
         query,
-        semantic_tokens,
-        query_vector,
         query::subsystem::TraversalScope::Expanded,
     ) {
         if !stats.files.is_empty() && stats.confidence != "Low" {
@@ -674,10 +600,7 @@ pub fn resolve_any(
             });
         }
     }
-    stages_tried.push("semantic".to_string());
-    if let Some(r) = stage_semantic_symbol(db, query_vector) {
-        return r;
-    }
+
 
     ResolvedEntity::NotFound(NotFound {
         query: query.to_string(),
@@ -702,33 +625,28 @@ pub fn resolve_any(
 pub fn resolve_search(
     db: &Database,
     query: &str,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
-    llm_used: bool,
     path_scope: Option<&str>,
     mode: query::engine::SearchMode,
     whole_word: bool,
-    min_confidence: Option<&str>,
-) -> (Vec<query::engine::SearchResult>, Option<String>) {
-    let (mut results, reason) = query::engine::search_symbols(
+    limit: usize,
+    include_concepts: bool,
+) -> (Vec<query::engine::SearchResult>, usize, usize, bool, Option<String>) {
+    let (mut results, total_occurrences, files_matched, truncated, reason) = query::engine::search_symbols(
         db,
         query,
-        semantic_tokens,
-        query_vector,
-        llm_used,
         path_scope,
         mode,
         whole_word,
-        min_confidence,
+        limit,
     )
-    .unwrap_or_else(|_| (vec![], None));
+    .unwrap_or_else(|_| (vec![], 0, 0, false, None));
 
     // Concept augmentation: query terms that map to a domain concept ("auth",
     // "realtime", "notifications", "database") pull in concept-tagged symbols
     // that pure lexical search misses — e.g. a query for "auth" finds
     // createClient/signInWithOAuth even though those names don't contain "auth".
     // Centralized here instead of being inline in each tool that needs it.
-    if mode != query::engine::SearchMode::Text {
+    if include_concepts && mode != query::engine::SearchMode::Text {
         let mut seen: std::collections::HashSet<(String, String)> = results
             .iter()
             .map(|r| (r.name.clone(), r.path.clone()))
@@ -760,6 +678,7 @@ pub fn resolve_search(
                         confidence: format!("Concept Match ({})", m.concept),
                         explanation: format!("Matched conceptual tag '{}'", m.concept),
                         line: None,
+                        matched_symbols: None,
                     });
                     concept_added += 1;
                 }
@@ -767,7 +686,7 @@ pub fn resolve_search(
         }
         results.sort_by(|a, b| b.score.cmp(&a.score));
     }
-    (results, reason)
+    (results, total_occurrences, files_matched, truncated, reason)
 }
 
 #[cfg(test)]
@@ -816,7 +735,7 @@ mod tests {
         let f = db.insert_file("./a.py", "h1").unwrap();
         insert_symbol(&db, f, "simulate", "function");
 
-        let result = resolve_symbol(&db, "simulate", None, None, None);
+        let result = resolve_symbol(&db, "simulate", None, None);
         match result {
             ResolvedEntity::Symbol(s) => assert_eq!(s.name, "simulate"),
             other => panic!("expected Symbol, got {:?}", other),
@@ -832,7 +751,7 @@ mod tests {
         insert_symbol(&db, f1, "SOFTWARE_REGISTRY", "variable");
         insert_symbol(&db, f2, "SOFTWARE_REGISTRY", "variable");
 
-        let result = resolve_symbol(&db, "SOFTWARE_REGISTRY", None, None, None);
+        let result = resolve_symbol(&db, "SOFTWARE_REGISTRY", None, None);
         assert!(
             result.is_ambiguous(),
             "expected Ambiguous, got {:?}",
@@ -852,7 +771,7 @@ mod tests {
         insert_symbol(&db, f1, "createClient", "function");
         insert_symbol(&db, f2, "createClient", "function");
 
-        let result = resolve_symbol(&db, "createClient", Some("b.py"), None, None);
+        let result = resolve_symbol(&db, "createClient", Some("b.py"), None);
         match result {
             ResolvedEntity::Symbol(s) => assert!(s.file_path.ends_with("b.py")),
             other => panic!("expected Symbol, got {:?}", other),
@@ -865,7 +784,7 @@ mod tests {
         let (db, root) = test_db();
         db.insert_file("./a.py", "h1").unwrap();
 
-        let result = resolve_symbol(&db, "totallyMadeUpName", None, None, None);
+        let result = resolve_symbol(&db, "totallyMadeUpName", None, None);
         assert!(result.is_not_found(), "expected NotFound, got {:?}", result);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -951,7 +870,7 @@ mod tests {
             )
             .unwrap();
 
-        let result = resolve_any(&db, "auth", None, &[], None);
+        let result = resolve_any(&db, "auth", None);
         match result {
             ResolvedEntity::Feature(f) => assert_eq!(f.concept, "auth"),
             other => panic!("expected Feature, got {:?}", other),

@@ -25,6 +25,8 @@ pub struct DuplicateLogicReport {
     pub symbols_scanned: usize,
     pub duplicate_groups_found: usize,
     pub groups: Vec<DuplicateGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 fn normalize(source: &str, file_path: &str) -> Option<(String, usize)> {
@@ -49,6 +51,7 @@ pub fn find_duplicate_logic(
     db: &Database,
     min_normalized_len: usize,
     path_scope: Option<&str>,
+    limit: Option<usize>,
 ) -> Result<DuplicateLogicReport, String> {
     let mut stmt = db.conn.prepare(
         "SELECT symbols.name, symbols.kind, files.path, symbols.start_line, symbols.end_line, symbols.start_byte, symbols.end_byte
@@ -146,9 +149,25 @@ pub fn find_duplicate_logic(
 
     result_groups.sort_by(|a, b| b.normalized_length.cmp(&a.normalized_length));
 
+    let total_found = result_groups.len();
+    if let Some(l) = limit {
+        result_groups.truncate(l);
+    }
+
+    let note = if total_found == 0 && path_scope.is_some() {
+        if symbols_scanned < 50 {
+            Some("Note: 0 duplicates found, but only a small number of symbols were scanned. Duplication detection relies on scale to be meaningful. Consider removing the path_scope parameter or using a much broader scope to find cross-file duplication.".to_string())
+        } else {
+            Some("Note: 0 duplicates found in this scope. You may want to broaden or remove the path_scope to search repo-wide.".to_string())
+        }
+    } else {
+        None
+    };
+
     Ok(DuplicateLogicReport {
         symbols_scanned,
-        duplicate_groups_found: result_groups.len(),
+        duplicate_groups_found: total_found,
         groups: result_groups,
+        note,
     })
 }

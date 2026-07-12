@@ -11,6 +11,8 @@ import {
   TerminalSquare
 } from 'lucide-react';
 import { Section } from '../../App';
+import { api, RepositoryOverview } from '../../providers/api';
+import { useState, useEffect, useCallback } from 'react';
 
 interface SidebarProps {
   activeSection: Section;
@@ -18,6 +20,16 @@ interface SidebarProps {
 }
 
 export function Sidebar({ activeSection, onSelect }: SidebarProps) {
+  const [data, setData] = useState<RepositoryOverview | null>(null);
+
+  const loadData = useCallback(() => {
+    api.getOverview().then(setData).catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
+
   const navItems: { id: Section; label: string; icon: React.ReactNode }[] = [
     { id: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" /> },
     { id: 'tokens', label: 'Tokens', icon: <Coins className="w-4 h-4" /> },
@@ -55,26 +67,14 @@ export function Sidebar({ activeSection, onSelect }: SidebarProps) {
       </nav>
 
       <div className="p-4 border-t border-[#1f1f22]">
-        <button 
-          onClick={() => onSelect('settings')}
-          className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm transition-colors duration-200 ${
-            activeSection === 'settings'
-              ? 'bg-[#111113] border border-[#ff6b35]/30 text-[#ff6b35]'
-              : 'text-[#71717a] hover:bg-[#111113] hover:text-[#fafafa] border border-transparent'
-          }`}
-        >
-          <Settings className="w-4 h-4" />
-          <span className="font-medium">Settings</span>
-        </button>
-        
-        <div className="mt-4 px-3 py-3 bg-[#111113] rounded-lg border border-[#1f1f22]">
+        <div className="px-3 py-3 bg-[#111113] rounded-lg border border-[#1f1f22]">
           <div className="text-xs text-[#71717a] mb-1 uppercase tracking-wider font-semibold">Workspace</div>
-          <div className="text-sm font-medium truncate" title="/Users/dev/project">
-            project-x
+          <div className="text-sm font-medium truncate" title={data?.workspacePath || "Loading..."}>
+            {data?.workspaceName || "Loading..."}
           </div>
           <div className="text-xs text-[#71717a] mt-2 flex justify-between">
             <span>v1.2.0</span>
-            <span className="text-[#ff6b35]">Syncing...</span>
+            <span className="text-[#22c55e]">Active</span>
           </div>
         </div>
       </div>

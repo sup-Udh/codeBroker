@@ -98,9 +98,10 @@ pub struct SearchResult {
     pub score: i32,
     pub confidence: String,
     pub explanation: String,
-    /// Line number for content/text matches. Absent for symbol/file matches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_symbols: Option<usize>,
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -179,12 +180,19 @@ const MAX_TEXT_MATCHES: usize = 50;
 /// names (fast, but misses string literals, comments, and config values).
 /// `Text` greps the raw file content of indexed files (slower, catches anything
 /// `Symbol` misses). `Both` runs symbol matching first and falls back to text
-/// search if that yields nothing, merging whatever is found.
+/// search if that yields nothing, merging whatever is found — and, when
+/// embeddings are available, is additionally fused with semantic retrieval by
+/// the layer above (see `semantic::search`). `Semantic` is embedding-only
+/// retrieval; this engine itself treats it as "no lexical results" (the
+/// semantic leg lives above the query crate, which must not depend on an
+/// embedding runtime) and the caller substitutes keyword results only when
+/// semantic retrieval is degraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     Symbol,
     Text,
     Both,
+    Semantic,
 }
 
 impl From<&str> for SearchMode {
@@ -192,9 +200,82 @@ impl From<&str> for SearchMode {
         match s.to_lowercase().as_str() {
             "text" => SearchMode::Text,
             "both" => SearchMode::Both,
+            "semantic" => SearchMode::Semantic,
             _ => SearchMode::Symbol,
         }
     }
+}
+
+/// Reciprocal-rank-fusion constant. 60 is the standard value from the RRF
+/// paper; the exact number matters less than being >> 1 so that rank 1 vs
+/// rank 2 doesn't dominate the fused score.
+pub const RRF_K: f64 = 60.0;
+
+/// True for confidence labels produced by exact lexical matching (symbol or
+/// file name equality). Used as the RRF tie-break: at equal fused score, an
+/// exact lexical hit must outrank a semantic one — an agent searching for a
+/// literal identifier should never see a "similar-looking" symbol first.
+fn is_exact_lexical(confidence: &str) -> bool {
+    confidence.starts_with("High (Exact")
+}
+
+/// Fuses two ranked result lists (typically lexical and semantic) with
+/// reciprocal rank fusion: fused(d) = Σ 1/(RRF_K + rank_i(d)). Results are
+/// identified by (name, path) — NOT line, because lexical symbol hits carry
+/// `line: None` while semantic hits carry the definition line, and the same
+/// symbol found by both legs must merge, not appear twice. The merged result
+/// keeps the first leg's confidence/explanation, upgrades to an exact
+/// lexical label if either leg had one, and fills in a missing line number
+/// from the other leg. Ordering: fused score desc, then exact lexical
+/// matches before non-exact at (float-)equal score, then name for
+/// determinism. The original integer `score` is replaced by the fused score
+/// scaled to an integer so downstream consumers that sort by `score` agree
+/// with this ordering.
+pub fn rrf_fuse(lists: Vec<Vec<SearchResult>>, limit: usize) -> Vec<SearchResult> {
+    use std::collections::HashMap;
+    let mut fused: HashMap<(String, String), (SearchResult, f64)> = HashMap::new();
+    for list in lists {
+        for (rank, result) in list.into_iter().enumerate() {
+            let key = (result.name.clone(), result.path.clone());
+            let contribution = 1.0 / (RRF_K + rank as f64 + 1.0);
+            match fused.get_mut(&key) {
+                Some((existing, score)) => {
+                    *score += contribution;
+                    // A hit found by both legs is stronger evidence than
+                    // either alone; keep the lexical label if either leg was
+                    // exact so the tie-break still recognizes it.
+                    if is_exact_lexical(&result.confidence)
+                        && !is_exact_lexical(&existing.confidence)
+                    {
+                        existing.confidence = result.confidence;
+                    }
+                    if existing.line.is_none() {
+                        existing.line = result.line;
+                    }
+                }
+                None => {
+                    fused.insert(key, (result, contribution));
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(SearchResult, f64)> = fused.into_values().collect();
+    out.sort_by(|(a, sa), (b, sb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| is_exact_lexical(&b.confidence).cmp(&is_exact_lexical(&a.confidence)))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out.truncate(limit);
+    out.into_iter()
+        .map(|(mut r, score)| {
+            // 1/(k+1) ≈ 0.016 is the max single-leg contribution; scale so
+            // fused scores land in a familiar integer range (~0-330 per leg).
+            r.score = (score * 10_000.0).round() as i32;
+            r
+        })
+        .collect()
 }
 
 /// Maps a `SearchResult.confidence` string to a coarse 1-3 level for
@@ -272,25 +353,8 @@ fn search_symbol_names(
     query_lower: &str,
     query_tokens: &[String],
     path_scope: Option<&str>,
-    query_vector: Option<&[f32]>,
 ) -> Result<Vec<SearchResult>, rusqlite::Error> {
     let mut results = Vec::new();
-
-    // 1. Fetch all symbol embeddings first if we have a query vector
-    let mut symbol_embeddings: std::collections::HashMap<i64, Vec<f32>> =
-        std::collections::HashMap::new();
-    if let Some(_) = query_vector {
-        let mut embed_stmt = db
-            .conn
-            .prepare("SELECT symbol_id, embedding FROM symbol_embeddings")?;
-        let mut embed_rows = embed_stmt.query([])?;
-        while let Some(row) = embed_rows.next()? {
-            let s_id: i64 = row.get(0)?;
-            let blob: Vec<u8> = row.get(1)?;
-            let vec = storage::blob_to_embedding(&blob);
-            symbol_embeddings.insert(s_id, vec);
-        }
-    }
 
     let query_str = "
         SELECT 
@@ -378,17 +442,7 @@ fn search_symbol_names(
             }
         }
 
-        let mut semantic_sim = -1.0;
-        if let Some(q_vec) = query_vector {
-            if let Some(s_vec) = symbol_embeddings.get(&s_id) {
-                semantic_sim = storage::cosine_similarity(q_vec, s_vec);
-                if semantic_sim > 0.25 {
-                    expl.push(format!("Semantic similarity {:.2}", semantic_sim));
-                }
-            }
-        }
-
-        if name_score == 0 && path_score == 0 && semantic_sim < 0.25 {
+        if name_score == 0 && path_score == 0 {
             continue;
         }
 
@@ -418,7 +472,7 @@ fn search_symbol_names(
         }
 
         let features = RankingFeatures {
-            semantic_similarity: semantic_sim as f64,
+            semantic_similarity: 0.0,
             lexical_score: name_score,
             path_score,
             pagerank,
@@ -431,14 +485,10 @@ fn search_symbol_names(
 
         let final_score = compute_retrieval_score(&features);
 
-        let confidence = if semantic_sim > 0.35 {
-            "High (Semantic Match)".to_string()
-        } else if name_score >= 1000 {
+        let confidence = if name_score >= 1000 {
             "High (Exact Match)".to_string()
         } else if name_score >= 500 {
             "High (Prefix Match)".to_string()
-        } else if semantic_sim > 0.25 {
-            "Medium (Semantic Match)".to_string()
         } else if name_score >= 250 {
             "Medium (Contains Match)".to_string()
         } else if name_score >= 100 {
@@ -450,7 +500,7 @@ fn search_symbol_names(
         };
 
         if final_score > 0 {
-            results.push(SearchResult {
+            results.push((SearchResult {
                 path: db.resolve_path(&path),
                 name,
                 kind,
@@ -458,7 +508,8 @@ fn search_symbol_names(
                 confidence,
                 explanation: expl.join(", "),
                 line: None,
-            });
+                matched_symbols: None,
+            }, name_score == 0));
         }
     }
 
@@ -466,8 +517,15 @@ fn search_symbol_names(
     // We group by symbol name to treat ambiguity as a ranking problem.
     let mut groups: std::collections::HashMap<String, Vec<SearchResult>> =
         std::collections::HashMap::new();
-    for res in results.into_iter() {
-        groups.entry(res.name.clone()).or_default().push(res);
+    let mut path_only_groups: std::collections::HashMap<String, Vec<SearchResult>> =
+        std::collections::HashMap::new();
+
+    for (res, is_path_only) in results.into_iter() {
+        if is_path_only {
+            path_only_groups.entry(res.path.clone()).or_default().push(res);
+        } else {
+            groups.entry(res.name.clone()).or_default().push(res);
+        }
     }
 
     let mut resolved_results = Vec::new();
@@ -485,6 +543,31 @@ fn search_symbol_names(
                 res.explanation.push_str(" (Ambiguous duplicate demoted)");
             }
             resolved_results.push(res);
+        }
+    }
+
+    // Process path-only matches. If a file has > 1 path-only symbol matches, roll them up.
+    // If it has 1, just keep it as is.
+    for (path, mut group) in path_only_groups {
+        if group.len() > 1 {
+            // Roll up
+            let max_score = group.iter().map(|r| r.score).max().unwrap_or(0);
+            resolved_results.push(SearchResult {
+                path: path.clone(),
+                name: std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&path)
+                    .to_string(),
+                kind: "file_rollup".to_string(),
+                score: max_score,
+                confidence: "Low (Weak Fuzzy)".to_string(),
+                explanation: "symbols match via path only; use read_file_skeleton".to_string(),
+                line: None,
+                matched_symbols: Some(group.len()),
+            });
+        } else {
+            resolved_results.extend(group);
         }
     }
 
@@ -590,6 +673,7 @@ fn search_symbol_names(
                 confidence,
                 explanation: expl.join(", "),
                 line: None,
+                matched_symbols: None,
             });
         }
     }
@@ -639,19 +723,22 @@ fn search_file_contents(
     query_lower: &str,
     path_scope: Option<&str>,
     whole_word: bool,
-) -> Result<Vec<SearchResult>, rusqlite::Error> {
+    limit: usize,
+) -> Result<(Vec<SearchResult>, bool), rusqlite::Error> {
     let mut results = Vec::new();
+    let mut truncated = false;
     let mut file_stmt = db.conn.prepare("SELECT path FROM files")?;
     let mut file_rows = file_stmt.query([])?;
 
     let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
     if query_tokens.is_empty() {
-        return Ok(results);
+        return Ok((results, truncated));
     }
 
     let mut files_scanned = 0usize;
     while let Some(row) = file_rows.next()? {
-        if files_scanned >= MAX_TEXT_SCAN_FILES || results.len() >= MAX_TEXT_MATCHES {
+        if files_scanned >= MAX_TEXT_SCAN_FILES || results.len() >= limit {
+            truncated = true;
             break;
         }
         let path: String = row.get(0)?;
@@ -676,127 +763,107 @@ fn search_file_contents(
         };
 
         if is_match {
-            let first_token = query_tokens.first().unwrap();
-            let mut preview_line = 1;
-            let mut preview_text = String::new();
             for (idx, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(first_token) {
-                    preview_line = idx + 1;
+                if results.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+                let line_lower = line.to_lowercase();
+                let line_matches = if whole_word {
+                    query_tokens.iter().all(|t| contains_whole_word(&line_lower, t))
+                } else {
+                    query_tokens.iter().all(|t| line_lower.contains(t))
+                };
+                if line_matches {
+                    let preview_line = idx + 1;
                     let trimmed = line.trim();
-                    preview_text = if trimmed.len() > 160 {
+                    let preview_text = if trimmed.len() > 160 {
                         format!("{}...", trimmed.chars().take(160).collect::<String>())
                     } else {
                         trimmed.to_string()
                     };
-                    break;
+                    results.push(SearchResult {
+                        path: abs_path.clone(),
+                        name: preview_text,
+                        kind: "text_match".to_string(),
+                        score: 200,
+                        confidence: "Medium (Content Match)".to_string(),
+                        explanation: format!("Matched literal text in file"),
+                        line: Some(preview_line as i64),
+                        matched_symbols: None,
+                    });
                 }
             }
-            if preview_text.is_empty() {
-                let first_line = content.lines().next().unwrap_or("").trim();
-                preview_text = first_line.chars().take(160).collect();
-            }
-
-            results.push(SearchResult {
-                path: abs_path.clone(),
-                name: preview_text,
-                kind: "text_match".to_string(),
-                score: 200,
-                confidence: "Medium (Content Match)".to_string(),
-                explanation: format!("Matched literal text in file"),
-                line: Some(preview_line as i64),
-            });
         }
     }
 
-    Ok(results)
+    Ok((results, truncated))
 }
 
 pub fn search_symbols(
     db: &Database,
     keyword: &str,
-    semantic_tokens: &[String],
-    query_vector: Option<&[f32]>,
-    llm_used: bool,
     path_scope: Option<&str>,
     mode: SearchMode,
     whole_word: bool,
-    min_confidence: Option<&str>,
-) -> Result<(Vec<SearchResult>, Option<String>), rusqlite::Error> {
+    limit: usize,
+) -> Result<(Vec<SearchResult>, usize, usize, bool, Option<String>), rusqlite::Error> {
     let start_time = Instant::now();
 
     let query_lower = keyword.to_lowercase();
-    let mut query_tokens = deterministic_query_expansion(keyword);
+    let query_tokens = deterministic_query_expansion(keyword);
+    let warning_msg = None;
 
-    if llm_used && query_vector.is_none() {
-        return Ok((
-            Vec::new(),
-            Some("Semantic search unavailable. Workspace indexed without embeddings.".to_string()),
-        ));
-    }
-
-    // Inject the AI-generated semantic synonyms into our token pool
-    for st in semantic_tokens {
-        if !query_tokens.contains(st) {
-            query_tokens.push(st.clone());
-        }
-    }
+    let mut truncated = false;
 
     let mut results = match mode {
         SearchMode::Symbol => {
-            search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?
+            search_symbol_names(db, &query_lower, &query_tokens, path_scope)?
         }
-        SearchMode::Text => search_file_contents(db, &query_lower, path_scope, whole_word)?,
+        SearchMode::Text => {
+            let (r, t) = search_file_contents(db, &query_lower, path_scope, whole_word, limit)?;
+            truncated |= t;
+            r
+        }
         SearchMode::Both => {
             let mut symbol_results =
-                search_symbol_names(db, &query_lower, &query_tokens, path_scope, query_vector)?;
-            if symbol_results.is_empty() {
-                symbol_results.extend(search_file_contents(
-                    db,
-                    &query_lower,
-                    path_scope,
-                    whole_word,
-                )?);
-            }
+                search_symbol_names(db, &query_lower, &query_tokens, path_scope)?;
+            let (text_results, t) = search_file_contents(db, &query_lower, path_scope, whole_word, limit)?;
+            truncated |= t;
+            symbol_results.extend(text_results);
             symbol_results
         }
+        // Embedding retrieval happens above the query crate (semantic::search)
+        // — this engine contributes no lexical results in pure-semantic mode.
+        SearchMode::Semantic => Vec::new(),
     };
 
-    let pre_filter_count = results.len();
-    let required_level = min_confidence_level(min_confidence);
-    if required_level > 0 {
-        results.retain(|r| confidence_level(&r.confidence) >= required_level);
-    }
-    let filtered_out_by_confidence =
-        required_level > 0 && results.is_empty() && pre_filter_count > 0;
-
     results.sort_by(|a, b| b.score.cmp(&a.score));
-    results.truncate(50);
+    
+    let total_occurrences = results.len();
+    let mut files = std::collections::HashSet::new();
+    for r in &results {
+        files.insert(r.path.clone());
+    }
+    let files_matched = files.len();
+    
+    if total_occurrences > limit {
+        truncated = true;
+    }
+    results.truncate(limit);
 
     // Sprint 6: Search Analytics
     let latency_ms = start_time.elapsed().as_millis() as i64;
     let result_count = results.len() as i64;
     let top_result = results.first().map(|r| r.name.clone());
-    let fallback_used = !llm_used;
-    let search_mode_label = if llm_used {
-        "semantic_boost"
-    } else {
-        "deterministic"
-    };
 
     let _ = db.conn.execute(
         "INSERT INTO search_events (query, result_count, latency_ms, fallback_used, llm_used, top_result, search_mode)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![keyword, result_count, latency_ms, fallback_used, llm_used, top_result, search_mode_label]
+        params![keyword, result_count, latency_ms, true, false, top_result, "deterministic"]
     );
 
-    let reason = if filtered_out_by_confidence {
-        Some(format!(
-            "Found {} match(es) for \"{}\" but none met min_confidence: \"{}\". Lower min_confidence or omit it to see them.",
-            pre_filter_count,
-            keyword,
-            min_confidence.unwrap_or("")
-        ))
-    } else if results.is_empty() {
+    let reason = if results.is_empty() {
         let scoped_symbol_count: i64 = if let Some(scope) = path_scope {
             let pattern = format!("%{}%", scope);
             db.conn.query_row(
@@ -813,6 +880,7 @@ pub fn search_symbols(
             SearchMode::Symbol => " Try mode: \"text\" or \"both\" to also search file content/string literals, not just symbol names.".to_string(),
             SearchMode::Text => " Try mode: \"symbol\" or \"both\" to also search indexed symbol names.".to_string(),
             SearchMode::Both => String::new(),
+            SearchMode::Semantic => " Semantic retrieval found nothing; try mode: \"both\" to fuse with keyword search.".to_string(),
         };
         let whole_word_hint = if whole_word {
             " whole_word: true is on — if you meant a substring match (e.g. inside a longer identifier), retry with whole_word: false."
@@ -826,6 +894,7 @@ pub fn search_symbols(
                 SearchMode::Symbol => "symbol",
                 SearchMode::Text => "text",
                 SearchMode::Both => "both",
+                SearchMode::Semantic => "semantic",
             },
             scoped_symbol_count,
             mode_hint,
@@ -834,8 +903,7 @@ pub fn search_symbols(
     } else {
         None
     };
-
-    Ok((results, reason))
+    Ok((results, total_occurrences, files_matched, truncated, reason.or(warning_msg)))
 }
 
 pub fn find_symbol_exact(
@@ -1050,139 +1118,6 @@ pub fn build_project_overview_scoped(
 }
 
 #[cfg(test)]
-mod min_confidence_tests {
-    use super::*;
-
-    fn setup_fixture() -> Database {
-        let db = Database::new(":memory:").unwrap();
-        db.init_schema().unwrap();
-
-        // "room" matches its own name exactly -> High (Exact Match).
-        // "ChatRoom" contains "room" but doesn't start with it -> Medium (Contains Match).
-        // "roof" is a 1-edit-distance fuzzy match with no substring overlap -> Low (Fuzzy Match).
-        let file_id = db.insert_file("components.ts", "fixturehash").unwrap();
-        for name in ["room", "ChatRoom", "roof"] {
-            db.insert_symbol(
-                file_id,
-                &graph::SymbolNode {
-                    name: name.to_string(),
-                    kind: "function".to_string(),
-                    start_line: 1,
-                    end_line: 1,
-                    start_byte: 0,
-                    end_byte: 0,
-                    signature: None,
-                    attributes: Vec::new(),
-                    metadata: None,
-                },
-            )
-            .unwrap();
-        }
-        db
-    }
-
-    #[test]
-    fn confidence_level_maps_known_prefixes() {
-        assert_eq!(confidence_level("High (Exact Match)"), 3);
-        assert_eq!(confidence_level("Medium (Contains Match)"), 2);
-        assert_eq!(confidence_level("Low (Fuzzy Match)"), 1);
-        // Unrecognized strings (e.g. "File Path Match") classify as Low
-        // rather than being silently excluded from every filter tier.
-        assert_eq!(confidence_level("File Path Match"), 1);
-    }
-
-    #[test]
-    fn min_confidence_level_parses_known_tiers_case_insensitively() {
-        assert_eq!(min_confidence_level(Some("high")), 3);
-        assert_eq!(min_confidence_level(Some("HIGH")), 3);
-        assert_eq!(min_confidence_level(Some("medium")), 2);
-        assert_eq!(min_confidence_level(Some("low")), 1);
-        assert_eq!(min_confidence_level(None), 0);
-        assert_eq!(min_confidence_level(Some("garbage")), 0);
-    }
-
-    #[test]
-    fn default_search_returns_all_confidence_tiers_unfiltered() {
-        let db = setup_fixture();
-        let (results, _) = search_symbols(
-            &db,
-            "room",
-            &[],
-            None,
-            false,
-            None,
-            SearchMode::Symbol,
-            false,
-            None,
-        )
-        .unwrap();
-        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert!(names.contains(&"room"));
-        assert!(names.contains(&"ChatRoom"));
-        assert!(
-            names.contains(&"roof"),
-            "default (no min_confidence) must not drop any tier, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn min_confidence_high_drops_medium_and_low_noise() {
-        let db = setup_fixture();
-        let (results, _) = search_symbols(
-            &db,
-            "room",
-            &[],
-            None,
-            false,
-            None,
-            SearchMode::Symbol,
-            false,
-            Some("high"),
-        )
-        .unwrap();
-        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["room"],
-            "min_confidence: \"high\" must keep only the exact match"
-        );
-    }
-
-    #[test]
-    fn min_confidence_filtering_does_not_change_result_count_when_unset() {
-        let db = setup_fixture();
-        let (unfiltered, _) = search_symbols(
-            &db,
-            "room",
-            &[],
-            None,
-            false,
-            None,
-            SearchMode::Symbol,
-            false,
-            None,
-        )
-        .unwrap();
-        let (explicit_low, _) = search_symbols(
-            &db,
-            "room",
-            &[],
-            None,
-            false,
-            None,
-            SearchMode::Symbol,
-            false,
-            Some("low"),
-        )
-        .unwrap();
-        assert_eq!(
-            unfiltered.len(),
-            explicit_low.len(),
-            "every tier here is >= Low, so min_confidence: \"low\" should be a no-op"
-        );
-    }
-}
 
 #[cfg(test)]
 mod find_symbol_tests {
@@ -1230,5 +1165,67 @@ mod find_symbol_tests {
             .copied()
             .collect();
         assert_eq!(exact, vec!["GET"], "only GET is an exact match");
+    }
+}
+
+#[cfg(test)]
+mod rrf_fuse_tests {
+    use super::*;
+
+    fn result(name: &str, confidence: &str) -> SearchResult {
+        SearchResult {
+            path: format!("./src/{}.ts", name),
+            name: name.to_string(),
+            kind: "function".to_string(),
+            score: 0,
+            confidence: confidence.to_string(),
+            explanation: String::new(),
+            line: Some(1),
+            matched_symbols: None,
+        }
+    }
+
+    #[test]
+    fn top_of_both_lists_beats_top_of_one() {
+        let lexical = vec![result("shared", "Medium (Token Match)"), result("lex_only", "Medium (Token Match)")];
+        let semantic = vec![result("shared", "Semantic (cosine 0.91)"), result("sem_only", "Semantic (cosine 0.80)")];
+        let fused = rrf_fuse(vec![lexical, semantic], 10);
+        assert_eq!(fused[0].name, "shared", "a hit ranked #1 by both legs must fuse above single-leg hits");
+        // 2/(k+1) vs 1/(k+2): both-legs rank-1 strictly beats any single-leg hit.
+        assert!(fused[0].score > fused[1].score);
+    }
+
+    #[test]
+    fn exact_lexical_outranks_semantic_at_equal_fused_score() {
+        // Same rank (1) in each leg -> identical fused score; the exact
+        // lexical hit must still come first.
+        let lexical = vec![result("exactHit", "High (Exact Match)")];
+        let semantic = vec![result("similarHit", "Semantic (cosine 0.95)")];
+        let fused = rrf_fuse(vec![lexical, semantic], 10);
+        assert_eq!(fused[0].name, "exactHit");
+        assert_eq!(fused[1].name, "similarHit");
+        assert_eq!(fused[0].score, fused[1].score, "test premise: scores tie");
+    }
+
+    #[test]
+    fn merged_duplicate_keeps_exact_label_from_either_leg() {
+        // Semantic leg lists it first; lexical leg (with the exact label)
+        // second. The merged result must still be recognizably exact.
+        let semantic = vec![result("timeAgo", "Semantic (cosine 0.88)")];
+        let lexical = vec![result("timeAgo", "High (Exact Match)")];
+        let fused = rrf_fuse(vec![semantic, lexical], 10);
+        assert_eq!(fused.len(), 1);
+        assert!(fused[0].confidence.starts_with("High (Exact"));
+    }
+
+    #[test]
+    fn respects_limit_and_orders_by_rank() {
+        let lexical: Vec<SearchResult> =
+            (0..5).map(|i| result(&format!("lex{}", i), "Medium (Token Match)")).collect();
+        let fused = rrf_fuse(vec![lexical, Vec::new()], 3);
+        assert_eq!(fused.len(), 3);
+        assert_eq!(fused[0].name, "lex0");
+        assert_eq!(fused[1].name, "lex1");
+        assert_eq!(fused[2].name, "lex2");
     }
 }

@@ -63,20 +63,26 @@ pub const INIT_SQL: &str = "
         FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
     );
 
-    -- Embedding-based semantic search. One row per symbol, keyed by
-    -- symbol_id so it's trivial to tell which symbols still need (re-)embedding
-    -- (LEFT JOIN symbols -> symbol_embeddings WHERE embedding IS NULL) after an
-    -- incremental reindex inserts new symbols with new ids. `embedding` is a
-    -- flat little-endian f32 BLOB (see storage::embedding_to_blob/blob_to_embedding)
-    -- rather than a JSON array, to keep a ~300-symbol repo's embedding table
-    -- small and avoid float-formatting precision loss on every read.
-    CREATE TABLE IF NOT EXISTS symbol_embeddings (
-        symbol_id INTEGER PRIMARY KEY,
-        embedding BLOB NOT NULL,
-        model TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    -- Embedding-based semantic search. Keyed by (symbol_id, model_id) so
+    -- switching embedding models invalidates old vectors instead of silently
+    -- mixing two models' vectors in one similarity comparison. `body_hash`
+    -- is a hash of the exact card text that was embedded, so a reindex can
+    -- skip re-embedding symbols whose content didn't change (symbol ids are
+    -- NOT stable across a full rebuild — the hash is the stable identity).
+    -- `vector` is a flat little-endian f32 BLOB (see
+    -- storage::embedding_to_blob/blob_to_embedding) rather than a JSON array,
+    -- to keep the table compact and avoid float-formatting precision loss.
+    CREATE TABLE IF NOT EXISTS embeddings (
+        symbol_id  INTEGER NOT NULL,
+        model_id   TEXT    NOT NULL,
+        dims       INTEGER NOT NULL,
+        vector     BLOB    NOT NULL,
+        body_hash  TEXT    NOT NULL,
+        PRIMARY KEY (symbol_id, model_id),
         FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
     );
+
+    CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model_id);
 
     CREATE TABLE IF NOT EXISTS symbol_features (
         symbol_id INTEGER PRIMARY KEY,

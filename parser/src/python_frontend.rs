@@ -316,7 +316,7 @@ fn extract_py_imports(
                 } else if *capture_kind == "global_ref" {
                     // `global x` inside a function body explicitly declares that
                     // the function reads/writes the module-level variable `x`.
-                    // This is real coupling that impact_analysis must count —
+                    // This is real coupling that get_context must count —
                     // functions sharing globals are coupled even with no call edges.
                     let name = text.trim().to_string();
                     if !crate::utils::is_noisy_call_name(&name) {

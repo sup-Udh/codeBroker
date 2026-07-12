@@ -7,9 +7,9 @@ use storage::Database;
 /// `stale: true`.
 ///
 /// Before this existed, editing a file and then immediately calling
-/// `impact_analysis`/`get_context`/`get_edit_context` on a symbol in it
+/// `get_context`/`get_context`/`get_edit_context` on a symbol in it
 /// produced a `stale: true` flag the caller had to notice and act on by
-/// separately calling `reindex_workspace` — easy to miss, and `impact_analysis`
+/// separately calling `reindex_workspace` — easy to miss, and `get_context`
 /// in particular used to serve the (possibly fan-out-corrupted) stale data
 /// anyway rather than refusing. This makes the common "edit, then
 /// immediately ask about it" workflow correct by default instead of relying

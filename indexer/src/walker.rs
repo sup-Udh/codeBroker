@@ -25,6 +25,7 @@ pub fn collect_files(root_dir: &str) -> Vec<String> {
     let _ = overrides.add("!**/.vexp_backup/**");
 
     let mut builder = WalkBuilder::new(root_dir);
+    builder.add_custom_ignore_filename(".codebrokerignore");
     if let Ok(ov) = overrides.build() {
         builder.overrides(ov);
     }

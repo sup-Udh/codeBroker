@@ -279,15 +279,28 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_reverse_dependencies(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
+            let non_call_edges = &[
+                "imports",
+                "interaction",
+                "component_use",
+                "type_ref",
+                "global_ref",
+                "new_call",
+                "extends",
+                "implements",
+                "inherits",
+                "instantiates",
+                "re_export",
+            ];
             let mut deps = crate::graph::get_incoming_edges(
                 self.db,
                 id,
-                Some(crate::graph::CANONICAL_DEPENDENCY_EDGES),
+                Some(non_call_edges),
             )?;
             deps.extend(crate::graph::get_incoming_edges_min_confidence(
                 self.db,
                 id,
-                crate::graph::RECEIVER_RESOLVED_EDGES,
+                &["MEMBER_ACCESS"],
                 crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
             )?);
             deps.sort();
@@ -352,15 +365,28 @@ impl<'a> ContextResponseBuilder<'a> {
 
     pub fn fetch_forward_dependencies(&self) -> Result<Vec<String>> {
         if let Some(id) = self.symbol_id {
+            let non_call_edges = &[
+                "imports",
+                "interaction",
+                "component_use",
+                "type_ref",
+                "global_ref",
+                "new_call",
+                "extends",
+                "implements",
+                "inherits",
+                "instantiates",
+                "re_export",
+            ];
             let mut deps = crate::graph::get_outgoing_edges(
                 self.db,
                 id,
-                Some(crate::graph::CANONICAL_DEPENDENCY_EDGES),
+                Some(non_call_edges),
             )?;
             deps.extend(crate::graph::get_outgoing_edges_min_confidence(
                 self.db,
                 id,
-                crate::graph::RECEIVER_RESOLVED_EDGES,
+                &["MEMBER_ACCESS"],
                 crate::graph::MIN_CONFIDENCE_FOR_RECEIVER_EDGES,
             )?);
             deps.sort();
@@ -767,11 +793,11 @@ mod tests {
                 .unwrap();
 
         assert!(
-            context
+            !context
                 .fetch_reverse_dependencies()
                 .unwrap()
                 .contains(&"GET".to_string()),
-            "reverse_dependencies now uses canonical edges, so it includes same-file calls"
+            "reverse_dependencies no longer includes calls, so it should not include same-file calls"
         );
         assert_eq!(
             context.fetch_same_file_callers().unwrap(),

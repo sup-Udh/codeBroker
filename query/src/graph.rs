@@ -623,7 +623,7 @@ fn find_suggested_connector(db: &Database, from_id: i64) -> Option<SuggestedConn
 /// resolves to an indexed route/endpoint handler — turning
 /// `find_suggested_connector`'s query-time-only heuristic into first-class
 /// graph data so `explore_graph`/`graph_subtree`/`dependency_cycles`/
-/// `impact_analysis` see the relationship too, not just `shortest_path`.
+/// `get_context` see the relationship too, not just `shortest_path`.
 /// Call once per (re)index, after all static edges for the workspace have
 /// been inserted. Returns the number of `fetch -> route` matches detected
 /// this pass (each is dedup-checked against existing rows by
@@ -1187,13 +1187,21 @@ pub struct DependencyCycle {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ExclusionReason {
+    pub count: usize,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DependencyCyclesResponse {
     pub cycles_found: usize,
     pub cross_file_cycles_found: usize,
     pub same_file_cycles_found: usize,
     pub cycles_returned: usize,
     pub truncated: bool,
+    pub graph_nodes_total: usize,
     pub nodes_scanned: usize,
+    pub nodes_excluded: ExclusionReason,
     pub edges_scanned: usize,
     pub cycles: Vec<DependencyCycle>,
     /// Up to 3 representative same-file cycles, always populated when
@@ -1214,41 +1222,87 @@ pub fn dependency_cycles(
     const MAX_NODES_PER_CYCLE: usize = 40;
 
     let mut adj: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
-    // Build a true symbol->symbol graph from edges attributed to their source
-    // symbol. The previous query joined `symbols.file_id = edges.source_file_id`,
-    // which made EVERY symbol in a file the source of EVERY edge leaving that
-    // file — a cartesian product that manufactured same-file "cycles" (a file
-    // with k symbols and e edges produced up to k*e fake adjacencies). Using
-    // source_symbol_id collapses each edge to exactly one source symbol.
-    // Edges with a NULL source_symbol_id (top-level imports, or any DB indexed
-    // before this column existed) are excluded — they can't be placed at symbol
-    // granularity, and including them is precisely what produced the noise.
-    let mut stmt = db.conn.prepare(
-        "SELECT edges.source_symbol_id, edges.target_symbol_id, files.path
-         FROM edges
-         JOIN symbols ON edges.source_symbol_id = symbols.id
-         JOIN files ON symbols.file_id = files.id
-         WHERE edges.source_symbol_id IS NOT NULL",
-    )?;
 
-    let mut rows = stmt.query([])?;
-    let mut edges_scanned = 0;
-    while let Some(row) = rows.next()? {
-        let source_id: i64 = row.get(0)?;
-        let target_id: i64 = row.get(1)?;
-        let path: String = row.get(2)?;
+    let mut all_nodes = Vec::new();
+    let mut file_paths = std::collections::HashMap::new();
+    let mut symbol_to_file = std::collections::HashMap::new();
+
+    // 1. Get all files
+    let mut file_stmt = db.conn.prepare("SELECT id, path FROM files")?;
+    let mut file_rows = file_stmt.query([])?;
+    while let Some(row) = file_rows.next()? {
+        let id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
         if let Some(scope) = path_scope {
             if !crate::path_matches_scope(&path, scope) {
                 continue;
             }
         }
-        // A symbol referencing itself (direct recursion, or a recursive type
-        // referencing its own name) is not a dependency cycle in the sense
-        // callers care about; drop these self-edges so they don't register as
-        // length-1 cycles.
+        all_nodes.push(-id);
+        file_paths.insert(-id, path);
+    }
+
+    // 2. Get all symbols
+    let mut sym_stmt = db.conn.prepare(
+        "SELECT symbols.id, files.path, symbols.file_id 
+         FROM symbols 
+         JOIN files ON symbols.file_id = files.id"
+    )?;
+    let mut sym_rows = sym_stmt.query([])?;
+    while let Some(row) = sym_rows.next()? {
+        let id: i64 = row.get(0)?;
+        let path: String = row.get(1)?;
+        let file_id: i64 = row.get(2)?;
+        if let Some(scope) = path_scope {
+            if !crate::path_matches_scope(&path, scope) {
+                continue;
+            }
+        }
+        all_nodes.push(id);
+        symbol_to_file.insert(id, -file_id);
+    }
+
+    let graph_nodes_total = all_nodes.len();
+
+    // 3. Add implicit symbol -> file edges to unify file-level cycles
+    for (sym_id, file_node_id) in &symbol_to_file {
+        if *sym_id != *file_node_id {
+            adj.entry(*sym_id).or_default().push(*file_node_id);
+        }
+    }
+
+    // 4. Gather edges
+    let mut edge_stmt = db.conn.prepare(
+        "SELECT IFNULL(edges.source_symbol_id, -edges.source_file_id), edges.target_symbol_id, files.path
+         FROM edges
+         JOIN files ON edges.source_file_id = files.id"
+    )?;
+    let mut edge_rows = edge_stmt.query([])?;
+    let mut edges_scanned = 0;
+    while let Some(row) = edge_rows.next()? {
+        let source_id: i64 = row.get(0)?;
+        let target_id: i64 = row.get(1)?;
+        let path: String = row.get(2)?;
+        
+        if let Some(scope) = path_scope {
+            if !crate::path_matches_scope(&path, scope) {
+                continue;
+            }
+        }
+        
+        if !symbol_to_file.contains_key(&target_id) {
+            continue; // Target out of scope
+        }
+
         if source_id == target_id {
             continue;
         }
+        
+        // Exclude containment edges: a file depending on a symbol it contains
+        if source_id < 0 && symbol_to_file.get(&target_id) == Some(&source_id) {
+            continue;
+        }
+
         adj.entry(source_id).or_default().push(target_id);
         edges_scanned += 1;
     }
@@ -1260,7 +1314,7 @@ pub fn dependency_cycles(
     let mut unique_cycles: HashSet<Vec<i64>> = HashSet::new();
     let mut truncated = false;
 
-    let all_nodes: Vec<i64> = adj.keys().copied().collect();
+    // `all_nodes` is already constructed to contain all files and symbols in scope.
 
     struct DfsState<'a> {
         adj: &'a std::collections::HashMap<i64, Vec<i64>>,
@@ -1350,7 +1404,16 @@ pub fn dependency_cycles(
     for cycle_ids in unique_cycles.into_iter() {
         let mut cycle_nodes = Vec::new();
         for &id in cycle_ids.iter().take(MAX_NODES_PER_CYCLE) {
-            if let Ok((name, kind, path)) = sym_stmt.query_row(rusqlite::params![id], |r| {
+            if id < 0 {
+                if let Some(path) = file_paths.get(&id) {
+                    let name = format!("[File: {}]", std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy());
+                    cycle_nodes.push(CycleNode {
+                        name,
+                        kind: "file".to_string(),
+                        file_path: path.clone(),
+                    });
+                }
+            } else if let Ok((name, kind, path)) = sym_stmt.query_row(rusqlite::params![id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -1400,13 +1463,25 @@ pub fn dependency_cycles(
 
     let cycles: Vec<DependencyCycle> = ordered.into_iter().take(return_limit).collect();
 
+    let nodes_excluded_count = graph_nodes_total.saturating_sub(nodes_scanned);
+    let reason = if truncated {
+        Some("Hit cycle limit (MAX_CYCLES)".to_string())
+    } else {
+        None
+    };
+
     Ok(DependencyCyclesResponse {
         cycles_found,
         cross_file_cycles_found,
         same_file_cycles_found,
         cycles_returned: cycles.len(),
         truncated: truncated || considered_total > cycles.len(),
+        graph_nodes_total,
         nodes_scanned,
+        nodes_excluded: ExclusionReason {
+            count: nodes_excluded_count,
+            reason,
+        },
         edges_scanned,
         cycles,
         same_file_examples,

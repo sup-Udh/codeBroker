@@ -204,8 +204,8 @@ fn fixture_symbol(name: &str, kind: &str, start_line: usize, end_line: usize) ->
         kind: kind.to_string(),
         start_line,
         end_line,
-        start_byte: 0,
-        end_byte: 0,
+        start_byte: start_line * 10,
+        end_byte: end_line * 10,
         signature: None,
         attributes: Vec::new(),
         metadata: None,
@@ -235,14 +235,14 @@ fn symbol_id_threading_prevents_same_name_divergence() {
     assert_ne!(first_id, second_id);
 
     // Without a line hint, this is genuinely ambiguous.
-    let ambiguous = resolver::resolve_symbol(&db, "config", Some("dup.ts"), None, None);
+    let ambiguous = resolver::resolve_symbol(&db, "config", Some("dup.ts"), None);
     assert!(
         ambiguous.is_ambiguous(),
         "two same-named symbols in one file must be ambiguous without a line hint"
     );
 
     // A line hint at the second definition resolves it deterministically.
-    let resolved = resolver::resolve_symbol(&db, "config", Some("dup.ts"), None, Some(21));
+    let resolved = resolver::resolve_symbol(&db, "config", Some("dup.ts"), Some(21));
     let resolved = match resolved {
         resolver::ResolvedEntity::Symbol(s) => s,
         other => panic!(
@@ -410,9 +410,9 @@ fn subsystem_alias_canonicalization_converges_on_the_same_subsystem() {
     db.insert_symbol(file_id, &fixture_symbol("auth", "function", 1, 5))
         .unwrap();
 
-    let via_canonical = resolver::resolve_subsystem(&db, "auth", &[], None);
-    let via_alias = resolver::resolve_subsystem(&db, "authentication", &[], None);
-    let via_case_variant = resolver::resolve_subsystem(&db, "AUTH", &[], None);
+    let via_canonical = resolver::resolve_subsystem(&db, "auth");
+    let via_alias = resolver::resolve_subsystem(&db, "authentication");
+    let via_case_variant = resolver::resolve_subsystem(&db, "AUTH");
 
     let (resolver::ResolvedEntity::Subsystem(canonical), resolver::ResolvedEntity::Subsystem(alias), resolver::ResolvedEntity::Subsystem(case_variant)) =
         (via_canonical, via_alias, via_case_variant)
@@ -436,8 +436,8 @@ fn subsystem_alias_canonicalization_converges_on_the_same_subsystem() {
     let raw_alias_lookup = query::subsystem::discover_subsystem(
         &db,
         "authentication",
-        &[],
-        None,
+ 
+
         query::subsystem::TraversalScope::Expanded,
     )
     .unwrap();
@@ -487,24 +487,24 @@ fn traversal_scope_controls_expansion_breadth() {
     let strict = query::subsystem::discover_subsystem(
         &db,
         "auth",
-        &[],
-        None,
+ 
+
         query::subsystem::TraversalScope::Strict,
     )
     .unwrap();
     let expanded = query::subsystem::discover_subsystem(
         &db,
         "auth",
-        &[],
-        None,
+ 
+
         query::subsystem::TraversalScope::Expanded,
     )
     .unwrap();
     let full = query::subsystem::discover_subsystem(
         &db,
         "auth",
-        &[],
-        None,
+ 
+
         query::subsystem::TraversalScope::Full,
     )
     .unwrap();
@@ -571,8 +571,8 @@ fn subsystem_discovery_truncates_past_the_hard_cap_instead_of_dumping_everything
     let stats = query::subsystem::discover_subsystem(
         &db,
         "auth",
-        &[],
-        None,
+ 
+
         query::subsystem::TraversalScope::Expanded,
     )
     .unwrap();
@@ -676,7 +676,7 @@ fn find_duplicate_logic_detects_renamed_and_same_file_duplicates_with_default_th
     // makes with no arguments.
     let default_min_length = 15;
     let report =
-        query::duplicates::find_duplicate_logic(&db, default_min_length, None).unwrap();
+        query::duplicates::find_duplicate_logic(&db, default_min_length, None, None).unwrap();
 
     let names_in_group = |group: &query::duplicates::DuplicateGroup| -> Vec<String> {
         let mut names: Vec<String> = group.members.iter().map(|m| m.symbol_name.clone()).collect();
