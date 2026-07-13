@@ -545,11 +545,44 @@ fn main() {
                     Ok(db) => {
                         match semantic::embedder::embedder_from_config(&embeddings_config)
                             .and_then(|embedder| {
+                                let mut pb: Option<indicatif::ProgressBar> = None;
+                                let mut t0 = std::time::Instant::now();
                                 semantic::embeddings::backfill_embeddings(
                                     &db,
                                     embedder.as_ref(),
                                     None,
                                     Some(&embedding_reuse),
+                                    Some(&mut |embedded: usize, total: usize| {
+                                        if pb.is_none() {
+                                            use indicatif::{ProgressBar, ProgressStyle};
+                                            let spinner_style = ProgressStyle::with_template(
+                                                "  🔴 {spinner:.red}  {wide_msg}",
+                                            ).unwrap().tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏",""]);
+                                            let p = ProgressBar::new_spinner();
+                                            p.set_style(spinner_style);
+                                            p.enable_steady_tick(std::time::Duration::from_millis(80));
+                                            pb = Some(p);
+                                            t0 = std::time::Instant::now();
+                                        }
+                                        if let Some(p) = &pb {
+                                            let eta_str = if embedded > 1 {
+                                                let rate = embedded as f64 / t0.elapsed().as_secs_f64().max(0.001);
+                                                let rem = total.saturating_sub(embedded);
+                                                let secs = (rem as f64 / rate).ceil() as u64;
+                                                if secs < 60 { format!("~{}s left", secs) }
+                                                else { format!("~{}m {}s left", secs / 60, secs % 60) }
+                                            } else {
+                                                "calculating…".to_string()
+                                            };
+                                            p.set_message(format!(
+                                                "Embedding  —  {}/{} symbols  ·  {}",
+                                                embedded, total, eta_str
+                                            ));
+                                            if embedded >= total {
+                                                p.finish_and_clear();
+                                            }
+                                        }
+                                    }),
                                 )
                             }) {
                             Ok(stats) => {
@@ -1125,6 +1158,7 @@ fn main() {
                                 &db,
                                 embedder.as_ref(),
                                 Some(&stats.touched_symbol_ids),
+                                None,
                                 None,
                             )
                         }) {

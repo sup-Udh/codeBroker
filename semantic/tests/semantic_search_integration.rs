@@ -111,7 +111,7 @@ fn conceptual_query_finds_relative_time_symbol_keyword_search_misses() {
         Ok(e) => e,
         Err(e) => panic!("default local embedder must construct: {}", e),
     };
-    let stats = match semantic::embeddings::backfill_embeddings(&db, embedder.as_ref(), None, None)
+    let stats = match semantic::embeddings::backfill_embeddings(&db, embedder.as_ref(), None, None, None)
     {
         Ok(s) => s,
         Err(e) => {

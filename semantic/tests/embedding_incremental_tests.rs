@@ -86,7 +86,7 @@ fn unchanged_symbols_are_skipped_by_body_hash() {
     fx.reindex(&["lib/timeFormat.ts", "pages/dashboard.ts"]);
 
     let mock = MockEmbedder::new();
-    let first = backfill_embeddings(&fx.db, &mock, None, None).unwrap();
+    let first = backfill_embeddings(&fx.db, &mock, None, None, None).unwrap();
     let total_symbols = fx.symbol_count() as usize;
     assert!(total_symbols >= 3, "fixture should index timeAgo/formatDate/render");
     assert_eq!(first.embedded, total_symbols, "first pass embeds everything");
@@ -95,7 +95,7 @@ fn unchanged_symbols_are_skipped_by_body_hash() {
     // Second pass over identical content: body hashes all match — the
     // embedder must not be called for a single text.
     let embedded_before = mock.texts_embedded.load(Ordering::SeqCst);
-    let second = backfill_embeddings(&fx.db, &mock, None, None).unwrap();
+    let second = backfill_embeddings(&fx.db, &mock, None, None, None).unwrap();
     assert_eq!(second.embedded, 0);
     assert_eq!(second.skipped_unchanged, total_symbols);
     assert_eq!(
@@ -113,7 +113,7 @@ fn editing_one_file_reembeds_only_its_symbols() {
     fx.reindex(&["lib/timeFormat.ts", "pages/dashboard.ts"]);
 
     let mock = MockEmbedder::new();
-    backfill_embeddings(&fx.db, &mock, None, None).unwrap();
+    backfill_embeddings(&fx.db, &mock, None, None, None).unwrap();
 
     // Edit ONLY timeFormat.ts (change timeAgo's body, keep formatDate as-is)
     // and incrementally reindex just that file, mirroring the CLI's
@@ -128,7 +128,7 @@ fn editing_one_file_reembeds_only_its_symbols() {
     assert!(!stats.touched_symbol_ids.is_empty());
 
     let embedded_before = mock.texts_embedded.load(Ordering::SeqCst);
-    let pass = backfill_embeddings(&fx.db, &mock, Some(&stats.touched_symbol_ids), None).unwrap();
+    let pass = backfill_embeddings(&fx.db, &mock, Some(&stats.touched_symbol_ids), None, None).unwrap();
 
     // timeAgo's card changed -> re-embedded. formatDate was re-inserted with
     // a new id by the reindex (so it lost its old vector and must be written
@@ -165,7 +165,7 @@ fn removed_symbols_vectors_are_deleted() {
     fx.reindex(&["lib/timeFormat.ts"]);
 
     let mock = MockEmbedder::new();
-    backfill_embeddings(&fx.db, &mock, None, None).unwrap();
+    backfill_embeddings(&fx.db, &mock, None, None, None).unwrap();
     let initial = fx.embedding_count();
     assert!(initial >= 2, "both timeAgo and formatDate embedded");
 
@@ -177,7 +177,7 @@ fn removed_symbols_vectors_are_deleted() {
          export function timeAgo(d) {\n  return d;\n}\n",
     );
     let stats = fx.reindex(&["lib/timeFormat.ts"]);
-    backfill_embeddings(&fx.db, &mock, Some(&stats.touched_symbol_ids), None).unwrap();
+    backfill_embeddings(&fx.db, &mock, Some(&stats.touched_symbol_ids), None, None).unwrap();
 
     assert_eq!(fx.orphan_embedding_count(), 0, "no vectors for deleted symbol ids");
     let format_date_rows: i64 = fx
@@ -201,7 +201,7 @@ fn body_hash_reuse_cache_avoids_model_calls_across_rebuilds() {
     fx.reindex(&["lib/timeFormat.ts"]);
 
     let mock = MockEmbedder::new();
-    backfill_embeddings(&fx.db, &mock, None, None).unwrap();
+    backfill_embeddings(&fx.db, &mock, None, None, None).unwrap();
     let reuse: std::collections::HashMap<String, Vec<u8>> = fx
         .db
         .embeddings_by_body_hash(MOCK_MODEL_ID)
@@ -215,7 +215,7 @@ fn body_hash_reuse_cache_avoids_model_calls_across_rebuilds() {
     fx.db.conn.execute("DELETE FROM embeddings", []).unwrap();
 
     let embedded_before = mock.texts_embedded.load(Ordering::SeqCst);
-    let pass = backfill_embeddings(&fx.db, &mock, None, Some(&reuse)).unwrap();
+    let pass = backfill_embeddings(&fx.db, &mock, None, Some(&reuse), None).unwrap();
     assert_eq!(pass.embedded, 0, "identical content must be served from the reuse cache");
     assert_eq!(pass.reused as i64, fx.symbol_count());
     assert_eq!(

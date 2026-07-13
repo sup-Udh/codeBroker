@@ -50,6 +50,7 @@ pub fn backfill_embeddings(
     embedder: &dyn Embedder,
     only_symbol_ids: Option<&[i64]>,
     reuse: Option<&HashMap<String, Vec<u8>>>,
+    mut progress_callback: Option<&mut dyn FnMut(usize, usize)>,
 ) -> Result<BackfillStats, String> {
     let model_id = embedder.model_id().to_string();
     let mut candidates = db.embedding_candidates(&model_id).map_err(|e| e.to_string())?;
@@ -107,6 +108,13 @@ pub fn backfill_embeddings(
     // Embed everything BEFORE opening the write transaction: a transaction
     // held across model inference (or worse, API round-trips) would block
     // every other writer on this database for its whole duration.
+    let total_to_embed = to_embed.len();
+    if total_to_embed > 0 {
+        if let Some(cb) = &mut progress_callback {
+            cb(0, total_to_embed);
+        }
+    }
+    let mut processed = 0;
     for chunk in to_embed.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<String> = chunk.iter().map(|(_, _, card)| card.clone()).collect();
         match embedder.embed(&texts) {
@@ -130,6 +138,10 @@ pub fn backfill_embeddings(
                 // Keep going: later batches may succeed, and failed symbols
                 // are retried by the next backfill via their missing rows.
             }
+        }
+        processed += chunk.len();
+        if let Some(cb) = &mut progress_callback {
+            cb(processed, total_to_embed);
         }
     }
 
