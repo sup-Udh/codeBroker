@@ -48,13 +48,40 @@ echo "Successfully installed $EXE_NAME and $MCP_EXE_NAME to $BIN_DIR"
 
 # Check if it's in PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    EXPORT_LINE="export PATH=\"\$PATH:\$HOME/.codebroker/bin\""
     echo ""
     echo "=========================================================="
-    echo "Please add $BIN_DIR to your PATH."
-    echo "For bash, add this to your ~/.bashrc or ~/.bash_profile:"
-    echo "  export PATH=\"\$PATH:$BIN_DIR\""
-    echo "For zsh, add this to your ~/.zshrc:"
-    echo "  export PATH=\"\$PATH:$BIN_DIR\""
+    
+    ADDED_TO_PROFILE=false
+    
+    if [ -f "$HOME/.bashrc" ]; then
+        if ! grep -q "\.codebroker/bin" "$HOME/.bashrc"; then
+            echo "" >> "$HOME/.bashrc"
+            echo "# codebroker path" >> "$HOME/.bashrc"
+            echo "$EXPORT_LINE" >> "$HOME/.bashrc"
+            echo "Added codebroker to PATH in ~/.bashrc"
+            ADDED_TO_PROFILE=true
+        fi
+    fi
+    
+    if [ -f "$HOME/.zshrc" ]; then
+        if ! grep -q "\.codebroker/bin" "$HOME/.zshrc"; then
+            echo "" >> "$HOME/.zshrc"
+            echo "# codebroker path" >> "$HOME/.zshrc"
+            echo "$EXPORT_LINE" >> "$HOME/.zshrc"
+            echo "Added codebroker to PATH in ~/.zshrc"
+            ADDED_TO_PROFILE=true
+        fi
+    fi
+    
+    if [ "$ADDED_TO_PROFILE" = true ]; then
+        echo "Please restart your terminal or run:"
+        echo "  source ~/.bashrc  # (or ~/.zshrc for zsh)"
+    else
+        echo "Please add $BIN_DIR to your PATH."
+        echo "For example, add this to your shell profile:"
+        echo "  $EXPORT_LINE"
+    fi
     echo "=========================================================="
 fi
 
