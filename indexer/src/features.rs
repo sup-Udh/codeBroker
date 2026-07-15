@@ -4,6 +4,7 @@ use storage::Database;
 
 pub fn extract_features(db: &Database) -> Result<(), String> {
     let t_total = Instant::now();
+    let show_timing = std::env::var("CODEBROKER_TIMING").is_ok();
     // We compute:
     // pagerank, fan_in, fan_out, interaction_count, community_id
     // and composable booleans.
@@ -94,11 +95,13 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
             },
         );
     }
-    eprintln!(
-        "[TIMING:features] Load symbols: {}ms ({} symbols)",
-        t0.elapsed().as_millis(),
-        symbols.len()
-    );
+    if show_timing {
+        eprintln!(
+            "[TIMING:features] Load symbols: {}ms ({} symbols)",
+            t0.elapsed().as_millis(),
+            symbols.len()
+        );
+    }
 
     // 2. Compute fan_in, fan_out, interactions, and collect edges for PageRank/Community
     let t1 = Instant::now();
@@ -136,11 +139,13 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
     }
 
     let total_edges = out_edges.values().map(|v| v.len()).sum::<usize>();
-    eprintln!(
-        "[TIMING:features] Load edges: {}ms ({} graph edges)",
-        t1.elapsed().as_millis(),
-        total_edges
-    );
+    if show_timing {
+        eprintln!(
+            "[TIMING:features] Load edges: {}ms ({} graph edges)",
+            t1.elapsed().as_millis(),
+            total_edges
+        );
+    }
 
     // 3. Compute PageRank
     let t2 = Instant::now();
@@ -162,7 +167,9 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
         pagerank = new_pr;
     }
 
-    eprintln!("[TIMING:features] PageRank (10 iter): {}ms", t2.elapsed().as_millis());
+    if show_timing {
+        eprintln!("[TIMING:features] PageRank (10 iter): {}ms", t2.elapsed().as_millis());
+    }
 
     // 4. Compute Communities (Label Propagation)
     let t3 = Instant::now();
@@ -201,7 +208,9 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
         }
     }
 
-    eprintln!("[TIMING:features] Community detection: {}ms", t3.elapsed().as_millis());
+    if show_timing {
+        eprintln!("[TIMING:features] Community detection: {}ms", t3.elapsed().as_millis());
+    }
 
     // 5. Update SQLite Database. DELETE + the re-INSERT loop below share one
     // transaction so a concurrent WAL reader (e.g. an MCP query mid-flight)
@@ -209,7 +218,9 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
     let t4 = Instant::now();
     let _ = db.conn.execute_batch("BEGIN IMMEDIATE");
     let _ = db.conn.execute("DELETE FROM symbol_features", []);
-    eprintln!("[TIMING:features] DELETE symbol_features: {}ms", t4.elapsed().as_millis());
+    if show_timing {
+        eprintln!("[TIMING:features] DELETE symbol_features: {}ms", t4.elapsed().as_millis());
+    }
 
     let t5 = Instant::now();
     {
@@ -228,13 +239,15 @@ pub fn extract_features(db: &Database) -> Result<(), String> {
     }
     let _ = db.conn.execute_batch("COMMIT");
     let insert_count = symbols.len();
-    eprintln!(
-        "[TIMING:features] INSERT symbol_features ({} rows, batched in one transaction): {}ms ({:.2}ms/row)",
-        insert_count,
-        t5.elapsed().as_millis(),
-        t5.elapsed().as_millis() as f64 / insert_count.max(1) as f64
-    );
-    eprintln!("[TIMING:features] Total extract_features: {}ms", t_total.elapsed().as_millis());
+    if show_timing {
+        eprintln!(
+            "[TIMING:features] INSERT symbol_features ({} rows, batched in one transaction): {}ms ({:.2}ms/row)",
+            insert_count,
+            t5.elapsed().as_millis(),
+            t5.elapsed().as_millis() as f64 / insert_count.max(1) as f64
+        );
+        eprintln!("[TIMING:features] Total extract_features: {}ms", t_total.elapsed().as_millis());
+    }
 
     Ok(())
 }

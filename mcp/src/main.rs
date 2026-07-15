@@ -27,58 +27,117 @@ struct ResolvedWorkspace {
     exists: bool,
 }
 
-/// Resolves the active CodeBroker workspace.
-/// If ~/.codebroker/active_project has ever been set (e.g. via `set_workspace`
-/// or `codebroker bind`), that workspace is always honored verbatim, even if
-/// its database hasn't been indexed yet. We deliberately do NOT fall back to
-/// a CWD-relative database in that case: silently serving a different
-/// project's data is what caused duplicate-tree / stale-graph results when
-/// switching workspaces. Only when no active_project pointer exists at all
-/// do we fall back to a CWD-relative database (first-run behavior).
+/// This session's own `set_workspace` call, if any. Kept in-process rather
+/// than only in the on-disk `~/.codebroker/active_project` pointer so that
+/// switching workspaces in one session can never be silently overridden —
+/// or silently applied to a *different*, concurrently running session — by
+/// some other repo's session rebinding that same shared file. See
+/// `resolve_workspace` for the full priority order this participates in.
+static SESSION_WORKSPACE_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn session_workspace_override() -> &'static std::sync::Mutex<Option<String>> {
+    SESSION_WORKSPACE_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn set_session_workspace_override(path: String) {
+    *session_workspace_override().lock().unwrap() = Some(path);
+}
+
+/// True when `path` is unsuitable to treat as a project root (empty, the
+/// user's home directory, or a filesystem root) — guards both the CWD-trust
+/// step in `resolve_workspace` and the auto-init hook in `main` from ever
+/// targeting something with no reasonable project scope.
+fn is_unsafe_project_root(path: &std::path::Path) -> bool {
+    let home_dir = runtime::environment::home_dir();
+    path.as_os_str().is_empty()
+        || home_dir.as_deref() == Some(path)
+        || path.parent().is_none()
+}
+
+/// Resolves a project root into its `.codebroker/codebroker.db`, logging
+/// whether it's actually been indexed yet.
+fn resolved_at(project_path: &str) -> ResolvedWorkspace {
+    let db_path = std::path::Path::new(project_path)
+        .join(".codebroker")
+        .join("codebroker.db")
+        .to_string_lossy()
+        .to_string();
+    let exists = std::path::Path::new(&db_path).exists();
+    if exists {
+        eprintln!("Using workspace database: {}", db_path);
+    } else {
+        eprintln!("Workspace '{}' has no index yet at {}", project_path, db_path);
+    }
+    ResolvedWorkspace {
+        db_path,
+        project_root: project_path.to_string(),
+        exists,
+    }
+}
+
+/// Resolves the active CodeBroker workspace, in priority order:
+///
+/// 1. This session's own `set_workspace` call, if any — explicit and most
+///    recent, so it always wins for the rest of this process's life.
+/// 2. `CODEBROKER_WORKSPACE` env var — written into the Claude Desktop /
+///    Gemini MCP config by `codebroker bind`. Those apps run one ambient
+///    process whose own CWD is never a project directory, so this env var
+///    is their only reliable signal.
+/// 3. The MCP process's own CWD, if it's a sane project directory.
+///    claude-code launches each session's MCP subprocess with CWD pinned to
+///    that session's project root, so trusting it here keeps concurrent
+///    sessions on different repos from fighting over the single
+///    `active_project` pointer below — that pointer is shared machine-wide,
+///    so honoring it unconditionally (as this used to) meant whichever repo
+///    last ran `bind`/`init` silently stole every other repo's already-open
+///    session's results.
+/// 4. `~/.codebroker/active_project` — last-resort default for launch
+///    contexts with neither an explicit override nor a project-scoped CWD.
 fn resolve_workspace() -> ResolvedWorkspace {
+    if let Some(path) = session_workspace_override().lock().unwrap().clone() {
+        return resolved_at(&path);
+    }
+
+    if let Ok(workspace) = std::env::var("CODEBROKER_WORKSPACE") {
+        let workspace = workspace.trim();
+        if !workspace.is_empty() {
+            return resolved_at(workspace);
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if !is_unsafe_project_root(&cwd) {
+            let cwd_db = ".codebroker/codebroker.db".to_string();
+            let exists = std::path::Path::new(&cwd_db).exists();
+            let project_root = cwd.canonicalize().unwrap_or(cwd).to_string_lossy().to_string();
+            return ResolvedWorkspace {
+                db_path: cwd_db,
+                project_root,
+                exists,
+            };
+        }
+    }
+
     if let Some(active_file) = runtime::environment::active_project_path() {
         if let Ok(project_path) = std::fs::read_to_string(&active_file) {
-            let project_path = project_path.trim().to_string();
+            let project_path = project_path.trim();
             if !project_path.is_empty() {
-                let db_path = std::path::Path::new(&project_path)
-                    .join(".codebroker")
-                    .join("codebroker.db")
-                    .to_string_lossy()
-                    .to_string();
-                let exists = std::path::Path::new(&db_path).exists();
-                if exists {
-                    eprintln!("Using active project database: {}", db_path);
-                } else {
-                    eprintln!(
-                        "Active workspace '{}' has no index yet at {}",
-                        project_path, db_path
-                    );
-                }
-                return ResolvedWorkspace {
-                    db_path,
-                    project_root: project_path,
-                    exists,
-                };
+                return resolved_at(project_path);
             }
         }
     }
 
-    // No active_project pointer has ever been set: fall back to CWD.
-    let cwd_db = ".codebroker/codebroker.db".to_string();
-    let exists = std::path::Path::new(&cwd_db).exists();
-    let project_root = std::env::var("CODEBROKER_WORKSPACE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().expect("Failed to get current dir"));
-
-    let project_root = project_root
-        .canonicalize()
-        .unwrap_or(project_root)
+    // Nothing usable at all: report CWD verbatim so the auto-init guard in
+    // `main` can decide whether it's still safe to index.
+    let project_root = std::env::current_dir()
+        .unwrap_or_default()
         .to_string_lossy()
         .to_string();
     ResolvedWorkspace {
-        db_path: cwd_db,
+        db_path: ".codebroker/codebroker.db".to_string(),
         project_root,
-        exists,
+        exists: false,
     }
 }
 
@@ -277,13 +336,9 @@ fn main() {
     // actual project root (not the MCP process's ambient CWD).
     if !resolved.exists {
         let project_dir = resolved.project_root.clone();
-        let home_dir = runtime::environment::home_dir();
         let project_path_buf = std::path::PathBuf::from(&project_dir);
 
-        if project_dir.is_empty()
-            || home_dir.as_deref() == Some(project_path_buf.as_path())
-            || project_path_buf.parent().is_none()
-        {
+        if is_unsafe_project_root(&project_path_buf) {
             eprintln!(
                 "Refusing to auto-initialize codebroker in home or root directory to prevent massive indexing."
             );
@@ -1125,6 +1180,11 @@ Treat native tools as the repository's implementation layer."#;
                                         if let Err(e) = std::fs::write(&active_file, path) {
                                             format!("Error saving workspace: {}", e)
                                         } else {
+                                            // Take effect for the rest of *this* process's
+                                            // life regardless of CWD or what any other
+                                            // concurrently running session does to the
+                                            // shared active_project file afterward.
+                                            set_session_workspace_override(path.to_string());
                                             let new_db_path = std::path::Path::new(path)
                                                 .join(".codebroker")
                                                 .join("codebroker.db")

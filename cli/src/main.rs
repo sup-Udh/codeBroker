@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use console::style;
 use rusqlite::params;
 use std::fs;
 use storage::GENERIC_SYMBOL_NAMES;
@@ -67,6 +68,310 @@ enum Commands {
     Update,
 }
 
+/// Hooks up Claude Desktop, Gemini, Antigravity, and claude-code to the
+/// current directory, and refreshes the shared AI instructions files.
+/// Called automatically at the end of `Commands::Init` so users don't need
+/// to separately run `codebroker bind`; `Commands::Bind` re-runs `init`
+/// (see below) which invokes this again, so this function itself must
+/// never spawn an `init` subprocess or it would recurse.
+fn run_bind() {
+    println!("{}", style("Binding CodeBroker to current directory...").cyan().bold());
+
+    // 1. Get current path and use the globally installed mcp binary
+    let current_dir = std::env::current_dir()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let codebroker_cmd = match runtime::executables::find_mcp_binary() {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(e) => {
+            // Surface the real problem instead of silently writing a
+            // config that points at nothing, but still fall back to
+            // the sibling-of-current-exe guess so `bind` finishes —
+            // useful e.g. right after a local `cargo build` before
+            // the mcp binary has been placed alongside this one.
+            println!("  {} {}", style("!").yellow().bold(), e);
+            let current_exe = std::env::current_exe()
+                .unwrap_or_else(|_| std::path::PathBuf::from("codebroker"));
+            let bin_dir = current_exe
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""));
+            bin_dir
+                .join(format!("codebroker-mcp{}", runtime::platform::exe_suffix()))
+                .to_string_lossy()
+                .to_string()
+        }
+    };
+
+    // 2. Paths to configs
+    let home_dir = runtime::environment::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let claude_path = match std::env::consts::OS {
+        "windows" => format!(
+            "{}\\Claude\\claude_desktop_config.json",
+            std::env::var("APPDATA").unwrap_or_default()
+        ),
+        "macos" | "darwin" => format!(
+            "{}/Library/Application Support/Claude/claude_desktop_config.json",
+            home_dir
+        ),
+        _ => format!("{}/.config/Claude/claude_desktop_config.json", home_dir),
+    };
+
+    let gemini_path = match std::env::consts::OS {
+        "windows" => format!("{}\\.gemini\\config\\mcp_config.json", home_dir),
+        _ => format!("{}/.gemini/config/mcp_config.json", home_dir),
+    };
+
+    let paths_to_update = vec![claude_path, gemini_path];
+
+    for path in paths_to_update {
+        let config_str = fs::read_to_string(&path).unwrap_or_else(|_| "{\"mcpServers\": {}}".to_string());
+
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            if !json.is_object() {
+                json = serde_json::json!({"mcpServers": {}});
+            }
+
+            let servers = json.as_object_mut()
+                .unwrap()
+                .entry("mcpServers")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap();
+
+            let codebroker = servers.entry("codebroker")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap();
+
+            codebroker.insert("command".to_string(), serde_json::Value::String(codebroker_cmd.to_string()));
+            codebroker.insert("args".to_string(), serde_json::json!([]));
+
+            let env_map = codebroker
+                .entry("env")
+                .or_insert_with(|| serde_json::json!({}));
+
+            if let Some(env_obj) = env_map.as_object_mut() {
+                env_obj.insert(
+                    "CODEBROKER_WORKSPACE".to_string(),
+                    serde_json::Value::String(current_dir.clone()),
+                );
+                let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
+                if !openai_key.is_empty() {
+                    env_obj.insert(
+                        "OPENAI_API_KEY".to_string(),
+                        serde_json::Value::String(openai_key.clone()),
+                    );
+                }
+            }
+
+            if let Ok(new_json) = serde_json::to_string_pretty(&json) {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::write(&path, new_json).is_ok() {
+                    println!("  {} {}", style("✓").green().bold(), style(&path).dim());
+                } else {
+                    println!("  {} could not write config at {}", style("!").yellow().bold(), path);
+                }
+            }
+        }
+    }
+
+    // Register as user-scoped so it's auto-trusted (no approval prompt).
+    // Cross-contamination between projects is prevented by the CWD safety
+    // guards in codebroker-mcp's auto-init hook — each claude session spawns
+    // its own subprocess with the project directory as CWD.
+
+    let claude_bin = if std::env::consts::OS == "windows" { "claude.cmd" } else { "claude" };
+
+    // Remove first to force a clean re-registration
+    let _ = std::process::Command::new(claude_bin)
+        .args(&["mcp", "remove", "codebroker", "-s", "user"])
+        .output(); // use output() to suppress stderr noise
+
+    // Also clean up any leftover project-scoped .mcp.json entry
+    let _ = std::process::Command::new(claude_bin)
+        .args(&["mcp", "remove", "codebroker", "-s", "local"])
+        .output();
+
+    // Add as user-scoped (globally trusted, no approval needed). Only
+    // pass `-e OPENAI_API_KEY=...` when the caller actually has one set —
+    // never inject a placeholder/hardcoded secret.
+    let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
+    let mut add_args = vec!["mcp", "add", "codebroker", "-s", "user"];
+    let env_arg = format!("OPENAI_API_KEY={}", openai_key);
+    if !openai_key.is_empty() {
+        add_args.push("-e");
+        add_args.push(&env_arg);
+    }
+    add_args.push("--");
+    // Use the same resolved absolute path as the JSON configs above —
+    // registering the bare "codebroker-mcp" name here relied on PATH,
+    // which is exactly the inconsistency that caused "executable not
+    // found" for claude-code registrations while Desktop/Gemini
+    // configs (already absolute) worked.
+    add_args.push(&codebroker_cmd);
+    let add_status = std::process::Command::new(claude_bin)
+        .args(&add_args)
+        .status();
+
+    match add_status {
+        Ok(s) if s.success() => println!(
+            "  {} claude-code MCP server (user-scoped, auto-trusted)",
+            style("✓").green().bold()
+        ),
+        _ => println!(
+            "  {} could not register with claude-code — is the 'claude' CLI installed?",
+            style("!").yellow().bold()
+        ),
+    }
+
+    // 2.5 Generate Antigravity instructions.md locally, then sync globally
+    let _ = fs::create_dir_all(".codebroker");
+    let local_instructions_path = ".codebroker/instructions.md";
+
+    let default_instructions = r#"## CodeBroker - Repository Intelligence Layer
+
+### MANDATORY: use CodeBroker - do NOT grep or glob the codebase blindly
+For any feature, fix, or refactor request:
+**call `search_codebase` or `repository_stats` FIRST**. CodeBroker is the discovery, architecture, and context engine for this workspace.
+
+Do NOT use grep, glob, or Bash sweeps to explore the codebase. CodeBroker answers "where is it, what touches it, what breaks" cheaply and fast. Use native tools (grep/Read) ONLY for verification or when CodeBroker identifies a specific file.
+
+### Primary Tools (Discovery & Context)
+- `search_codebase` - **USE THIS TO FIND CODE**. Fuses keyword and semantic rankings. Mode: "both" works for concrete identifiers and conceptual phrases. Exact symbol matches rank first.
+- `get_context` - View callers/callees at a glance. Default to `format: "markdown"`.
+- `get_edit_context` - **USE BEFORE EDITING**. Returns exact line boundaries, callers, callees, and reverse dependencies in one call.
+- `repository_stats` - Run once at session-start for unfamiliar repos. Returns files, languages, and entrypoints.
+
+### Deep Dive Tools (Use only when necessary)
+- `read_file_skeleton` - Preferred over full file reads to grasp structure. Merge with symbol reads (`target_symbol="X"`).
+- `read_symbol_source` - Use for exact bodies; batch related symbols via `symbols: [...]`.
+- `explore_graph` / `shortest_path` - Use to trace connections between subsystems.
+- `subsystem_communication` - View directory-to-directory coupling.
+- `architectural_hotspots` / `find_duplicate_logic` - Scope with `path_scope` once target area is known to avoid noise.
+
+### Workflow
+1. `search_codebase` (mode: "both") - ALWAYS FIRST to locate relevant files/symbols.
+2. Need structure? `read_file_skeleton` - avoid full Reads unless editing.
+3. Need dependencies? `get_context` (markdown) or `get_edit_context`.
+4. Make targeted changes natively based on the discovered context.
+5. Verify natively - CodeBroker confirms structure, not correctness (tests/compilation).
+
+### Trust Calibration & Golden Rules
+- **Dynamic Blind Spots**: The index models static imports. Decorators (Python), dynamic `import()` (JS/TS), and macros (Rust) are invisible. Verify these natively.
+- **Verify generic edges**: Edge resolution is name-based. Confirm actual import/use paths for generic names (e.g. `obj.metadata`).
+- **Resolve before query**: Never pass guessed paths to `get_context` or `read_symbol_source`. Confirm via `search_codebase` first.
+- **High Trust**: `repository_stats`, exact symbol matches, same-subsystem graph edges.
+- **Low Trust**: Cross-file edges on generic names, duplicate logic groups (might be intentional), dynamic dispatch.
+
+### Anti-patterns
+- Acting on an impact claim in auth/payments/data-integrity without native confirmation.
+- Full-file reads when a skeleton plus one or two symbol reads would answer it.
+- Recursive directory scans or blind grep sweeps to "explore" — use `repository_stats` and `search_codebase` instead.
+- Retrying a failed subsystem/symbol name by guessing variants — use the `did_you_mean` / candidate list.
+"#;
+
+    // Always write latest instructions (overwrite on upgrade)
+    let _ = fs::write(local_instructions_path, default_instructions);
+
+    // Sync to Antigravity and Claude, tracking failures instead of printing
+    // one line per destination — only surface a warning if something failed.
+    let mut synced_targets: Vec<&str> = vec!["project"];
+    let mut sync_warnings: Vec<String> = Vec::new();
+    if let Ok(local_content) = fs::read_to_string(local_instructions_path) {
+        // Antigravity
+        let antigravity_dir = format!("{}/.gemini/antigravity/mcp/codebroker", home_dir);
+        if fs::create_dir_all(&antigravity_dir).is_ok() {
+            let global_instructions_path = format!("{}/instructions.md", antigravity_dir);
+            if fs::write(&global_instructions_path, &local_content).is_ok() {
+                synced_targets.push("Antigravity");
+            } else {
+                sync_warnings.push(format!("could not write {}", global_instructions_path));
+            }
+        }
+
+        // Claude Desktop
+        let claude_dir = format!("{}/.config/Claude/mcp/codebroker", home_dir);
+        if fs::create_dir_all(&claude_dir).is_ok() {
+            let claude_instructions_path = format!("{}/instructions.md", claude_dir);
+            if fs::write(&claude_instructions_path, &local_content).is_ok() {
+                synced_targets.push("Claude Desktop");
+            } else {
+                sync_warnings.push(format!("could not write {}", claude_instructions_path));
+            }
+        }
+
+        // claude-code CLAUDE.md (Global)
+        let claude_md_dir = format!("{}/.claude", home_dir);
+        if fs::create_dir_all(&claude_md_dir).is_ok() {
+            let claude_md_path = format!("{}/CLAUDE.md", claude_md_dir);
+
+            // Build the CLAUDE.md content — always update to latest instructions
+            let mut final_content = String::new();
+
+            // Preserve any existing non-CodeBroker content
+            if let Ok(existing) = fs::read_to_string(&claude_md_path) {
+                // Strip out old CodeBroker section and any duplicates
+                // by dropping everything from the first "## CodeBroker" to the end of the file.
+                // Must match `default_instructions`' actual heading level below
+                // (was "# CodeBroker", one level off, so this never fired and
+                // every bind/init appended a fresh copy instead of replacing).
+                for line in existing.lines() {
+                    if line.starts_with("## CodeBroker") {
+                        break;
+                    }
+                    final_content.push_str(line);
+                    final_content.push('\n');
+                }
+            }
+
+            // Append the latest CodeBroker instructions
+            if !final_content.is_empty() && !final_content.ends_with("\n\n") {
+                final_content.push('\n');
+            }
+            final_content.push_str(&local_content);
+
+            let _ = fs::write(&claude_md_path, &final_content);
+            synced_targets.push("claude-code");
+        }
+    }
+    println!(
+        "  {} AI instructions synced ({})",
+        style("✓").green().bold(),
+        synced_targets.join(", ")
+    );
+    for warning in &sync_warnings {
+        println!("  {} {}", style("!").yellow().bold(), warning);
+    }
+
+    // 3. Write the active project pointer so codebroker-mcp always finds the right database
+    let current_dir_str = std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    match (
+        runtime::environment::codebroker_dir(),
+        runtime::environment::active_project_path(),
+    ) {
+        (Some(dir), Some(active_project_path)) => {
+            let _ = fs::create_dir_all(&dir);
+            if fs::write(&active_project_path, &current_dir_str).is_ok() {
+                println!("  {} active project set to {}", style("✓").green().bold(), style(&current_dir_str).dim());
+            }
+        }
+        _ => println!(
+            "  {} could not determine the user's home directory — active project pointer was not written.",
+            style("!").yellow().bold()
+        ),
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
@@ -87,7 +392,7 @@ fn main() {
             let pb = ProgressBar::new_spinner();
             pb.set_style(spinner_style);
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
-            pb.set_message("Churning  —  loading cache & warming database");
+            pb.set_message(style("Churning  —  loading cache & warming database").cyan().to_string());
 
             let _ = fs::create_dir_all(".codebroker");
 
@@ -171,7 +476,10 @@ fn main() {
                     has_previous_index && stored_version.as_deref() == Some(PIPELINE_VERSION);
                 let full_rebuild = !trust_hashes;
                 if has_previous_index && !trust_hashes {
-                    println!("Pipeline version changed since last index — reparsing every file.");
+                    println!(
+                        "  {} pipeline version changed since last index — reparsing every file",
+                        style("!").yellow().bold()
+                    );
                 }
 
                 let t_old_hashes = std::time::Instant::now();
@@ -525,8 +833,12 @@ fn main() {
                 };
                 pb.finish_and_clear();
                 println!(
-                    "  ✅  Done  —  {} files  ·  {} symbols  ·  {} edges  ·  {}",
-                    total_files, pass1_symbols, edges_created, elapsed_str
+                    "  {} {} files  ·  {} symbols  ·  {} edges  ·  {}",
+                    style("✓").green().bold(),
+                    style(total_files).cyan(),
+                    style(pass1_symbols).cyan(),
+                    style(edges_created).cyan(),
+                    style(elapsed_str).dim()
                 );
             }
 
@@ -574,10 +886,10 @@ fn main() {
                                             } else {
                                                 "calculating…".to_string()
                                             };
-                                            p.set_message(format!(
+                                            p.set_message(style(format!(
                                                 "Embedding  —  {}/{} symbols  ·  {}",
                                                 embedded, total, eta_str
-                                            ));
+                                            )).cyan().to_string());
                                             if embedded >= total {
                                                 p.finish_and_clear();
                                             }
@@ -587,24 +899,32 @@ fn main() {
                             }) {
                             Ok(stats) => {
                                 println!(
-                                    "  🧠  Embeddings  —  {} embedded  ·  {} reused  ·  {} unchanged  ·  {} ({})",
-                                    stats.embedded,
-                                    stats.reused,
-                                    stats.skipped_unchanged,
-                                    embeddings_config.model_id(),
+                                    "  {} {} embedded  ·  {} reused  ·  {} unchanged  ·  {}",
+                                    style("✓").green().bold(),
+                                    style(stats.embedded).cyan(),
+                                    style(stats.reused).cyan(),
+                                    style(stats.skipped_unchanged).cyan(),
                                     if stats.failed_batches > 0 {
-                                        format!("{} batches failed", stats.failed_batches)
+                                        style(format!("{} batches failed", stats.failed_batches)).yellow().to_string()
                                     } else {
-                                        format!("{:.1}s", t_embed.elapsed().as_secs_f64())
+                                        style(format!("{:.1}s", t_embed.elapsed().as_secs_f64())).dim().to_string()
                                     }
                                 );
                             }
                             Err(e) => {
-                                println!("  ⚠️   Semantic search degraded (keyword search unaffected): {}", e);
+                                println!(
+                                    "  {} semantic search degraded (keyword search unaffected): {}",
+                                    style("!").yellow().bold(),
+                                    e
+                                );
                             }
                         }
                     }
-                    Err(e) => println!("  ⚠️   Skipping embeddings — could not reopen index: {}", e),
+                    Err(e) => println!(
+                        "  {} skipping embeddings — could not reopen index: {}",
+                        style("!").yellow().bold(),
+                        e
+                    ),
                 }
                 if show_timing {
                     eprintln!("[TIMING] Embedding backfill: {}ms", t_embed.elapsed().as_millis());
@@ -614,6 +934,11 @@ fn main() {
             if show_timing {
                 eprintln!("[TIMING] === TOTAL WALL TIME (including file rename): {}ms ===", t_pipeline.elapsed().as_millis());
             }
+
+            // Auto-bind: wire up Claude Desktop, Antigravity, and claude-code
+            // so users don't need to separately run `codebroker bind`.
+            run_bind();
+            println!("{}", style("Done! Restart Claude Desktop or Antigravity to begin.").green().bold());
         }
         Commands::Update => {
             println!("Checking for updates...");
@@ -1180,310 +1505,18 @@ fn main() {
             println!("Use 'cargo run -- metrics' or 'cargo run -- dashboard' instead.");
         }
         Commands::Bind => {
-            println!("Binding CodeBroker to current directory...");
-
-            println!("Binding CodeBroker to current directory...");
-
-            // 1. Get current path and use the globally installed mcp binary
-            let current_dir = std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
-
-            let codebroker_cmd = match runtime::executables::find_mcp_binary() {
-                Ok(path) => path.to_string_lossy().to_string(),
-                Err(e) => {
-                    // Surface the real problem instead of silently writing a
-                    // config that points at nothing, but still fall back to
-                    // the sibling-of-current-exe guess so `bind` finishes —
-                    // useful e.g. right after a local `cargo build` before
-                    // the mcp binary has been placed alongside this one.
-                    println!("Warning: {}", e);
-                    let current_exe = std::env::current_exe()
-                        .unwrap_or_else(|_| std::path::PathBuf::from("codebroker"));
-                    let bin_dir = current_exe
-                        .parent()
-                        .unwrap_or_else(|| std::path::Path::new(""));
-                    bin_dir
-                        .join(format!("codebroker-mcp{}", runtime::platform::exe_suffix()))
-                        .to_string_lossy()
-                        .to_string()
-                }
-            };
-
-            // 2. Paths to configs
-            let home_dir = runtime::environment::home_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let claude_path = match std::env::consts::OS {
-                "windows" => format!(
-                    "{}\\Claude\\claude_desktop_config.json",
-                    std::env::var("APPDATA").unwrap_or_default()
-                ),
-                "macos" | "darwin" => format!(
-                    "{}/Library/Application Support/Claude/claude_desktop_config.json",
-                    home_dir
-                ),
-                _ => format!("{}/.config/Claude/claude_desktop_config.json", home_dir),
-            };
-
-            let gemini_path = match std::env::consts::OS {
-                "windows" => format!("{}\\.gemini\\config\\mcp_config.json", home_dir),
-                _ => format!("{}/.gemini/config/mcp_config.json", home_dir),
-            };
-
-            let paths_to_update = vec![claude_path, gemini_path];
-
-            for path in paths_to_update {
-                let config_str = fs::read_to_string(&path).unwrap_or_else(|_| "{\"mcpServers\": {}}".to_string());
-                
-                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                    if !json.is_object() {
-                        json = serde_json::json!({"mcpServers": {}});
-                    }
-                    
-                    let servers = json.as_object_mut()
-                        .unwrap()
-                        .entry("mcpServers")
-                        .or_insert_with(|| serde_json::json!({}))
-                        .as_object_mut()
-                        .unwrap();
-                    
-                    let codebroker = servers.entry("codebroker")
-                        .or_insert_with(|| serde_json::json!({}))
-                        .as_object_mut()
-                        .unwrap();
-                    
-                    codebroker.insert("command".to_string(), serde_json::Value::String(codebroker_cmd.to_string()));
-                    codebroker.insert("args".to_string(), serde_json::json!([]));
-
-                    let env_map = codebroker
-                        .entry("env")
-                        .or_insert_with(|| serde_json::json!({}));
-                    
-                    if let Some(env_obj) = env_map.as_object_mut() {
-                        env_obj.insert(
-                            "CODEBROKER_WORKSPACE".to_string(),
-                            serde_json::Value::String(current_dir.clone()),
-                        );
-                        let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
-                        if !openai_key.is_empty() {
-                            env_obj.insert(
-                                "OPENAI_API_KEY".to_string(),
-                                serde_json::Value::String(openai_key.clone()),
-                            );
-                        }
-                    }
-
-                    if let Ok(new_json) = serde_json::to_string_pretty(&json) {
-                        if let Some(parent) = std::path::Path::new(&path).parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        if fs::write(&path, new_json).is_ok() {
-                            println!("Successfully bound config at {}", path);
-                        } else {
-                            println!("Warning: Could not write to config at {}", path);
-                        }
-                    }
-                }
-            }
-
-            // Register as user-scoped so it's auto-trusted (no approval prompt).
-            // Cross-contamination between projects is prevented by the CWD safety
-            // guards in codebroker-mcp's auto-init hook — each claude session spawns
-            // its own subprocess with the project directory as CWD.
-
-            let claude_bin = if std::env::consts::OS == "windows" { "claude.cmd" } else { "claude" };
-
-            // Remove first to force a clean re-registration
-            let _ = std::process::Command::new(claude_bin)
-                .args(&["mcp", "remove", "codebroker", "-s", "user"])
-                .output(); // use output() to suppress stderr noise
-
-            // Also clean up any leftover project-scoped .mcp.json entry
-            let _ = std::process::Command::new(claude_bin)
-                .args(&["mcp", "remove", "codebroker", "-s", "local"])
-                .output();
-
-            // Add as user-scoped (globally trusted, no approval needed). Only
-            // pass `-e OPENAI_API_KEY=...` when the caller actually has one set —
-            // never inject a placeholder/hardcoded secret.
-            let openai_key = runtime::environment::openai_api_key().unwrap_or_default();
-            let mut add_args = vec!["mcp", "add", "codebroker", "-s", "user"];
-            let env_arg = format!("OPENAI_API_KEY={}", openai_key);
-            if !openai_key.is_empty() {
-                add_args.push("-e");
-                add_args.push(&env_arg);
-            }
-            add_args.push("--");
-            // Use the same resolved absolute path as the JSON configs above —
-            // registering the bare "codebroker-mcp" name here relied on PATH,
-            // which is exactly the inconsistency that caused "executable not
-            // found" for claude-code registrations while Desktop/Gemini
-            // configs (already absolute) worked.
-            add_args.push(&codebroker_cmd);
-            let add_status = std::process::Command::new(claude_bin)
-                .args(&add_args)
-                .status();
-
-            match add_status {
-                Ok(s) if s.success() => println!(
-                    "Registered CodeBroker MCP Server for claude-code (user-scoped, auto-trusted)."
-                ),
-                _ => println!(
-                    "Warning: Could not register with claude-code. Is 'claude' CLI installed?"
-                ),
-            }
-
-            // 2.5 Generate Antigravity instructions.md locally, then sync globally
-            let _ = fs::create_dir_all(".codebroker");
-            let local_instructions_path = ".codebroker/instructions.md";
-
-            let default_instructions = r#"## CodeBroker - Repository Intelligence Layer
-
-### MANDATORY: use CodeBroker - do NOT grep or glob the codebase blindly
-For any feature, fix, or refactor request:
-**call `search_codebase` or `repository_stats` FIRST**. CodeBroker is the discovery, architecture, and context engine for this workspace.
-
-Do NOT use grep, glob, or Bash sweeps to explore the codebase. CodeBroker answers "where is it, what touches it, what breaks" cheaply and fast. Use native tools (grep/Read) ONLY for verification or when CodeBroker identifies a specific file.
-
-### Primary Tools (Discovery & Context)
-- `search_codebase` - **USE THIS TO FIND CODE**. Fuses keyword and semantic rankings. Mode: "both" works for concrete identifiers and conceptual phrases. Exact symbol matches rank first.
-- `get_context` - View callers/callees at a glance. Default to `format: "markdown"`.
-- `get_edit_context` - **USE BEFORE EDITING**. Returns exact line boundaries, callers, callees, and reverse dependencies in one call.
-- `repository_stats` - Run once at session-start for unfamiliar repos. Returns files, languages, and entrypoints.
-
-### Deep Dive Tools (Use only when necessary)
-- `read_file_skeleton` - Preferred over full file reads to grasp structure. Merge with symbol reads (`target_symbol="X"`).
-- `read_symbol_source` - Use for exact bodies; batch related symbols via `symbols: [...]`.
-- `explore_graph` / `shortest_path` - Use to trace connections between subsystems.
-- `subsystem_communication` - View directory-to-directory coupling.
-- `architectural_hotspots` / `find_duplicate_logic` - Scope with `path_scope` once target area is known to avoid noise.
-
-### Workflow
-1. `search_codebase` (mode: "both") - ALWAYS FIRST to locate relevant files/symbols.
-2. Need structure? `read_file_skeleton` - avoid full Reads unless editing.
-3. Need dependencies? `get_context` (markdown) or `get_edit_context`.
-4. Make targeted changes natively based on the discovered context.
-5. Verify natively - CodeBroker confirms structure, not correctness (tests/compilation).
-
-### Trust Calibration & Golden Rules
-- **Dynamic Blind Spots**: The index models static imports. Decorators (Python), dynamic `import()` (JS/TS), and macros (Rust) are invisible. Verify these natively.
-- **Verify generic edges**: Edge resolution is name-based. Confirm actual import/use paths for generic names (e.g. `obj.metadata`).
-- **Resolve before query**: Never pass guessed paths to `get_context` or `read_symbol_source`. Confirm via `search_codebase` first.
-- **High Trust**: `repository_stats`, exact symbol matches, same-subsystem graph edges.
-- **Low Trust**: Cross-file edges on generic names, duplicate logic groups (might be intentional), dynamic dispatch.
-
-### Anti-patterns
-- Acting on an impact claim in auth/payments/data-integrity without native confirmation.
-- Full-file reads when a skeleton plus one or two symbol reads would answer it.
-- Recursive directory scans or blind grep sweeps to "explore" — use `repository_stats` and `search_codebase` instead.
-- Retrying a failed subsystem/symbol name by guessing variants — use the `did_you_mean` / candidate list.
-"#;
-
-            // Always write latest instructions (overwrite on upgrade)
-            let _ = fs::write(local_instructions_path, default_instructions);
-            println!(
-                "Updated local project instructions at {}",
-                local_instructions_path
-            );
-
-            // Sync to Antigravity and Claude
-            if let Ok(local_content) = fs::read_to_string(local_instructions_path) {
-                // Antigravity
-                let antigravity_dir = format!("{}/.gemini/antigravity/mcp/codebroker", home_dir);
-                if fs::create_dir_all(&antigravity_dir).is_ok() {
-                    let global_instructions_path = format!("{}/instructions.md", antigravity_dir);
-                    if fs::write(&global_instructions_path, &local_content).is_ok() {
-                        println!(
-                            "Successfully synced AI instructions to {}",
-                            global_instructions_path
-                        );
-                    } else {
-                        println!(
-                            "Warning: Failed to write global instructions.md at {}",
-                            global_instructions_path
-                        );
-                    }
-                }
-
-                // Claude Desktop
-                let claude_dir = format!("{}/.config/Claude/mcp/codebroker", home_dir);
-                if fs::create_dir_all(&claude_dir).is_ok() {
-                    let claude_instructions_path = format!("{}/instructions.md", claude_dir);
-                    if fs::write(&claude_instructions_path, &local_content).is_ok() {
-                        println!(
-                            "Successfully synced AI instructions to {}",
-                            claude_instructions_path
-                        );
-                    } else {
-                        println!(
-                            "Warning: Failed to write global instructions.md at {}",
-                            claude_instructions_path
-                        );
-                    }
-                }
-
-                // claude-code CLAUDE.md (Global)
-                let claude_md_dir = format!("{}/.claude", home_dir);
-                if fs::create_dir_all(&claude_md_dir).is_ok() {
-                    let claude_md_path = format!("{}/CLAUDE.md", claude_md_dir);
-
-                    // Build the CLAUDE.md content — always update to latest instructions
-                    let mut final_content = String::new();
-
-                    // Preserve any existing non-CodeBroker content
-                    if let Ok(existing) = fs::read_to_string(&claude_md_path) {
-                        // Strip out old CodeBroker section and any duplicates
-                        // by dropping everything from the first "# CodeBroker" to the end of the file.
-                        for line in existing.lines() {
-                            if line.starts_with("# CodeBroker") {
-                                break;
-                            }
-                            final_content.push_str(line);
-                            final_content.push('\n');
-                        }
-                    }
-
-                    // Append the latest CodeBroker instructions
-                    if !final_content.is_empty() && !final_content.ends_with("\n\n") {
-                        final_content.push('\n');
-                    }
-                    final_content.push_str(&local_content);
-
-                    let _ = fs::write(&claude_md_path, &final_content);
-                    println!("Updated global CLAUDE.md with latest CodeBroker instructions");
-                }
-            }
-
-            // 3. Write the active project pointer so codebroker-mcp always finds the right database
-            let current_dir_str = std::env::current_dir()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            match (
-                runtime::environment::codebroker_dir(),
-                runtime::environment::active_project_path(),
-            ) {
-                (Some(dir), Some(active_project_path)) => {
-                    let _ = fs::create_dir_all(&dir);
-                    if fs::write(&active_project_path, &current_dir_str).is_ok() {
-                        println!("Set active project to: {}", current_dir_str);
-                    }
-                }
-                _ => println!(
-                    "Warning: Could not determine the user's home directory — active project pointer was not written."
-                ),
-            }
-
-            // 4. Auto-Init the directory so it's ready!
-            println!("Initializing CodeBroker database...");
-            let _ = std::process::Command::new(std::env::current_exe().unwrap())
+            // `init` now runs the full bind sequence (run_bind) automatically
+            // at the end of its own pipeline, so `bind` is kept only as a
+            // backward-compatible alias that re-runs `init`.
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .arg("init")
                 .status();
-
-            println!("Done! Restart Claude Desktop or Antigravity to begin.");
+            if !matches!(status, Ok(s) if s.success()) {
+                println!(
+                    "  {} 'codebroker init' did not complete successfully",
+                    style("!").yellow().bold()
+                );
+            }
         }
         Commands::Summary => {
             let db = storage::Database::new(".codebroker/codebroker.db").expect("Failed to open DB");

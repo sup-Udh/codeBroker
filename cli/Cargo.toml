@@ -1,6 +1,6 @@
 [package]
 name = "cli"
-version = "0.1.31"
+version = "0.1.32"
 edition = "2024"
 
 [dependencies]
@@ -23,6 +23,7 @@ graph_diagnostics = { path = "../graph_diagnostics" }
 runtime = { path = "../runtime" }
 rayon = "1.10"
 indicatif = "0.17"
+console = "0.15"
 self_update = { version = "0.44.0", features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
 reqwest = { version = "0.13.4", features = ["blocking"] }
 tempfile = "3.27.0"
