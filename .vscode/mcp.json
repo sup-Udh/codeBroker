@@ -4,7 +4,7 @@
       "type": "stdio",
       "command": "/home/labuser/.nvm/versions/node/v24.16.0/bin/node",
       "args": [
-        "/home/labuser/.vscode/extensions/vexp.vexp-vscode-2.1.5-linux-x64/dist/mcp-server.cjs"
+        "/home/labuser/.vscode/extensions/vexp.vexp-vscode-2.1.7-linux-x64/dist/mcp-server.cjs"
       ],
       "env": {
         "VEXP_WORKSPACE": "/main-code/codeBroker"
